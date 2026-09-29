@@ -33,21 +33,26 @@ fn open(app: &AppHandle, label: &str, view: Value, title: &str, size: (f64, f64)
         let _ = w.set_title(title);
         let _ = w.set_size(LogicalSize::new(size.0, size.1));
         let _ = w.set_always_on_top(on_top);
+        #[cfg(target_os = "macos")]
+        let _ = w.set_visible_on_all_workspaces(on_top);
         let _ = w.center();
         // The page renders the view, then shows and focuses its own window.
         let _ = w.eval(&format!("window.__boot({view});"));
         schedule_warm(app);
         return;
     }
-    let _ = WebviewWindowBuilder::new(app, label, WebviewUrl::App("index.html".into()))
+    let b = WebviewWindowBuilder::new(app, label, WebviewUrl::App("index.html".into()))
         .title(title)
         .inner_size(size.0, size.1)
         .min_inner_size(260.0, 150.0)
         .center()
         .always_on_top(on_top)
         .focused(true)
-        .initialization_script(&format!("window.__VIEW={view};"))
-        .build();
+        .initialization_script(&format!("window.__VIEW={view};"));
+    // macOS: popups must also appear on the current Space / over full-screen apps.
+    #[cfg(target_os = "macos")]
+    let b = b.visible_on_all_workspaces(on_top);
+    let _ = b.build();
 }
 
 fn take_spare(app: &AppHandle) -> Option<WebviewWindow> {

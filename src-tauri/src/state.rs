@@ -45,6 +45,35 @@ pub struct Settings {
     /// Performance mode keeps one pre-rendered hidden window so new windows appear
     /// instantly; efficiency mode (default) creates every window from scratch.
     pub perf_mode: bool,
+    /// Presence shown to others; chosen from the tray menu.
+    pub status: Status,
+    /// Reset `status` to online on every start.
+    pub auto_online: bool,
+    /// Save each message's attachments into their own sub-folder.
+    pub split_folders: bool,
+}
+
+/// Presence. `Offline` hides this user from everyone's lists; `Dnd` still
+/// receives but without popups, and senders are told so.
+#[derive(Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Status {
+    Dnd,
+    Offline,
+    /// Also what unknown values from newer versions read as.
+    #[default]
+    #[serde(other)]
+    Online,
+}
+
+impl Status {
+    pub fn label(self) -> &'static str {
+        match self {
+            Status::Online => "온라인",
+            Status::Dnd => "방해금지",
+            Status::Offline => "오프라인",
+        }
+    }
 }
 
 impl Default for Settings {
@@ -65,6 +94,9 @@ impl Default for Settings {
             context_menu: true,
             signature: String::new(),
             perf_mode: false,
+            status: Status::Online,
+            auto_online: true,
+            split_folders: true,
         }
     }
 }
@@ -89,6 +121,9 @@ pub struct Meta {
     pub free_space: u64,
     #[serde(default)]
     pub ver: u32,
+    /// Missing in 0.1.0/0.1.1 peers, which are always online.
+    #[serde(default)]
+    pub status: Status,
 }
 
 fn yes() -> bool {
@@ -106,6 +141,8 @@ pub struct Peer {
     pub notify: bool,
     pub max_files: u32,
     pub max_file_size: u64,
+    pub status: Status,
+    /// Recently seen and not in `Offline` status.
     #[serde(skip)]
     pub online: bool,
     #[serde(skip)]
@@ -119,6 +156,7 @@ pub struct PeerView {
     pub host: String,
     pub ip: String,
     pub online: bool,
+    pub status: Status,
     pub notify: bool,
     pub count: u32,
 }
@@ -263,12 +301,13 @@ impl AppState {
             name: s.name.clone(),
             host: self.host.clone(),
             port: self.port,
-            online: true,
+            online: s.status != Status::Offline,
+            status: s.status,
             notify: s.notify,
             max_files,
             max_file_size,
             free_space,
-            ver: 1,
+            ver: 2,
         }
     }
 
@@ -284,6 +323,7 @@ impl AppState {
                 host: p.host.clone(),
                 ip: p.ip.clone(),
                 online: p.online,
+                status: p.status,
                 notify: p.notify,
                 count: d.counts.get(&p.id).copied().unwrap_or(0),
             })

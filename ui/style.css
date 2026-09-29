@@ -12,6 +12,8 @@ html, body { margin: 0; height: 100%; background: var(--bg); color: var(--fg);
 .grow { flex: 1; min-height: 0; overflow: auto; }
 .muted { color: var(--mu); font-size: 12px; }
 .err { color: var(--er); white-space: pre-wrap; }
+.warn { color: #b8860b; font-size: 12px; }
+@media (prefers-color-scheme: dark) { .warn { color: #e0b050; } }
 .head { display: flex; align-items: baseline; gap: 8px; }
 .head b { font-size: 14px; }
 .body { white-space: pre-wrap; word-break: break-word; user-select: text; border: 1px solid var(--bd);

@@ -16,7 +16,7 @@ use tauri::{AppHandle, Emitter, Manager, RunEvent, State};
 
 #[tauri::command]
 fn me(st: State<AppState>) -> Value {
-    json!({ "meta": st.my_meta(), "port": st.port })
+    json!({ "meta": st.my_meta(), "port": st.port, "os": std::env::consts::OS })
 }
 
 #[tauri::command]
@@ -38,6 +38,7 @@ async fn save_settings(app: AppHandle, s: Settings) -> Result<(), String> {
         let dir = s.download_dir.trim();
         *cur = Settings {
             id: cur.id.clone(),
+            status: cur.status, // changed from the tray only; the form may be stale
             name: if name.is_empty() { cur.name.clone() } else { name.to_string() },
             download_dir: if dir.is_empty() { cur.download_dir.clone() } else { dir.to_string() },
             max_files: s.max_files.clamp(0, 10_000),
@@ -57,6 +58,18 @@ async fn save_settings(app: AppHandle, s: Settings) -> Result<(), String> {
     tray::refresh(&app);
     st.scan.notify_one();
     Ok(())
+}
+
+/// Kind and size of attachment paths for the compose window (folders are zipped when sent).
+#[tauri::command]
+fn stat_paths(paths: Vec<String>) -> Vec<Value> {
+    paths
+        .into_iter()
+        .map(|p| match std::fs::metadata(&p) {
+            Ok(m) => json!({ "path": p, "dir": m.is_dir(), "size": m.len(), "ok": true }),
+            Err(_) => json!({ "path": p, "dir": false, "size": 0, "ok": false }),
+        })
+        .collect()
 }
 
 #[tauri::command]
@@ -251,6 +264,7 @@ fn main() {
             spare_ready,
             cancel_recv,
             open_path,
+            stat_paths,
             open_url,
             pick_files,
             pick_dir,
@@ -267,7 +281,10 @@ fn main() {
 
             let dir = app.path().app_data_dir()?;
             std::fs::create_dir_all(&dir)?;
-            let settings = AppState::load_settings(&dir);
+            let mut settings = AppState::load_settings(&dir);
+            if settings.auto_online {
+                settings.status = state::Status::Online;
+            }
             let dl = app
                 .path()
                 .download_dir()
@@ -287,10 +304,20 @@ fn main() {
         })
         .build(tauri::generate_context!())
         .expect("failed to start PopupMessenger")
-        .run(|_, e| {
+        .run(|_app, e| match e {
             // Tray-only app: closing the last window must not quit.
-            if let RunEvent::ExitRequested { api, code: None, .. } = e {
-                api.prevent_exit();
+            RunEvent::ExitRequested { api, code: None, .. } => api.prevent_exit(),
+            // macOS: files/folders handed over by LaunchServices ("Open With", drop on the app).
+            #[cfg(target_os = "macos")]
+            RunEvent::Opened { urls } => {
+                let files = urls
+                    .iter()
+                    .filter_map(|u| u.to_file_path().ok())
+                    .filter(|p| p.exists())
+                    .map(|p| p.to_string_lossy().into_owned())
+                    .collect();
+                shell::queue_files(_app, files);
             }
+            _ => {}
         });
 }

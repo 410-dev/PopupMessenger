@@ -10,7 +10,7 @@ npm run dev      # 개발 실행
 npm run build    # 설치 파일 (Windows: MSI/NSIS, macOS: .app/.dmg)
 ```
 
-필요: Rust (stable), Node.js. Windows는 WebView2, macOS는 Xcode CLT.
+필요: Rust (stable), Node.js. Windows는 WebView2, macOS는 Xcode Command Line Tools. 지원 OS: Windows 10/11, macOS 15 Sequoia ~ macOS 27.
 
 ## 동작 방식
 
@@ -21,17 +21,24 @@ npm run build    # 설치 파일 (Windows: MSI/NSIS, macOS: .app/.dmg)
 | 메시지 | 상대 포트로 TCP 연결 → JSON 헤더 → 수락/거절 → 파일 원본 스트리밍 → 완료 |
 | 알림 켬 | 수신 즉시 항상 위 팝업 창 |
 | 알림 끔 | 받은 쪽지함에만 쌓이고 트레이 아이콘이 주황색으로 바뀜 |
-| 트레이 | 좌클릭: 받은 쪽지. 우클릭: 자주 보낸 순 상위 10명 → 클릭 시 바로 쪽지 쓰기, 11명 이상이면 "더보기…" |
+| 상태 | 트레이 "상태" 메뉴: 온라인 / 방해금지 / 오프라인. 오프라인이면 다른 사람 목록에서 사라짐. 방해금지면 보내는 사람에게 표시되고, 받을 때 팝업·수신 중 창 없이 쪽지함에 쌓이며 트레이 아이콘에 작은 빨간 점. "재시작 시 온라인으로 자동 전환"(기본 켬) |
+| 트레이 | 좌클릭: 쪽지함(받은/보낸 쪽지). 우클릭: 자주 보낸 순 상위 10명 → 클릭 시 바로 쪽지 쓰기, 11명 이상이면 "더보기…" |
 | 첨부 | 기본 10개 · 파일당 10GB. 받는 쪽 설정으로 조정 가능하며 디스크 여유(−512MB)를 넘지 않도록 자동 축소 |
 | 대량 수신 | 3개 이상 또는 20MB 이상이면 "수신 중" 창(진행률, 취소) |
+| 폴더 | 폴더를 첨부하면 보낼 때 `<폴더>.zip`으로 자동 압축 (링크·`.DS_Store` 제외, 보낸 뒤 임시 파일 삭제) |
+| 받은 파일 | 기본은 쪽지마다 `보낸 사람 YYYY-MM-DD HHMMSS` 폴더를 만들어 저장. 설정에서 끄면 저장 위치에 바로 저장 |
+| 메모리 | 효율 모드(기본): 창을 닫으면 해제. 성능 모드: 숨은 창 하나를 미리 그려 두어 창이 바로 뜸 |
 | 자동 실행 | 릴리스 빌드에서 로그인 시 자동 실행 등록 (설정에서 끔) |
-| 우클릭 메뉴 | Windows 탐색기 `Send using PopupMessenger` (HKCU에 등록, 관리자 권한 불필요). Windows 11은 "추가 옵션 표시" 안에 있음 |
+| 우클릭 메뉴 | Windows: 탐색기에서 파일·폴더 우클릭 `Send using PopupMessenger` (HKCU, 관리자 권한 불필요. Windows 11은 "추가 옵션 표시" 안). macOS: Finder 우클릭 > 빠른 동작 `Send using PopupMessenger` (`~/Library/Services`에 설치) |
 
 데이터: 앱 데이터 폴더의 `settings.json`, `data.json`. 받은 파일: `다운로드/PopupMessenger` (설정에서 변경).
 
 ## 참고
 
 - 처음 실행 시 Windows 방화벽 허용 창이 뜨면 "개인 네트워크"를 허용해야 다른 PC에서 보입니다.
+- macOS: 처음 실행 시 "로컬 네트워크" 접근 허용 창에서 허용해야 탐색·전송이 됩니다 (시스템 설정 > 개인정보 보호 및 보안 > 로컬 네트워크). 다운로드 폴더 접근도 한 번 묻습니다.
+- macOS: 빌드는 임시(ad-hoc) 서명이라 처음 열 때 Gatekeeper 경고가 뜹니다. Finder에서 우클릭 > 열기, 또는 `xattr -dr com.apple.quarantine /Applications/PopupMessenger.app`. 빠른 동작이 안 보이면 시스템 설정 > 키보드 > 키보드 단축키 > 서비스(또는 확장 프로그램 > Finder)에서 켜 주세요.
+- macOS에서는 Dock 아이콘 없이 메뉴 막대(트레이)에만 표시됩니다.
 - 브로드캐스트가 막힌 망(서브넷이 다른 경우 등)은 설정의 "추가 탐색 주소"에 상대 IP를 넣으면 됩니다.
 - 전송은 암호화되지 않습니다. 신뢰할 수 있는 LAN에서만 사용하세요.
 - `src-tauri/icons`의 아이콘은 빌드용 임시 파일입니다. 트레이 아이콘은 코드에서 그린 점입니다.

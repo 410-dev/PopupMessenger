@@ -31,6 +31,9 @@ const time = (ts) => {
   return d.toDateString() === now.toDateString() ? hm : `${d.getMonth() + 1}/${d.getDate()} ${hm}`;
 };
 const base = (p) => p.split(/[\\/]/).pop();
+const MAC = navigator.userAgent.includes('Mac');
+const SEND_KEY = MAC ? '⌘+Enter' : 'Ctrl+Enter';
+const isSendKey = (e) => e.key === 'Enter' && (e.ctrlKey || e.metaKey);
 const close = () => win.close();
 document.addEventListener('keydown', (e) => { if (e.key === 'Escape') close(); });
 document.addEventListener('contextmenu', (e) => { if (!e.target.closest('input,textarea,.body')) e.preventDefault(); });
@@ -75,7 +78,7 @@ async function popup() {
       h('button', { class: 'primary', onclick: reply }, '답장'),
       h('button', { onclick: close }, '닫기')),
   );
-  document.addEventListener('keydown', (e) => { if (e.key === 'Enter' && e.ctrlKey) reply(); });
+  document.addEventListener('keydown', (e) => { if (isSendKey(e)) reply(); });
 }
 
 // ---------------------------------------------------------------- compose
@@ -91,18 +94,34 @@ async function compose() {
   const initial = below ? `\n\n\n${below}` : '';
 
   const toLine = h('div', { class: 'muted' });
-  const ta = h('textarea', { class: 'grow', placeholder: '내용 (Ctrl+Enter 전송)', value: initial });
+  const dndLine = h('div', { class: 'warn', hidden: true });
+  const stats = new Map(); // path -> { dir, size, ok }
+  const ta = h('textarea', { class: 'grow', placeholder: `내용 (${SEND_KEY} 전송)`, value: initial });
   const list = h('div', { class: 'files' });
   const prog = h('progress', { max: 1, value: 0, hidden: true });
   const status = h('span', { class: 'status muted' });
   const sendBtn = h('button', { class: 'primary', onclick: send }, '전송');
 
-  const drawTo = () => { toLine.textContent = `받는 사람: ${to.map(nameOf).join(', ')}`; };
-  const drawFiles = () => list.replaceChildren(...files.map((f, i) =>
-    h('div', { class: 'file' },
-      h('span', { title: f }, base(f)),
-      h('a', { class: 'muted', onclick: () => { files.splice(i, 1); drawFiles(); } }, '✕'))));
-  const addFiles = (ps) => { files = [...new Set([...files, ...ps])]; drawFiles(); };
+  const drawTo = () => {
+    toLine.textContent = `받는 사람: ${to.map(nameOf).join(', ')}`;
+    const dnd = to.filter((id) => (peers.find((p) => p.id === id) || {}).status === 'dnd').map(nameOf);
+    dndLine.hidden = !dnd.length;
+    dndLine.textContent = `⛔ ${dnd.join(', ')} 님은 방해금지 상태입니다. 알림 없이 쪽지함으로 전달됩니다.`;
+  };
+  const drawFiles = () => list.replaceChildren(...files.map((f, i) => {
+    const s = stats.get(f);
+    const info = !s ? '' : !s.ok ? '읽을 수 없음' : s.dir ? '폴더 → zip으로 압축' : size(s.size);
+    return h('div', { class: 'file' },
+      h('span', { title: f }, base(f) + (s && s.dir ? '/' : '')),
+      h('span', { class: s && !s.ok ? 'err' : 'muted' }, info),
+      h('a', { class: 'muted', onclick: () => { files.splice(i, 1); drawFiles(); } }, '✕'));
+  }));
+  const addFiles = async (ps) => {
+    files = [...new Set([...files, ...ps])];
+    drawFiles();
+    for (const s of await invoke('stat_paths', { paths: files.filter((f) => !stats.has(f)) })) stats.set(s.path, s);
+    drawFiles();
+  };
 
   async function send() {
     if (sendBtn.disabled || ((!ta.value.trim() || ta.value === initial) && !files.length)) return;
@@ -112,6 +131,7 @@ async function compose() {
     const job = Math.random().toString(36).slice(2);
     const un = await listen('send-progress', ({ payload: p }) => {
       if (p.job !== job) return;
+      if (p.zip) { status.textContent = `'${p.zip}' 압축 중…`; return; }
       prog.hidden = false;
       prog.value = p.total ? p.done / p.total : 0;
       status.textContent = `${p.to}: ${size(p.done)} / ${size(p.total)}`;
@@ -128,14 +148,15 @@ async function compose() {
     sendBtn.disabled = false;
   }
 
-  ta.addEventListener('keydown', (e) => { if (e.key === 'Enter' && e.ctrlKey) send(); });
+  ta.addEventListener('keydown', (e) => { if (isSendKey(e)) send(); });
   T.webview.getCurrentWebview().onDragDropEvent(({ payload: p }) => {
     $app.classList.toggle('drop', p.type === 'enter' || p.type === 'over');
     if (p.type === 'drop') addFiles(p.paths);
   });
   drawTo();
-  drawFiles();
-  render(toLine, ta, list, prog,
+  addFiles([]);
+  listen('peers', async () => { peers.splice(0, peers.length, ...(await invoke('peers'))); drawTo(); });
+  render(toLine, dndLine, ta, list, prog,
     h('div', { class: 'bar' }, status,
       h('button', { onclick: async () => addFiles(await invoke('pick_files')) }, '파일…'),
       sendBtn));
@@ -163,17 +184,18 @@ async function pick() {
   }
   function draw() {
     const s = q.value.trim().toLowerCase();
-    const shown = peers.filter((p) => !s || `${p.name} ${p.host} ${p.ip}`.toLowerCase().includes(s));
+    const shown = peers.filter((p) => p.online && (!s || `${p.name} ${p.host} ${p.ip}`.toLowerCase().includes(s)));
     list.replaceChildren(...(shown.length ? shown.map((p) => {
       const cb = h('input', { type: 'checkbox', checked: sel.has(p.id), onchange: () => {
         cb.checked ? sel.add(p.id) : sel.delete(p.id);
         go.disabled = !sel.size;
         go.textContent = sel.size ? `${sel.size}명에게 쓰기` : '쓰기';
       } });
-      return h('div', { class: 'row' + (p.online ? '' : ' off') }, cb,
+      return h('div', { class: 'row' }, cb,
         h('span', { class: 'name', title: '클릭하면 바로 쓰기', onclick: () => open([p.id]) }, p.name),
-        h('span', { class: 'muted' }, p.online ? (p.host || p.ip) : '오프라인'));
-    }) : [h('div', { class: 'empty muted' }, '사용자가 없습니다')]));
+        p.status === 'dnd' && h('span', { class: 'warn', title: '알림 없이 쪽지함으로 전달됩니다' }, '방해금지'),
+        h('span', { class: 'muted' }, p.host || p.ip));
+    }) : [h('div', { class: 'empty muted' }, '접속 중인 사용자가 없습니다')]));
   }
   listen('peers', async () => { peers = await invoke('peers'); draw(); });
   q.addEventListener('keydown', (e) => {
@@ -283,6 +305,8 @@ async function settings() {
     notify: h('input', { type: 'checkbox', checked: s.notify }),
     autostart: h('input', { type: 'checkbox', checked: s.autostart }),
     context_menu: h('input', { type: 'checkbox', checked: s.context_menu }),
+    auto_online: h('input', { type: 'checkbox', checked: s.auto_online }),
+    split_folders: h('input', { type: 'checkbox', checked: s.split_folders }),
     max_files: h('input', { type: 'number', min: 0, value: s.max_files }),
     max_file_gb: h('input', { type: 'number', min: 0, step: 'any', value: s.max_file_gb }),
     download_dir: h('input', { value: s.download_dir }),
@@ -301,6 +325,8 @@ async function settings() {
       notify: f.notify.checked,
       autostart: f.autostart.checked,
       context_menu: f.context_menu.checked,
+      auto_online: f.auto_online.checked,
+      split_folders: f.split_folders.checked,
       max_files: Math.max(0, parseInt(f.max_files.value, 10) || 0),
       max_file_gb: Math.max(0, parseFloat(f.max_file_gb.value) || 0),
       download_dir: f.download_dir.value,
@@ -316,10 +342,14 @@ async function settings() {
     field('서명 (새 쪽지와 답장에 자동으로 들어감)', f.signature),
     check('메시지가 오면 팝업으로 표시 (끄면 트레이에 보관)', f.notify),
     check('시스템 시작 시 실행', f.autostart),
-    check('탐색기 우클릭 메뉴 "Send using PopupMessenger" (Windows)', f.context_menu),
+    check('재시작 시 온라인으로 자동 전환', f.auto_online),
+    check(me.os === 'macos'
+      ? 'Finder 우클릭 > 빠른 동작 "Send using PopupMessenger" (파일·폴더)'
+      : '탐색기 우클릭 메뉴 "Send using PopupMessenger" (파일·폴더)', f.context_menu),
     h('div', { class: 'inline' }, field('받을 첨부파일 수', f.max_files), field('파일당 최대 크기 (GB)', f.max_file_gb)),
     field('받은 파일 저장 위치', h('div', { class: 'inline' }, f.download_dir,
       h('button', { type: 'button', onclick: async () => { const d = await invoke('pick_dir'); if (d) f.download_dir.value = d; } }, '…'))),
+    check('쪽지마다 폴더를 따로 만들어 저장 (보낸 사람 + 날짜)', f.split_folders),
     field('추가 탐색 주소 (브로드캐스트가 닿지 않는 PC)', f.extra_hosts),
     field('탐색 포트 수 (55000부터)', f.scan_span),
     h('fieldset', {}, h('legend', { class: 'muted' }, '메모리 절약'),

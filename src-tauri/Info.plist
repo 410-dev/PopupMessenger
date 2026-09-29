@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- Merged into the app bundle's Info.plist by the Tauri bundler (macOS). -->
+<plist version="1.0">
+<dict>
+	<!-- Tray-only app: no Dock icon, no app menu bar. -->
+	<key>LSUIElement</key>
+	<true/>
+	<!-- macOS 15+ asks before an app talks to the local network (UDP broadcast discovery, TCP to peers). -->
+	<key>NSLocalNetworkUsageDescription</key>
+	<string>같은 네트워크의 PopupMessenger 사용자를 찾고 쪽지와 파일을 주고받기 위해 필요합니다.</string>
+	<!-- Attachments are usually picked from and saved to these folders (TCC prompts). -->
+	<key>NSDownloadsFolderUsageDescription</key>
+	<string>받은 첨부파일을 다운로드 폴더에 저장합니다.</string>
+	<key>NSDesktopFolderUsageDescription</key>
+	<string>데스크탑의 파일을 첨부해 보냅니다.</string>
+	<key>NSDocumentsFolderUsageDescription</key>
+	<string>문서 폴더의 파일을 첨부해 보냅니다.</string>
+</dict>
+</plist>

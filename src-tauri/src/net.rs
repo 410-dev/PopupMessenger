@@ -181,7 +181,8 @@ pub fn upsert_peer(app: &AppHandle, m: Meta, ip: IpAddr) {
         let mut d = st.data.lock().unwrap();
         let e = d.peers.entry(m.id.clone()).or_insert_with(|| Peer { id: m.id.clone(), ..Default::default() });
         let persist = e.name != m.name || e.ip != ip || e.port != m.port || e.host != m.host;
-        let changed = persist || !e.online || e.notify != m.notify;
+        let online = m.status != Status::Offline;
+        let changed = persist || e.online != online || e.status != m.status || e.notify != m.notify;
         e.name = m.name;
         e.host = m.host;
         e.ip = ip;
@@ -189,7 +190,8 @@ pub fn upsert_peer(app: &AppHandle, m: Meta, ip: IpAddr) {
         e.notify = m.notify;
         e.max_files = m.max_files;
         e.max_file_size = m.max_file_size;
-        e.online = true;
+        e.status = m.status;
+        e.online = online;
         e.seen = Some(Instant::now());
         (changed, persist)
     };
@@ -322,7 +324,15 @@ async fn receive(app: AppHandle, mut s: TcpStream, addr: SocketAddr, hdr: Value)
 
     // Local id: it ends up in window labels, so never trust the sender's.
     let id = new_id();
-    let big = h.files.len() >= BIG_COUNT || total >= BIG_BYTES;
+    let (dnd, split) = {
+        let s = app.state::<AppState>();
+        let s = s.settings.lock().unwrap();
+        (s.status == Status::Dnd, s.split_folders)
+    };
+    let base = dir.clone();
+    let dir = if split && !h.files.is_empty() { message_dir(&base, &h.from.name) } else { base.clone() };
+    // Do-not-disturb: no progress window either; the message just lands in the inbox.
+    let big = !dnd && (h.files.len() >= BIG_COUNT || total >= BIG_BYTES);
     let cancel = Arc::new(AtomicBool::new(false));
     if big {
         app.state::<AppState>().cancels.lock().unwrap().insert(id.clone(), cancel.clone());
@@ -391,6 +401,9 @@ async fn receive(app: AppHandle, mut s: TcpStream, addr: SocketAddr, hdr: Value)
         let _ = write_frame(&mut s, &json!({ "t": "done" })).await;
     }
     drop(s);
+    if saved.is_empty() && dir != base {
+        let _ = std::fs::remove_dir(&dir); // nothing was saved into the per-message folder
+    }
 
     if big {
         app.state::<AppState>().cancels.lock().unwrap().remove(&id);
@@ -417,11 +430,31 @@ fn deliver(app: &AppHandle, m: Message) {
     let st = app.state::<AppState>();
     let id = m.id.clone();
     st.push_message(m);
-    if st.settings.lock().unwrap().notify {
+    let popup = {
+        let s = st.settings.lock().unwrap();
+        s.notify && s.status != Status::Dnd
+    };
+    if popup {
         ui::open_popup(app, &id);
     }
     tray::refresh(app);
     let _ = app.emit("inbox", ());
+}
+
+/// Creates "<sender> <YYYY-MM-DD HHMMSS>" under `base` (with " (n)" if taken);
+/// falls back to `base` itself if it cannot be created.
+fn message_dir(base: &Path, sender: &str) -> PathBuf {
+    let name = sanitize(&format!("{sender} {}", chrono::Local::now().format("%Y-%m-%d %H%M%S")));
+    for n in 0..1000 {
+        let d = if n == 0 { base.join(&name) } else { base.join(format!("{name} ({n})")) };
+        if std::fs::create_dir(&d).is_ok() {
+            return d;
+        }
+        if !d.exists() {
+            break;
+        }
+    }
+    base.to_path_buf()
 }
 
 fn sanitize(name: &str) -> String {
@@ -477,19 +510,31 @@ pub struct SendResult {
 
 pub async fn send(app: AppHandle, job: String, to: Vec<String>, text: String, files: Vec<String>) -> Vec<SendResult> {
     let st = app.state::<AppState>();
-    let mut list: Vec<(String, String, u64)> = Vec::new();
+    // Folders are sent as "<folder>.zip", built once here for all recipients.
+    let tmp = std::env::temp_dir().join("PopupMessenger").join(new_id());
+    let mut list: Vec<(String, String, u64)> = Vec::new(); // (file to read, name on the wire, size)
+    let mut sources: Vec<String> = Vec::new(); // what the user picked, for the sent history
     let mut bad = String::new();
-    for p in &files {
+    for (i, p) in files.iter().enumerate() {
+        let name = Path::new(p).file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
         match std::fs::metadata(p) {
-            Ok(m) if m.is_file() => {
-                let name = Path::new(p).file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-                list.push((p.clone(), name, m.len()));
+            Ok(m) if m.is_file() => list.push((p.clone(), name, m.len())),
+            Ok(m) if m.is_dir() => {
+                let _ = app.emit("send-progress", json!({ "job": job, "zip": name }));
+                let zip_name = format!("{name}.zip");
+                let (src, dst) = (PathBuf::from(p), tmp.join(i.to_string()).join(&zip_name));
+                match tauri::async_runtime::spawn_blocking(move || zip_dir(&src, &dst).map(|n| (dst, n))).await {
+                    Ok(Ok((dst, n))) => list.push((dst.to_string_lossy().into_owned(), zip_name, n)),
+                    Ok(Err(e)) => bad = format!("'{name}' 폴더를 압축하지 못했습니다: {e}"),
+                    Err(e) => bad = format!("'{name}' 폴더를 압축하지 못했습니다: {e}"),
+                }
             }
-            _ => {
-                bad = format!("파일을 읽을 수 없습니다: {p}");
-                break;
-            }
+            _ => bad = format!("파일을 읽을 수 없습니다: {p}"),
         }
+        if !bad.is_empty() {
+            break;
+        }
+        sources.push(p.clone());
     }
 
     let mut out = Vec::new();
@@ -518,11 +563,50 @@ pub async fn send(app: AppHandle, job: String, to: Vec<String>, text: String, fi
             .map(|r| Recipient { id: r.to.clone(), name: r.name.clone(), ok: r.ok, error: r.error.clone() })
             .collect(),
         text,
-        files: list.into_iter().map(|(path, name, size)| FileEntry { name, size, path }).collect(),
+        files: list.into_iter().zip(sources).map(|((_, name, size), path)| FileEntry { name, size, path }).collect(),
         ts: now_ms(),
     });
+    let _ = std::fs::remove_dir_all(&tmp);
     let _ = app.emit("sent", ());
     out
+}
+
+/// Zips `src` (recursively, keeping its own name as the top folder) into `dst`.
+/// Symlinks and junctions are skipped so a link cannot pull in files outside the folder.
+fn zip_dir(src: &Path, dst: &Path) -> Result<u64, String> {
+    use std::io::Write;
+    use zip::write::SimpleFileOptions;
+    if let Some(parent) = dst.parent() {
+        std::fs::create_dir_all(parent).map_err(es)?;
+    }
+    let root = src.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| "folder".into());
+    let mut z = zip::ZipWriter::new(std::io::BufWriter::new(std::fs::File::create(dst).map_err(es)?));
+    // Fast level: attachments are often already compressed (media, archives).
+    let opts = SimpleFileOptions::default()
+        .compression_method(zip::CompressionMethod::Deflated)
+        .compression_level(Some(1));
+    let mut stack = vec![(src.to_path_buf(), root)];
+    while let Some((dir, prefix)) = stack.pop() {
+        z.add_directory(format!("{prefix}/"), opts).map_err(es)?;
+        for e in std::fs::read_dir(&dir).map_err(es)? {
+            let e = e.map_err(es)?;
+            let ft = e.file_type().map_err(es)?; // does not follow links
+            let name = e.file_name().to_string_lossy().into_owned();
+            if ft.is_symlink() || name == ".DS_Store" {
+                continue;
+            }
+            let entry = format!("{prefix}/{name}");
+            if ft.is_dir() {
+                stack.push((e.path(), entry));
+            } else if ft.is_file() {
+                let size = e.metadata().map_err(es)?.len();
+                z.start_file(entry, opts.large_file(size >= u32::MAX as u64)).map_err(es)?;
+                std::io::copy(&mut std::fs::File::open(e.path()).map_err(es)?, &mut z).map_err(es)?;
+            }
+        }
+    }
+    z.finish().map_err(es)?.flush().map_err(es)?;
+    Ok(std::fs::metadata(dst).map_err(es)?.len())
 }
 
 async fn send_one(app: &AppHandle, job: &str, p: &Peer, text: &str, files: &[(String, String, u64)]) -> Result<(), String> {

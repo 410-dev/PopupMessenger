@@ -1,4 +1,5 @@
-//! OS integration: autostart and the Explorer "Send using PopupMessenger" verb.
+//! OS integration: autostart and "Send using PopupMessenger" on selected files
+//! and folders (Explorer verb on Windows, Finder Quick Action on macOS).
 
 use crate::state::AppState;
 use crate::ui;
@@ -29,32 +30,83 @@ pub fn apply(app: &AppHandle) {
     let _ = set_context_menu(ctx);
 }
 
+/// Per-user verb for all files (`*`) and folders (`Directory`); no admin rights needed.
 #[cfg(windows)]
 fn set_context_menu(enable: bool) -> std::io::Result<()> {
     use winreg::enums::HKEY_CURRENT_USER;
     use winreg::RegKey;
     let hkcu = RegKey::predef(HKEY_CURRENT_USER);
-    let base = r"Software\Classes\*\shell\PopupMessenger";
-    if !enable {
-        let _ = hkcu.delete_subkey_all(base);
-        return Ok(());
-    }
     let exe = std::env::current_exe()?.to_string_lossy().into_owned();
-    let (k, _) = hkcu.create_subkey(base)?;
-    k.set_value("", &"Send using PopupMessenger")?;
-    k.set_value("MultiSelectModel", &"Player")?;
-    k.set_value("Icon", &exe)?;
-    let (c, _) = hkcu.create_subkey(format!(r"{base}\command"))?;
-    c.set_value("", &format!("\"{exe}\" --send \"%1\""))?;
+    for base in [r"Software\Classes\*\shell\PopupMessenger", r"Software\Classes\Directory\shell\PopupMessenger"] {
+        if !enable {
+            let _ = hkcu.delete_subkey_all(base);
+            continue;
+        }
+        let (k, _) = hkcu.create_subkey(base)?;
+        k.set_value("", &"Send using PopupMessenger")?;
+        k.set_value("MultiSelectModel", &"Player")?;
+        k.set_value("Icon", &exe)?;
+        let (c, _) = hkcu.create_subkey(format!(r"{base}\command"))?;
+        c.set_value("", &format!("\"{exe}\" --send \"%1\""))?;
+    }
     Ok(())
 }
 
-#[cfg(not(windows))]
+/// Installs a Finder Quick Action (right-click > Quick Actions / Services) as an
+/// Automator workflow in ~/Library/Services. It starts a new instance with
+/// `--send <paths>`; the single-instance plugin hands the paths to the running
+/// app (or that instance becomes the app if none is running).
+#[cfg(target_os = "macos")]
+fn set_context_menu(enable: bool) -> std::io::Result<()> {
+    let home = std::env::var("HOME").map_err(std::io::Error::other)?;
+    let wf = Path::new(&home).join("Library/Services/Send using PopupMessenger.workflow");
+    if !enable {
+        if wf.exists() {
+            std::fs::remove_dir_all(&wf)?;
+            refresh_services();
+        }
+        return Ok(());
+    }
+    let exe = std::env::current_exe()?;
+    let q = |p: &Path| format!("'{}'", p.to_string_lossy().replace('\'', r"'\''"));
+    // Through LaunchServices when bundled, so the app is not a child of the Automator runner.
+    let script = match exe.ancestors().find(|p| p.extension().is_some_and(|e| e == "app")) {
+        Some(bundle) => format!("open -n -a {} --args --send \"$@\"", q(bundle)),
+        None => format!("nohup {} --send \"$@\" >/dev/null 2>&1 &", q(&exe)),
+    };
+    let contents = wf.join("Contents");
+    std::fs::create_dir_all(&contents)?;
+    let wflow = WORKFLOW.replace("{{COMMAND}}", &xml_escape(&script));
+    let changed = std::fs::read_to_string(contents.join("document.wflow")).ok().as_deref() != Some(&wflow);
+    if changed {
+        std::fs::write(contents.join("Info.plist"), WORKFLOW_INFO)?;
+        std::fs::write(contents.join("document.wflow"), wflow)?;
+        refresh_services();
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn refresh_services() {
+    let _ = std::process::Command::new("/System/Library/CoreServices/pbs").arg("-update").spawn();
+}
+
+#[cfg(target_os = "macos")]
+fn xml_escape(s: &str) -> String {
+    s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;")
+}
+
+#[cfg(target_os = "macos")]
+const WORKFLOW_INFO: &str = include_str!("../macos/workflow-Info.plist");
+#[cfg(target_os = "macos")]
+const WORKFLOW: &str = include_str!("../macos/workflow-document.wflow");
+
+#[cfg(not(any(windows, target_os = "macos")))]
 fn set_context_menu(_enable: bool) -> std::io::Result<()> {
     Ok(())
 }
 
-/// Files following `--send` in a command line.
+/// Files and folders following `--send` in a command line.
 pub fn files_from_args(args: &[String], cwd: &str) -> Vec<String> {
     let mut out = Vec::new();
     let mut on = false;
@@ -65,7 +117,7 @@ pub fn files_from_args(args: &[String], cwd: &str) -> Vec<String> {
             on = false;
         } else if on {
             let p = Path::new(cwd).join(a);
-            if p.is_file() {
+            if p.is_file() || p.is_dir() {
                 out.push(p.to_string_lossy().into_owned());
             }
         }
