@@ -86,7 +86,7 @@ async function compose() {
   const peers = await invoke('peers');
   let to = V.to.slice();
   let files = V.files.slice();
-  const nameOf = (id) => (peers.find((p) => p.id === id) || { name: id }).name;
+  const nameOf = (id) => (peers.find((p) => p.id === id) || { display: id }).display;
   const { signature } = await invoke('get_settings');
   const orig = V.reply ? await invoke('get_message', { id: V.reply }) : null;
   // Cursor goes on top; signature and the quoted original sit below three blank lines.
@@ -108,7 +108,7 @@ async function compose() {
     dndLine.hidden = !dnd.length;
     dndLine.textContent = `⛔ ${dnd.join(', ')} 님은 방해금지 상태입니다. 알림 없이 쪽지함으로 전달됩니다.`;
   };
-  const drawFiles = () => list.replaceChildren(...files.map((f, i) => {
+  const drawFiles = () => list.replaceChildren(...(files.length ? [] : [h('div', { class: 'muted hint' }, '파일이나 폴더를 이 창에 끌어다 놓으면 첨부됩니다 (폴더는 zip으로 압축)')]), ...files.map((f, i) => {
     const s = stats.get(f);
     const info = !s ? '' : !s.ok ? '읽을 수 없음' : s.dir ? '폴더 → zip으로 압축' : size(s.size);
     return h('div', { class: 'file' },
@@ -184,7 +184,7 @@ async function pick() {
   }
   function draw() {
     const s = q.value.trim().toLowerCase();
-    const shown = peers.filter((p) => p.online && (!s || `${p.name} ${p.host} ${p.ip}`.toLowerCase().includes(s)));
+    const shown = peers.filter((p) => p.online && (!s || `${p.display} ${p.host} ${p.ip}`.toLowerCase().includes(s)));
     list.replaceChildren(...(shown.length ? shown.map((p) => {
       const cb = h('input', { type: 'checkbox', checked: sel.has(p.id), onchange: () => {
         cb.checked ? sel.add(p.id) : sel.delete(p.id);
@@ -192,9 +192,9 @@ async function pick() {
         go.textContent = sel.size ? `${sel.size}명에게 쓰기` : '쓰기';
       } });
       return h('div', { class: 'row' }, cb,
-        h('span', { class: 'name', title: '클릭하면 바로 쓰기', onclick: () => open([p.id]) }, p.name),
+        h('span', { class: 'name', title: '클릭하면 바로 쓰기', onclick: () => open([p.id]) }, p.display),
         p.status === 'dnd' && h('span', { class: 'warn', title: '알림 없이 쪽지함으로 전달됩니다' }, '방해금지'),
-        h('span', { class: 'muted' }, p.host || p.ip));
+        p.host && h('span', { class: 'muted' }, p.host));
     }) : [h('div', { class: 'empty muted' }, '접속 중인 사용자가 없습니다')]));
   }
   listen('peers', async () => { peers = await invoke('peers'); draw(); });
@@ -302,6 +302,7 @@ async function settings() {
   const check = (label, input) => h('label', { class: 'check' }, input, label);
   const f = {
     name: h('input', { value: s.name }),
+    show_host: h('input', { type: 'checkbox', checked: s.show_host }),
     notify: h('input', { type: 'checkbox', checked: s.notify }),
     autostart: h('input', { type: 'checkbox', checked: s.autostart }),
     context_menu: h('input', { type: 'checkbox', checked: s.context_menu }),
@@ -317,11 +318,18 @@ async function settings() {
     perf_mode: h('input', { type: 'radio', name: 'mode', checked: s.perf_mode }),
   };
   const err = h('div', { class: 'err' });
+  const nameWarn = h('div', { class: 'warn', hidden: true });
+  f.name.addEventListener('input', async () => {
+    const taken = await invoke('name_taken', { name: f.name.value });
+    nameWarn.hidden = !taken;
+    nameWarn.textContent = taken ? `같은 네트워크에 '${f.name.value.trim()}' 사용자가 이미 있습니다.` : '';
+  });
   async function save(e) {
     e.preventDefault();
     const n = {
       ...s,
       name: f.name.value,
+      show_host: f.show_host.checked,
       notify: f.notify.checked,
       autostart: f.autostart.checked,
       context_menu: f.context_menu.checked,
@@ -339,10 +347,12 @@ async function settings() {
   }
   render(h('form', { class: 'grow', onsubmit: save },
     field('이름', f.name),
+    nameWarn,
     field('서명 (새 쪽지와 답장에 자동으로 들어감)', f.signature),
     check('메시지가 오면 팝업으로 표시 (끄면 트레이에 보관)', f.notify),
     check('시스템 시작 시 실행', f.autostart),
     check('재시작 시 온라인으로 자동 전환', f.auto_online),
+    check('컴퓨터 호스트 이름 보기 (끄면 이름이 같은 사람은 이름-xxxx로 구분)', f.show_host),
     check(me.os === 'macos'
       ? 'Finder 우클릭 > 빠른 동작 "Send using PopupMessenger" (파일·폴더)'
       : '탐색기 우클릭 메뉴 "Send using PopupMessenger" (파일·폴더)', f.context_menu),

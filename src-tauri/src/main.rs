@@ -29,17 +29,29 @@ fn get_settings(st: State<AppState>) -> Settings {
     st.settings.lock().unwrap().clone()
 }
 
+/// For the settings form: another user on the LAN already has this name.
+#[tauri::command]
+fn name_taken(st: State<AppState>, name: String) -> bool {
+    let name = name.trim();
+    !name.is_empty() && name != st.settings.lock().unwrap().name && st.name_in_use(name)
+}
+
 #[tauri::command]
 async fn save_settings(app: AppHandle, s: Settings) -> Result<(), String> {
     let st = app.state::<AppState>();
+    let name = s.name.trim().to_string();
+    let renamed = !name.is_empty() && name != st.settings.lock().unwrap().name;
+    if renamed && st.name_in_use(&name) {
+        return Err(format!("같은 네트워크에 '{name}' 사용자가 이미 있습니다. 다른 이름을 써 주세요."));
+    }
     {
         let mut cur = st.settings.lock().unwrap();
-        let name = s.name.trim();
         let dir = s.download_dir.trim();
         *cur = Settings {
             id: cur.id.clone(),
             status: cur.status, // changed from the tray only; the form may be stale
-            name: if name.is_empty() { cur.name.clone() } else { name.to_string() },
+            name_custom: cur.name_custom || renamed,
+            name: if name.is_empty() { cur.name.clone() } else { name },
             download_dir: if dir.is_empty() { cur.download_dir.clone() } else { dir.to_string() },
             max_files: s.max_files.clamp(0, 10_000),
             max_file_gb: if s.max_file_gb.is_finite() { s.max_file_gb.clamp(0.0, 1.0e6) } else { cur.max_file_gb },
@@ -56,6 +68,7 @@ async fn save_settings(app: AppHandle, s: Settings) -> Result<(), String> {
     }
     shell::apply(&app);
     tray::refresh(&app);
+    let _ = app.emit("peers", ()); // display names depend on show_host
     st.scan.notify_one();
     Ok(())
 }
@@ -247,6 +260,7 @@ fn main() {
             me,
             peers,
             get_settings,
+            name_taken,
             save_settings,
             send_message,
             open_compose,

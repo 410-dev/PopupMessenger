@@ -2,25 +2,25 @@ use crate::state::{AppState, Status};
 use crate::{net, ui};
 use tauri::image::Image;
 use tauri::menu::{CheckMenuItem, Menu, MenuItem, PredefinedMenuItem, Submenu};
-use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
+use tauri::tray::TrayIconBuilder;
 use tauri::{AppHandle, Manager, Wry};
 
 const TRAY: &str = "main";
 /// Recipients shown directly in the tray menu; the rest go behind "더보기".
 const TOP_N: usize = 10;
 
-/// Placeholder icon drawn in code until real icons exist: a dot colored by
-/// status (orange when there is unread mail), plus a small red badge for mail
-/// that arrived silently in do-not-disturb.
+/// Placeholder icon drawn in code until real icons exist: a dot whose color
+/// always reflects the status, plus a small red badge while there is unread mail.
+/// (Unread used to recolor the whole dot orange, which made a switch from DND
+/// back to online look like the wrong status.)
 fn icon(status: Status, unread: bool) -> Image<'static> {
     const S: u32 = 32;
     let base = match status {
-        _ if unread && status != Status::Dnd => [232, 113, 10],
         Status::Online => [74, 144, 217],
         Status::Dnd => [142, 68, 173],
         Status::Offline => [140, 140, 140],
     };
-    let badge = unread && status == Status::Dnd;
+    let badge = unread;
     // Coverage of a disc of radius r centered at (cx, cy), anti-aliased over one pixel.
     let disc = |x: f32, y: f32, cx: f32, cy: f32, r: f32| (r - ((x - cx).powi(2) + (y - cy).powi(2)).sqrt()).clamp(0.0, 1.0);
     let mut px = Vec::with_capacity((S * S * 4) as usize);
@@ -66,7 +66,7 @@ fn build_menu(app: &AppHandle) -> tauri::Result<Menu<Wry>> {
         m.append(&MenuItem::with_id(app, "none", "(접속 중인 사용자 없음)", false, None::<&str>)?)?;
     }
     for p in peers.iter().take(TOP_N) {
-        let mut text = if p.host.is_empty() { p.name.clone() } else { format!("{}  ({})", p.name, p.host) };
+        let mut text = if p.host.is_empty() { p.display.clone() } else { format!("{}  ({})", p.display, p.host) };
         if p.status == Status::Dnd {
             text.push_str("  — 방해금지");
         }
@@ -91,13 +91,8 @@ pub fn create(app: &AppHandle) -> tauri::Result<()> {
         .icon(icon(Status::Online, false))
         .tooltip("PopupMessenger")
         .menu(&build_menu(app)?)
-        .show_menu_on_left_click(false)
+        .show_menu_on_left_click(true) // left and right click open the same menu
         .on_menu_event(|app, e| on_menu(app, e.id().as_ref()))
-        .on_tray_icon_event(|tray, e| {
-            if let TrayIconEvent::Click { button: MouseButton::Left, button_state: MouseButtonState::Up, .. } = e {
-                ui::open_inbox(tray.app_handle());
-            }
-        })
         .build(app)?;
     refresh(app);
     Ok(())

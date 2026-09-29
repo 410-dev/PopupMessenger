@@ -1,14 +1,16 @@
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU32};
 use std::sync::{Arc, Mutex};
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 /// Disk space kept free when accepting attachments.
 pub const DISK_MARGIN: u64 = 512 * 1024 * 1024;
 const GB: f64 = 1024.0 * 1024.0 * 1024.0;
 const INBOX_CAP: usize = 1000;
+/// Peers heard from within this window count as present on the network.
+pub const RECENT: Duration = Duration::from_secs(95);
 
 pub fn now_ms() -> u64 {
     SystemTime::now()
@@ -25,11 +27,44 @@ pub fn new_id() -> String {
     format!("{:016x}", h.finish())
 }
 
+/// OS account name; the base of the default display name.
+pub fn default_name() -> String {
+    std::env::var("USERNAME")
+        .or_else(|_| std::env::var("USER"))
+        .unwrap_or_else(|_| "user".into())
+}
+
+/// Stable 64-bit FNV-1a of a computer name as 16 hex digits. Only used to tell
+/// same-named users apart, so a non-cryptographic hash is fine.
+pub fn host_hash(host: &str) -> String {
+    let mut h: u64 = 0xcbf29ce484222325;
+    for b in host.trim().to_lowercase().bytes() {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x100000001b3);
+    }
+    format!("{h:016x}")
+}
+
+/// "<base>-<4 hex digits of the host hash>", moving to the next 4 digits while
+/// the result is taken. Falls back to the first 4 if every slice is taken.
+pub fn tagged(base: &str, host: &str, taken: impl Fn(&str) -> bool) -> String {
+    let hash = host_hash(host);
+    (0..4)
+        .map(|i| format!("{base}-{}", &hash[i * 4..i * 4 + 4]))
+        .find(|c| !taken(c))
+        .unwrap_or_else(|| format!("{base}-{}", &hash[..4]))
+}
+
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Settings {
     pub id: String,
     pub name: String,
+    /// The user typed `name` in settings. Otherwise it is the default, which is
+    /// renamed to "<name>-<hash>" automatically if someone on the LAN has the same name.
+    pub name_custom: bool,
+    /// Show peers' computer names in the tray and recipient lists.
+    pub show_host: bool,
     pub notify: bool,
     pub autostart: bool,
     pub max_files: u32,
@@ -78,12 +113,11 @@ impl Status {
 
 impl Default for Settings {
     fn default() -> Self {
-        let name = std::env::var("USERNAME")
-            .or_else(|_| std::env::var("USER"))
-            .unwrap_or_else(|_| "user".into());
         Self {
             id: new_id(),
-            name,
+            name: default_name(),
+            name_custom: false,
+            show_host: true,
             notify: true,
             autostart: true,
             max_files: 10,
@@ -153,6 +187,9 @@ pub struct Peer {
 pub struct PeerView {
     pub id: String,
     pub name: String,
+    /// `name`, or "<name>-<hash>" when another listed user has the same name
+    /// and computer names are hidden.
+    pub display: String,
     pub host: String,
     pub ip: String,
     pub online: bool,
@@ -312,6 +349,7 @@ impl AppState {
     }
 
     pub fn peers(&self, online_only: bool) -> Vec<PeerView> {
+        let show_host = self.settings.lock().unwrap().show_host;
         let d = self.data.lock().unwrap();
         let mut v: Vec<PeerView> = d
             .peers
@@ -320,7 +358,8 @@ impl AppState {
             .map(|p| PeerView {
                 id: p.id.clone(),
                 name: p.name.clone(),
-                host: p.host.clone(),
+                display: p.name.clone(),
+                host: if show_host { p.host.clone() } else { String::new() },
                 ip: p.ip.clone(),
                 online: p.online,
                 status: p.status,
@@ -334,7 +373,32 @@ impl AppState {
                 .then(b.count.cmp(&a.count))
                 .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
         });
+        if !show_host {
+            // Same-named online users are told apart by a tag from their computer name.
+            let mut taken: HashSet<String> = v.iter().filter(|p| p.online).map(|p| p.name.to_lowercase()).collect();
+            for i in 0..v.len() {
+                let dup = v[i].online
+                    && v.iter().filter(|q| q.online && q.name.eq_ignore_ascii_case(&v[i].name)).count() > 1;
+                if dup {
+                    let host = d.peers.get(&v[i].id).map(|p| p.host.clone()).unwrap_or_default();
+                    let tag = tagged(&v[i].name, &host, |c| taken.contains(&c.to_lowercase()));
+                    taken.insert(tag.to_lowercase());
+                    v[i].display = tag;
+                }
+            }
+        }
         v
+    }
+
+    /// Whether a user seen on the LAN recently (other than this one) uses `name`.
+    pub fn name_in_use(&self, name: &str) -> bool {
+        let me = self.my_id();
+        let name = name.trim();
+        self.data.lock().unwrap().peers.values().any(|p| {
+            p.id != me
+                && p.name.trim().eq_ignore_ascii_case(name)
+                && p.seen.is_some_and(|t| t.elapsed() < RECENT)
+        })
     }
 
     pub fn unread(&self) -> usize {

@@ -18,7 +18,6 @@ use tokio::time::timeout;
 pub const BASE_PORT: u16 = 55000;
 pub const MAX_PORT: u16 = 65500;
 const SCAN_EVERY: Duration = Duration::from_secs(30);
-const STALE: Duration = Duration::from_secs(95);
 const CHUNK: usize = 256 * 1024;
 const MAX_FRAME: u32 = 8 * 1024 * 1024;
 /// Transfers at or above these show the "receiving" window.
@@ -177,6 +176,7 @@ fn targets(app: &AppHandle) -> Vec<SocketAddr> {
 pub fn upsert_peer(app: &AppHandle, m: Meta, ip: IpAddr) {
     let st = app.state::<AppState>();
     let ip = ip.to_string();
+    let other_name = m.name.clone();
     let (changed, persist) = {
         let mut d = st.data.lock().unwrap();
         let e = d.peers.entry(m.id.clone()).or_insert_with(|| Peer { id: m.id.clone(), ..Default::default() });
@@ -201,6 +201,25 @@ pub fn upsert_peer(app: &AppHandle, m: Meta, ip: IpAddr) {
     if changed {
         peers_changed(app);
     }
+    avoid_name_clash(app, &other_name);
+}
+
+/// A default (never user-chosen) name that someone else on the LAN also uses
+/// becomes "<name>-<hash of this computer's name>" and stays the new default.
+fn avoid_name_clash(app: &AppHandle, other: &str) {
+    let st = app.state::<AppState>();
+    let clash = {
+        let s = st.settings.lock().unwrap();
+        !s.name_custom && s.name.trim().eq_ignore_ascii_case(other.trim())
+    };
+    if !clash {
+        return;
+    }
+    let name = tagged(&default_name(), &st.host, |c| st.name_in_use(c));
+    st.settings.lock().unwrap().name = name;
+    st.save_settings();
+    st.scan.notify_one(); // announce the new name right away
+    tray::refresh(app);
 }
 
 fn set_offline(app: &AppHandle, id: &str) {
@@ -221,7 +240,7 @@ fn expire(app: &AppHandle) {
     let st = app.state::<AppState>();
     let mut changed = false;
     for p in st.data.lock().unwrap().peers.values_mut() {
-        if p.online && p.seen.map_or(true, |t| t.elapsed() > STALE) {
+        if p.online && p.seen.map_or(true, |t| t.elapsed() > RECENT) {
             p.online = false;
             changed = true;
         }
