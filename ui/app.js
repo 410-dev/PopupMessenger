@@ -38,6 +38,35 @@ const close = () => win.close();
 document.addEventListener('keydown', (e) => { if (e.key === 'Escape') close(); });
 document.addEventListener('contextmenu', (e) => { if (!e.target.closest('input,textarea,.body')) e.preventDefault(); });
 
+// File drops. macOS: Tauri's native handler delivers paths (onDragDropEvent).
+// Windows: WebView2 receives the drop itself and the files are forwarded to the
+// app, which answers with their paths via window.__pmDrop (see src-tauri/src/windrop.rs).
+// Views that accept files set onDrop; everywhere else drops are refused, which also
+// keeps WebView2 from navigating to a dropped file.
+let onDrop = null;
+const hasFiles = (e) => e.dataTransfer && [...e.dataTransfer.types].includes('Files');
+const highlight = (on) => $app.classList.toggle('drop', on && !!onDrop);
+document.addEventListener('dragover', (e) => {
+  if (!hasFiles(e)) return;
+  e.preventDefault();
+  e.dataTransfer.dropEffect = onDrop ? 'copy' : 'none';
+  highlight(true);
+});
+document.addEventListener('dragleave', (e) => { if (!e.relatedTarget) highlight(false); });
+document.addEventListener('drop', (e) => {
+  if (!hasFiles(e)) return;
+  e.preventDefault();
+  highlight(false);
+  if (onDrop && e.dataTransfer.files.length && window.chrome?.webview) {
+    window.chrome.webview.postMessageWithAdditionalObjects('pm-drop', e.dataTransfer.files);
+  }
+});
+window.__pmDrop = (paths) => { if (onDrop && paths.length) onDrop(paths); };
+T.webview.getCurrentWebview().onDragDropEvent(({ payload: p }) => {
+  highlight(p.type === 'enter' || p.type === 'over');
+  if (p.type === 'drop' && onDrop) onDrop(p.paths);
+});
+
 // Splits text into text nodes and http(s) links. The link label is the normalized
 // URL itself (IDN hosts show as xn--), so what you see is what opens; the backend
 // re-validates before handing it to the browser.
@@ -149,10 +178,7 @@ async function compose() {
   }
 
   ta.addEventListener('keydown', (e) => { if (isSendKey(e)) send(); });
-  T.webview.getCurrentWebview().onDragDropEvent(({ payload: p }) => {
-    $app.classList.toggle('drop', p.type === 'enter' || p.type === 'over');
-    if (p.type === 'drop') addFiles(p.paths);
-  });
+  onDrop = addFiles;
   drawTo();
   addFiles([]);
   listen('peers', async () => { peers.splice(0, peers.length, ...(await invoke('peers'))); drawTo(); });

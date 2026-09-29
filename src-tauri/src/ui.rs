@@ -52,7 +52,13 @@ fn open(app: &AppHandle, label: &str, view: Value, title: &str, size: (f64, f64)
     // macOS: popups must also appear on the current Space / over full-screen apps.
     #[cfg(target_os = "macos")]
     let b = b.visible_on_all_workspaces(on_top);
-    let _ = b.build();
+    #[cfg(windows)]
+    let b = b.disable_drag_drop_handler(); // see windrop.rs
+    let _w = b.build();
+    #[cfg(windows)]
+    if let Ok(w) = &_w {
+        crate::windrop::attach(w);
+    }
 }
 
 fn take_spare(app: &AppHandle) -> Option<WebviewWindow> {
@@ -83,15 +89,20 @@ pub fn warm(app: &AppHandle) {
         *spare = Some((label.clone(), false));
         label
     };
-    let built = WebviewWindowBuilder::new(app, &label, WebviewUrl::App("index.html".into()))
+    let b = WebviewWindowBuilder::new(app, &label, WebviewUrl::App("index.html".into()))
         .inner_size(400.0, 400.0)
         .min_inner_size(260.0, 150.0)
         .visible(false)
         .focused(false)
-        .initialization_script("window.__SPARE=true;")
-        .build();
-    if built.is_err() {
-        *st.spare.lock().unwrap() = None;
+        .initialization_script("window.__SPARE=true;");
+    #[cfg(windows)]
+    let b = b.disable_drag_drop_handler(); // see windrop.rs
+    match b.build() {
+        #[cfg(windows)]
+        Ok(w) => crate::windrop::attach(&w),
+        #[cfg(not(windows))]
+        Ok(_) => {}
+        Err(_) => *st.spare.lock().unwrap() = None,
     }
 }
 

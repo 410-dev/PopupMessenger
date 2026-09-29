@@ -5,6 +5,8 @@ mod shell;
 mod state;
 mod tray;
 mod ui;
+#[cfg(windows)]
+mod windrop;
 
 use serde_json::{json, Value};
 use state::{AppState, Message, PeerView, Sent, Settings};
