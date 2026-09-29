@@ -1,0 +1,568 @@
+//! Discovery (UDP) and messaging (TCP) share one port number: 55000 + a,
+//! where `a` is the first offset whose TCP and UDP ports are both free.
+
+use crate::state::*;
+use crate::{tray, ui};
+use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, OnceLock};
+use std::time::{Duration, Instant};
+use tauri::{AppHandle, Emitter, Manager};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::{TcpListener, TcpStream, UdpSocket};
+use tokio::time::timeout;
+
+pub const BASE_PORT: u16 = 55000;
+pub const MAX_PORT: u16 = 65500;
+const SCAN_EVERY: Duration = Duration::from_secs(30);
+const STALE: Duration = Duration::from_secs(95);
+const CHUNK: usize = 256 * 1024;
+const MAX_FRAME: u32 = 8 * 1024 * 1024;
+/// Transfers at or above these show the "receiving" window.
+const BIG_COUNT: usize = 3;
+const BIG_BYTES: u64 = 20 * 1024 * 1024;
+const IO_TIMEOUT: Duration = Duration::from_secs(60);
+const PROGRESS_EVERY: Duration = Duration::from_millis(200);
+
+static UDP: OnceLock<Arc<UdpSocket>> = OnceLock::new();
+
+fn es<E: std::fmt::Display>(e: E) -> String {
+    e.to_string()
+}
+
+pub fn human(n: u64) -> String {
+    let u = ["B", "KB", "MB", "GB", "TB"];
+    let mut v = n as f64;
+    let mut i = 0;
+    while v >= 1024.0 && i < u.len() - 1 {
+        v /= 1024.0;
+        i += 1;
+    }
+    if i == 0 { format!("{n} B") } else { format!("{v:.1} {}", u[i]) }
+}
+
+pub fn bind() -> Option<(std::net::TcpListener, std::net::UdpSocket, u16)> {
+    for p in BASE_PORT..=MAX_PORT {
+        if let Ok(t) = std::net::TcpListener::bind((Ipv4Addr::UNSPECIFIED, p)) {
+            if let Ok(u) = std::net::UdpSocket::bind((Ipv4Addr::UNSPECIFIED, p)) {
+                return Some((t, u, p));
+            }
+        }
+    }
+    None
+}
+
+pub fn start(app: AppHandle, tcp: std::net::TcpListener, udp: std::net::UdpSocket) {
+    let _ = tcp.set_nonblocking(true);
+    let _ = udp.set_nonblocking(true);
+    let _ = udp.set_broadcast(true);
+
+    let a = app.clone();
+    tauri::async_runtime::spawn(async move {
+        let Ok(udp) = UdpSocket::from_std(udp) else { return };
+        let udp = Arc::new(udp);
+        let _ = UDP.set(udp.clone());
+        tauri::async_runtime::spawn(scan_loop(a.clone(), udp.clone()));
+        udp_loop(a, udp).await;
+    });
+
+    tauri::async_runtime::spawn(async move {
+        let Ok(l) = TcpListener::from_std(tcp) else { return };
+        loop {
+            if let Ok((s, addr)) = l.accept().await {
+                let app = app.clone();
+                tauri::async_runtime::spawn(async move {
+                    let _ = handle_conn(app, s, addr).await;
+                });
+            }
+        }
+    });
+}
+
+// ---------------------------------------------------------------- discovery
+
+async fn udp_loop(app: AppHandle, sock: Arc<UdpSocket>) {
+    let mut buf = vec![0u8; 4096];
+    loop {
+        // Windows reports ICMP port-unreachable as a recv error; just keep going.
+        let Ok((n, src)) = sock.recv_from(&mut buf).await else {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            continue;
+        };
+        let Ok(p) = serde_json::from_slice::<Value>(&buf[..n]) else { continue };
+        let st = app.state::<AppState>();
+        match p["t"].as_str() {
+            Some(t @ ("q" | "a")) => {
+                let Ok(m) = serde_json::from_value::<Meta>(p["me"].clone()) else { continue };
+                if m.id == st.my_id() {
+                    continue;
+                }
+                if t == "q" {
+                    let reply = json!({ "t": "a", "me": st.my_meta() }).to_string();
+                    let _ = sock.send_to(reply.as_bytes(), src).await;
+                }
+                upsert_peer(&app, m, src.ip());
+            }
+            Some("bye") => {
+                if let Some(id) = p["id"].as_str() {
+                    set_offline(&app, id);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+async fn scan_loop(app: AppHandle, sock: Arc<UdpSocket>) {
+    loop {
+        let pkt = json!({ "t": "q", "me": app.state::<AppState>().my_meta() }).to_string();
+        for t in targets(&app) {
+            let _ = sock.send_to(pkt.as_bytes(), t).await;
+        }
+        expire(&app);
+        let st = app.state::<AppState>();
+        let _ = timeout(SCAN_EVERY, st.scan.notified()).await;
+    }
+}
+
+/// Broadcast addresses of every IPv4 interface, extra hosts from settings and
+/// the last known address of every remembered peer.
+fn targets(app: &AppHandle) -> Vec<SocketAddr> {
+    let st = app.state::<AppState>();
+    let (span, extra) = {
+        let s = st.settings.lock().unwrap();
+        (s.scan_span.clamp(1, 1000), s.extra_hosts.clone())
+    };
+    let mut hosts: Vec<Ipv4Addr> = vec![Ipv4Addr::BROADCAST];
+    if let Ok(ifs) = if_addrs::get_if_addrs() {
+        for i in ifs {
+            if i.is_loopback() {
+                continue;
+            }
+            if let if_addrs::IfAddr::V4(v4) = i.addr {
+                let mask = u32::from(v4.netmask);
+                if mask != u32::MAX {
+                    hosts.push(Ipv4Addr::from(u32::from(v4.ip) | !mask));
+                }
+            }
+        }
+    }
+    let mut out: Vec<SocketAddr> = Vec::new();
+    for tok in extra.split(|c: char| c == ',' || c.is_whitespace()).filter(|s| !s.is_empty()) {
+        if let Ok(sa) = tok.parse::<SocketAddr>() {
+            out.push(sa);
+        } else if let Ok(ip) = tok.parse::<Ipv4Addr>() {
+            hosts.push(ip);
+        }
+    }
+    let end = BASE_PORT.saturating_add(span).min(MAX_PORT + 1);
+    for h in hosts {
+        for p in BASE_PORT..end {
+            out.push(SocketAddr::new(IpAddr::V4(h), p));
+        }
+    }
+    for p in st.data.lock().unwrap().peers.values() {
+        if let Ok(ip) = p.ip.parse::<IpAddr>() {
+            out.push(SocketAddr::new(ip, p.port));
+        }
+    }
+    out.sort();
+    out.dedup();
+    out
+}
+
+pub fn upsert_peer(app: &AppHandle, m: Meta, ip: IpAddr) {
+    let st = app.state::<AppState>();
+    let ip = ip.to_string();
+    let (changed, persist) = {
+        let mut d = st.data.lock().unwrap();
+        let e = d.peers.entry(m.id.clone()).or_insert_with(|| Peer { id: m.id.clone(), ..Default::default() });
+        let persist = e.name != m.name || e.ip != ip || e.port != m.port || e.host != m.host;
+        let changed = persist || !e.online || e.notify != m.notify;
+        e.name = m.name;
+        e.host = m.host;
+        e.ip = ip;
+        e.port = m.port;
+        e.notify = m.notify;
+        e.max_files = m.max_files;
+        e.max_file_size = m.max_file_size;
+        e.online = true;
+        e.seen = Some(Instant::now());
+        (changed, persist)
+    };
+    if persist {
+        st.save_data();
+    }
+    if changed {
+        peers_changed(app);
+    }
+}
+
+fn set_offline(app: &AppHandle, id: &str) {
+    let st = app.state::<AppState>();
+    let changed = match st.data.lock().unwrap().peers.get_mut(id) {
+        Some(p) if p.online => {
+            p.online = false;
+            true
+        }
+        _ => false,
+    };
+    if changed {
+        peers_changed(app);
+    }
+}
+
+fn expire(app: &AppHandle) {
+    let st = app.state::<AppState>();
+    let mut changed = false;
+    for p in st.data.lock().unwrap().peers.values_mut() {
+        if p.online && p.seen.map_or(true, |t| t.elapsed() > STALE) {
+            p.online = false;
+            changed = true;
+        }
+    }
+    if changed {
+        peers_changed(app);
+    }
+}
+
+pub fn peers_changed(app: &AppHandle) {
+    tray::refresh(app);
+    let _ = app.emit("peers", ());
+}
+
+pub async fn send_bye(app: &AppHandle) {
+    let Some(sock) = UDP.get() else { return };
+    let pkt = json!({ "t": "bye", "id": app.state::<AppState>().my_id() }).to_string();
+    for t in targets(app) {
+        let _ = sock.send_to(pkt.as_bytes(), t).await;
+    }
+}
+
+// ---------------------------------------------------------------- framing
+
+async fn write_frame(s: &mut TcpStream, v: &Value) -> Result<(), String> {
+    let b = serde_json::to_vec(v).map_err(es)?;
+    timeout(IO_TIMEOUT, async {
+        s.write_u32(b.len() as u32).await?;
+        s.write_all(&b).await
+    })
+    .await
+    .map_err(|_| "시간 초과".to_string())?
+    .map_err(es)
+}
+
+async fn read_frame(s: &mut TcpStream, wait: Duration) -> Result<Value, String> {
+    timeout(wait, async {
+        let n = s.read_u32().await.map_err(es)?;
+        if n > MAX_FRAME {
+            return Err("잘못된 데이터".to_string());
+        }
+        let mut b = vec![0u8; n as usize];
+        s.read_exact(&mut b).await.map_err(es)?;
+        serde_json::from_slice(&b).map_err(es)
+    })
+    .await
+    .map_err(|_| "응답 시간 초과".to_string())?
+}
+
+// ---------------------------------------------------------------- receiving
+
+#[derive(Deserialize)]
+struct FileHdr {
+    name: String,
+    size: u64,
+}
+
+#[derive(Deserialize)]
+struct MsgHdr {
+    from: Meta,
+    #[serde(default)]
+    text: String,
+    #[serde(default)]
+    files: Vec<FileHdr>,
+}
+
+async fn handle_conn(app: AppHandle, mut s: TcpStream, addr: SocketAddr) -> Result<(), String> {
+    let _ = s.set_nodelay(true);
+    let hdr = read_frame(&mut s, Duration::from_secs(10)).await?;
+    match hdr["t"].as_str() {
+        Some("meta") => {
+            let me = app.state::<AppState>().my_meta();
+            write_frame(&mut s, &json!({ "t": "meta", "me": me })).await
+        }
+        Some("msg") => receive(app, s, addr, hdr).await,
+        _ => Err("unknown request".into()),
+    }
+}
+
+async fn receive(app: AppHandle, mut s: TcpStream, addr: SocketAddr, hdr: Value) -> Result<(), String> {
+    let h: MsgHdr = serde_json::from_value(hdr).map_err(es)?;
+    upsert_peer(&app, h.from.clone(), addr.ip());
+    let (max_files, max_size, dir, free) = app.state::<AppState>().limits();
+    let total: u64 = h.files.iter().map(|f| f.size).sum();
+
+    let reject = if h.files.len() > max_files as usize {
+        Some(format!("첨부파일은 최대 {max_files}개까지 받을 수 있습니다"))
+    } else if let Some(f) = h.files.iter().find(|f| f.size > max_size) {
+        Some(format!("'{}' 파일이 허용 크기({})를 초과합니다", f.name, human(max_size)))
+    } else if total > 0 && total.saturating_add(DISK_MARGIN) > free {
+        Some("받는 사람의 디스크 공간이 부족합니다".to_string())
+    } else {
+        None
+    };
+    if let Some(r) = reject {
+        let _ = write_frame(&mut s, &json!({ "t": "err", "reason": r })).await;
+        return Err(r);
+    }
+    write_frame(&mut s, &json!({ "t": "ok" })).await?;
+
+    // Local id: it ends up in window labels, so never trust the sender's.
+    let id = new_id();
+    let big = h.files.len() >= BIG_COUNT || total >= BIG_BYTES;
+    let cancel = Arc::new(AtomicBool::new(false));
+    if big {
+        app.state::<AppState>().cancels.lock().unwrap().insert(id.clone(), cancel.clone());
+        ui::open_receiving(&app, &id, &h.from.name, h.files.len(), total);
+    }
+
+    let mut saved = Vec::new();
+    let mut note = String::new();
+    let mut done: u64 = 0;
+    let mut last = Instant::now();
+    let mut buf = vec![0u8; CHUNK];
+    for f in &h.files {
+        let Some((tmp, fin)) = reserve_path(&dir, &sanitize(&f.name)) else {
+            note = "파일을 저장할 수 없습니다".into();
+            break;
+        };
+        let res: Result<(), String> = async {
+            let mut file = tokio::fs::OpenOptions::new().write(true).truncate(true).open(&tmp).await.map_err(es)?;
+            let mut remain = f.size;
+            while remain > 0 {
+                if cancel.load(Ordering::Relaxed) {
+                    return Err("수신이 취소되었습니다".to_string());
+                }
+                let want = remain.min(CHUNK as u64) as usize;
+                let n = timeout(IO_TIMEOUT, s.read(&mut buf[..want]))
+                    .await
+                    .map_err(|_| "시간 초과".to_string())?
+                    .map_err(es)?;
+                if n == 0 {
+                    return Err("연결이 끊어졌습니다".to_string());
+                }
+                file.write_all(&buf[..n]).await.map_err(es)?;
+                remain -= n as u64;
+                done += n as u64;
+                if big && last.elapsed() >= PROGRESS_EVERY {
+                    last = Instant::now();
+                    let _ = app.emit("recv-progress", json!({ "id": id, "done": done, "total": total, "file": f.name }));
+                }
+            }
+            file.flush().await.map_err(es)?;
+            drop(file.into_std().await);
+            Ok(())
+        }
+        .await;
+        match res {
+            Ok(()) => {
+                if tokio::fs::rename(&tmp, &fin).await.is_err() {
+                    let _ = tokio::fs::remove_file(&tmp).await;
+                    note = format!("'{}' 저장 실패", f.name);
+                    break;
+                }
+                saved.push(FileEntry {
+                    name: fin.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default(),
+                    size: f.size,
+                    path: fin.to_string_lossy().into_owned(),
+                });
+            }
+            Err(e) => {
+                let _ = tokio::fs::remove_file(&tmp).await;
+                note = format!("첨부파일 수신 중단: {e}");
+                break;
+            }
+        }
+    }
+    if note.is_empty() {
+        let _ = write_frame(&mut s, &json!({ "t": "done" })).await;
+    }
+    drop(s);
+
+    if big {
+        app.state::<AppState>().cancels.lock().unwrap().remove(&id);
+        ui::close(&app, &format!("recv-{id}"));
+    }
+    deliver(
+        &app,
+        Message {
+            id,
+            from_id: h.from.id,
+            from_name: h.from.name,
+            from_ip: addr.ip().to_string(),
+            text: h.text,
+            files: saved,
+            ts: now_ms(),
+            read: false,
+            note,
+        },
+    );
+    Ok(())
+}
+
+fn deliver(app: &AppHandle, m: Message) {
+    let st = app.state::<AppState>();
+    let id = m.id.clone();
+    st.push_message(m);
+    if st.settings.lock().unwrap().notify {
+        ui::open_popup(app, &id);
+    }
+    tray::refresh(app);
+    let _ = app.emit("inbox", ());
+}
+
+fn sanitize(name: &str) -> String {
+    let base = name.rsplit(['/', '\\']).next().unwrap_or("");
+    let mut s: String = base
+        .chars()
+        .map(|c| if c.is_control() || "<>:\"|?*".contains(c) { '_' } else { c })
+        .collect();
+    while s.ends_with('.') || s.ends_with(' ') {
+        s.pop();
+    }
+    let stem = s.split('.').next().unwrap_or("").to_ascii_uppercase();
+    const RESERVED: [&str; 22] = [
+        "CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8", "COM9", "LPT1",
+        "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
+    ];
+    if RESERVED.contains(&stem.as_str()) {
+        s.insert(0, '_');
+    }
+    if s.is_empty() { "file".into() } else { s }
+}
+
+/// Picks a free "name (n).ext" and creates its ".part" file so concurrent
+/// transfers cannot claim the same name.
+fn reserve_path(dir: &Path, name: &str) -> Option<(PathBuf, PathBuf)> {
+    let (stem, ext) = match name.rfind('.') {
+        Some(i) if i > 0 => (&name[..i], &name[i..]),
+        _ => (name, ""),
+    };
+    for n in 0..10000 {
+        let cand = if n == 0 { name.to_string() } else { format!("{stem} ({n}){ext}") };
+        let fin = dir.join(&cand);
+        let tmp = dir.join(format!("{cand}.part"));
+        if fin.exists() {
+            continue;
+        }
+        if std::fs::OpenOptions::new().write(true).create_new(true).open(&tmp).is_ok() {
+            return Some((tmp, fin));
+        }
+    }
+    None
+}
+
+// ---------------------------------------------------------------- sending
+
+#[derive(Serialize)]
+pub struct SendResult {
+    pub to: String,
+    pub name: String,
+    pub ok: bool,
+    pub error: String,
+}
+
+pub async fn send(app: AppHandle, job: String, to: Vec<String>, text: String, files: Vec<String>) -> Vec<SendResult> {
+    let st = app.state::<AppState>();
+    let mut list: Vec<(String, String, u64)> = Vec::new();
+    let mut bad = String::new();
+    for p in &files {
+        match std::fs::metadata(p) {
+            Ok(m) if m.is_file() => {
+                let name = Path::new(p).file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+                list.push((p.clone(), name, m.len()));
+            }
+            _ => {
+                bad = format!("파일을 읽을 수 없습니다: {p}");
+                break;
+            }
+        }
+    }
+
+    let mut out = Vec::new();
+    for id in to {
+        let peer = st.data.lock().unwrap().peers.get(&id).cloned();
+        let name = peer.as_ref().map(|p| p.name.clone()).unwrap_or_else(|| id.clone());
+        let r = if !bad.is_empty() {
+            Err(bad.clone())
+        } else if let Some(p) = peer {
+            send_one(&app, &job, &p, &text, &list).await
+        } else {
+            Err("알 수 없는 사용자".into())
+        };
+        if r.is_ok() {
+            *st.data.lock().unwrap().counts.entry(id.clone()).or_insert(0) += 1;
+            st.save_data();
+            tray::refresh(&app);
+        }
+        out.push(SendResult { to: id, name, ok: r.is_ok(), error: r.err().unwrap_or_default() });
+    }
+    out
+}
+
+async fn send_one(app: &AppHandle, job: &str, p: &Peer, text: &str, files: &[(String, String, u64)]) -> Result<(), String> {
+    if p.max_files > 0 && files.len() > p.max_files as usize {
+        return Err(format!("받는 사람은 첨부파일을 {}개까지 받습니다", p.max_files));
+    }
+    if p.max_file_size > 0 {
+        if let Some((_, n, _)) = files.iter().find(|f| f.2 > p.max_file_size) {
+            return Err(format!("'{n}' 파일이 받는 사람의 허용 크기({})를 초과합니다", human(p.max_file_size)));
+        }
+    }
+    let ip: IpAddr = p.ip.parse().map_err(|_| "주소 없음".to_string())?;
+    let mut s = timeout(Duration::from_secs(5), TcpStream::connect(SocketAddr::new(ip, p.port)))
+        .await
+        .map_err(|_| "연결 시간 초과 (오프라인?)".to_string())?
+        .map_err(|e| format!("연결 실패: {e}"))?;
+    let _ = s.set_nodelay(true);
+
+    let me = app.state::<AppState>().my_meta();
+    let fl: Vec<Value> = files.iter().map(|(_, n, sz)| json!({ "name": n, "size": sz })).collect();
+    write_frame(&mut s, &json!({ "t": "msg", "id": new_id(), "from": me, "text": text, "files": fl })).await?;
+    let r = read_frame(&mut s, IO_TIMEOUT).await?;
+    if r["t"] != "ok" {
+        return Err(r["reason"].as_str().unwrap_or("거부되었습니다").to_string());
+    }
+
+    let total: u64 = files.iter().map(|f| f.2).sum();
+    let mut done: u64 = 0;
+    let mut last = Instant::now();
+    let mut buf = vec![0u8; CHUNK];
+    for (path, _, size) in files {
+        let mut f = tokio::fs::File::open(path).await.map_err(es)?;
+        let mut remain = *size;
+        while remain > 0 {
+            let want = remain.min(CHUNK as u64) as usize;
+            let n = f.read(&mut buf[..want]).await.map_err(es)?;
+            if n == 0 {
+                return Err("전송 중 파일이 변경되었습니다".into());
+            }
+            timeout(IO_TIMEOUT, s.write_all(&buf[..n]))
+                .await
+                .map_err(|_| "시간 초과".to_string())?
+                .map_err(|_| "받는 쪽에서 연결을 끊었습니다".to_string())?;
+            remain -= n as u64;
+            done += n as u64;
+            if last.elapsed() >= PROGRESS_EVERY {
+                last = Instant::now();
+                let _ = app.emit("send-progress", json!({ "job": job, "to": p.name, "done": done, "total": total }));
+            }
+        }
+    }
+    let _ = s.flush().await;
+    let r = read_frame(&mut s, IO_TIMEOUT * 2).await?;
+    if r["t"] == "done" { Ok(()) } else { Err("전송이 완료되지 않았습니다".into()) }
+}
