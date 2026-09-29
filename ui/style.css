@@ -47,4 +47,8 @@ label { display: flex; flex-direction: column; gap: 2px; }
 label.check { flex-direction: row; align-items: center; gap: 6px; }
 label.check input { width: auto; }
 .inline { display: flex; gap: 6px; }
+.tabs { display: flex; gap: 4px; }
+.tabs button.on { background: var(--hi); font-weight: 600; }
+fieldset { border: 1px solid var(--bd); border-radius: 4px; padding: 6px 8px; display: flex; flex-direction: column; gap: 4px; }
+legend { padding: 0 4px; }
 .drop { outline: 2px dashed var(--ac); outline-offset: -4px; }

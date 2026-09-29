@@ -510,6 +510,18 @@ pub async fn send(app: AppHandle, job: String, to: Vec<String>, text: String, fi
         }
         out.push(SendResult { to: id, name, ok: r.is_ok(), error: r.err().unwrap_or_default() });
     }
+
+    st.push_sent(Sent {
+        id: new_id(),
+        to: out
+            .iter()
+            .map(|r| Recipient { id: r.to.clone(), name: r.name.clone(), ok: r.ok, error: r.error.clone() })
+            .collect(),
+        text,
+        files: list.into_iter().map(|(path, name, size)| FileEntry { name, size, path }).collect(),
+        ts: now_ms(),
+    });
+    let _ = app.emit("sent", ());
     out
 }
 

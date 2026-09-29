@@ -42,6 +42,9 @@ pub struct Settings {
     pub context_menu: bool,
     /// Appended to every new message and reply.
     pub signature: String,
+    /// Performance mode keeps one pre-rendered hidden window so new windows appear
+    /// instantly; efficiency mode (default) creates every window from scratch.
+    pub perf_mode: bool,
 }
 
 impl Default for Settings {
@@ -61,6 +64,7 @@ impl Default for Settings {
             scan_span: 10,
             context_menu: true,
             signature: String::new(),
+            perf_mode: false,
         }
     }
 }
@@ -147,6 +151,26 @@ pub struct Data {
     /// Sent message count per peer id; drives tray ordering.
     pub counts: HashMap<String, u32>,
     pub peers: HashMap<String, Peer>,
+    pub sent: Vec<Sent>,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+pub struct Recipient {
+    pub id: String,
+    pub name: String,
+    pub ok: bool,
+    #[serde(default)]
+    pub error: String,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+pub struct Sent {
+    pub id: String,
+    pub to: Vec<Recipient>,
+    pub text: String,
+    /// `path` is the local source file.
+    pub files: Vec<FileEntry>,
+    pub ts: u64,
 }
 
 pub struct AppState {
@@ -158,6 +182,10 @@ pub struct AppState {
     pub cancels: Mutex<HashMap<String, Arc<AtomicBool>>>,
     pub pending: Mutex<(Vec<String>, Option<Instant>)>,
     pub seq: AtomicU32,
+    /// Logical window label -> real label, for windows that were spare windows.
+    pub aliases: Mutex<HashMap<String, String>>,
+    /// The hidden pre-rendered window (label, page ready) in performance mode.
+    pub spare: Mutex<Option<(String, bool)>>,
     pub scan: tokio::sync::Notify,
 }
 
@@ -188,6 +216,8 @@ impl AppState {
             cancels: Mutex::new(HashMap::new()),
             pending: Mutex::new((Vec::new(), None)),
             seq: AtomicU32::new(1),
+            aliases: Mutex::new(HashMap::new()),
+            spare: Mutex::new(None),
             scan: tokio::sync::Notify::new(),
         }
     }
@@ -269,6 +299,15 @@ impl AppState {
 
     pub fn unread(&self) -> usize {
         self.data.lock().unwrap().inbox.iter().filter(|m| !m.read).count()
+    }
+
+    pub fn push_sent(&self, s: Sent) {
+        {
+            let mut d = self.data.lock().unwrap();
+            d.sent.insert(0, s);
+            d.sent.truncate(INBOX_CAP);
+        }
+        self.save_data();
     }
 
     pub fn push_message(&self, m: Message) {

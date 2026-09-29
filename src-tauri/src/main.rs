@@ -7,7 +7,7 @@ mod tray;
 mod ui;
 
 use serde_json::{json, Value};
-use state::{AppState, Message, PeerView, Settings};
+use state::{AppState, Message, PeerView, Sent, Settings};
 use std::sync::atomic::Ordering;
 use tauri::{AppHandle, Emitter, Manager, RunEvent, State};
 
@@ -48,6 +48,11 @@ async fn save_settings(app: AppHandle, s: Settings) -> Result<(), String> {
         std::fs::create_dir_all(&cur.download_dir).map_err(|e| format!("다운로드 폴더: {e}"))?;
     }
     st.save_settings();
+    if st.settings.lock().unwrap().perf_mode {
+        ui::warm(&app);
+    } else {
+        ui::cool(&app);
+    }
     shell::apply(&app);
     tray::refresh(&app);
     st.scan.notify_one();
@@ -119,6 +124,34 @@ fn mark_all_read(app: AppHandle) {
     st.save_data();
     tray::refresh(&app);
     let _ = app.emit("inbox", ());
+}
+
+#[tauri::command]
+fn sent_list(st: State<AppState>) -> Vec<Sent> {
+    st.data.lock().unwrap().sent.clone()
+}
+
+#[tauri::command]
+fn get_sent(st: State<AppState>, id: String) -> Option<Sent> {
+    st.data.lock().unwrap().sent.iter().find(|s| s.id == id).cloned()
+}
+
+#[tauri::command]
+fn delete_sent(app: AppHandle, id: String) {
+    let st = app.state::<AppState>();
+    st.data.lock().unwrap().sent.retain(|s| s.id != id);
+    st.save_data();
+    let _ = app.emit("sent", ());
+}
+
+#[tauri::command]
+async fn open_sent(app: AppHandle, id: String) {
+    ui::open_sent(&app, &id);
+}
+
+#[tauri::command]
+fn spare_ready(app: AppHandle, window: tauri::WebviewWindow) {
+    ui::spare_ready(&app, window.label());
 }
 
 #[tauri::command]
@@ -211,6 +244,11 @@ fn main() {
             inbox,
             delete_message,
             mark_all_read,
+            sent_list,
+            get_sent,
+            delete_sent,
+            open_sent,
+            spare_ready,
             cancel_recv,
             open_path,
             open_url,
@@ -218,6 +256,11 @@ fn main() {
             pick_dir,
             rescan
         ])
+        .on_window_event(|w, e| {
+            if let tauri::WindowEvent::Destroyed = e {
+                ui::forget(w.app_handle(), w.label());
+            }
+        })
         .setup(move |app| {
             #[cfg(target_os = "macos")]
             app.set_activation_policy(tauri::ActivationPolicy::Accessory);
@@ -239,6 +282,7 @@ fn main() {
             tray::create(&h)?;
             net::start(h.clone(), tcp, udp);
             shell::queue_files(&h, shell::files_from_args(&args, &cwd));
+            ui::warm(&h);
             Ok(())
         })
         .build(tauri::generate_context!())
