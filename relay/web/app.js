@@ -129,12 +129,13 @@ const field = (label, input) => h('div', { class: 'fld' }, h('label', { class: '
 // ---------------------------------------------------------------- data grid
 const sortState = {};
 // cols: { k, t, v(row) -> node|string, s(row) -> sort value, cls, sort: false }
-function grid(id, cols, rows, { key = 'id', sel, onSel, onRow, empty = '항목이 없습니다' } = {}) {
-  const st = sortState[id] || (sortState[id] = { k: null, dir: 1 });
+// `order` ({ sort, asc, set(k) }) sorts on the server instead of in the page.
+function grid(id, cols, rows, { key = 'id', sel, onSel, onRow, order, empty = '항목이 없습니다' } = {}) {
+  const st = order ? { k: order.sort, dir: order.asc ? 1 : -1 } : sortState[id] || (sortState[id] = { k: null, dir: 1 });
   const wrap = h('div', { class: 'tw' });
   function draw() {
     let list = rows.slice();
-    const col = cols.find((c) => c.k === st.k);
+    const col = !order && cols.find((c) => c.k === st.k);
     if (col) {
       const sv = col.s || ((r) => r[col.k]);
       list.sort((a, b) => {
@@ -153,7 +154,7 @@ function grid(id, cols, rows, { key = 'id', sel, onSel, onRow, empty = '항목�
       })),
       cols.map((c) => h('th', {
         class: [c.cls, c.sort !== false ? 's' : ''].filter(Boolean).join(' '),
-        onclick: c.sort === false ? null : () => { st.dir = st.k === c.k ? -st.dir : 1; st.k = c.k; draw(); },
+        onclick: c.sort === false ? null : () => { if (order) return order.set(c.k); st.dir = st.k === c.k ? -st.dir : 1; st.k = c.k; draw(); },
       }, c.t, st.k === c.k && h('span', { class: 'ar' }, st.dir > 0 ? '▲' : '▼'))));
     const body = list.map((r) => h('tr', {
       class: [sel && sel.has(r[key]) ? 'sel' : '', onRow ? 'click' : ''].filter(Boolean).join(' '),
@@ -170,6 +171,43 @@ function grid(id, cols, rows, { key = 'id', sel, onSel, onRow, empty = '항목�
   }
   draw();
   return wrap;
+}
+
+// Paged list state: page, per, search text, filter and server-side sort.
+function lister(path, opts = {}) {
+  const st = { page: 1, per: opts.per || 100, q: '', filter: opts.filter || '', sort: opts.sort || null, asc: false, extra: {} };
+  const L = {
+    st,
+    reload: null, // set by the page
+    async fetch() {
+      const qs = new URLSearchParams({ page: st.page, per: st.per, q: st.q, filter: st.filter, ...(st.sort ? { sort: st.sort, dir: st.asc ? 'asc' : 'desc' } : {}), ...st.extra });
+      const r = await api('GET', `${path}?${qs}`);
+      const pages = Math.max(1, Math.ceil(r.total / st.per));
+      if (st.page > pages && r.total) { st.page = pages; return L.fetch(); }
+      return r;
+    },
+    order() {
+      return { sort: st.sort, asc: st.asc, set: (k) => { st.asc = st.sort === k ? !st.asc : false; st.sort = k; st.page = 1; L.reload(); } };
+    },
+    search(placeholder) {
+      let t = null;
+      return h('input', { type: 'search', placeholder, value: st.q, oninput: (e) => { clearTimeout(t); t = setTimeout(() => { st.q = e.target.value.trim(); st.page = 1; L.reload(); }, 300); } });
+    },
+    pager(total) {
+      const pages = Math.max(1, Math.ceil(total / st.per));
+      const go = (n) => () => { st.page = Math.min(pages, Math.max(1, n)); L.reload(); };
+      const from = total ? (st.page - 1) * st.per + 1 : 0;
+      return h('div', { class: 'pager' },
+        h('button', { class: 'btn sm', disabled: st.page <= 1, onclick: go(1), title: '처음' }, '«'),
+        h('button', { class: 'btn sm', disabled: st.page <= 1, onclick: go(st.page - 1) }, '‹ 이전'),
+        h('span', { class: 'mu' }, `${num(from)}–${num(Math.min(total, st.page * st.per))} / ${num(total)} · ${num(st.page)}/${num(pages)}쪽`),
+        h('button', { class: 'btn sm', disabled: st.page >= pages, onclick: go(st.page + 1) }, '다음 ›'),
+        h('button', { class: 'btn sm', disabled: st.page >= pages, onclick: go(pages), title: '마지막' }, '»'),
+        h('select', { onchange: (e) => { st.per = Number(e.target.value); st.page = 1; L.reload(); } },
+          [50, 100, 200, 500].map((n) => h('option', { value: n, selected: n === st.per }, `${n}개씩`))));
+    },
+  };
+  return L;
 }
 
 const chip = (cls, text, title) => h('span', { class: 'chip ' + cls, title }, text);
@@ -361,50 +399,52 @@ async function pOverview(c, ph) {
 
 // ---------------------------------------------------------------- connections
 async function pConnections(c, ph) {
-  const q = h('input', { type: 'search', placeholder: '이름, 계정, 기기 ID, IP', oninput: () => draw() });
+  const L = lister('/api/connections', { sort: 'since' });
   ph.append(h('span', { class: 'sp' }), h('span', { class: 'mu' }, '3초마다 갱신'));
-  let rows = [];
   const host = h('div');
   const foot = h('div', { class: 'foot' });
-  async function load() { rows = (await api('GET', '/api/connections')).connections; draw(); }
-  function draw() {
-    const s = q.value.trim().toLowerCase();
-    const list = rows.filter((r) => !s || `${r.name} ${r.username || ''} ${r.device} ${r.account} ${r.ip}`.toLowerCase().includes(s));
+  const pg = h('div');
+  async function load() {
+    const r = await L.fetch();
     host.replaceChildren(grid('conns', [
-      { k: 'name', t: '이름', v: (r) => r.name || h('span', { class: 'mu' }, '(이름 없음)') },
-      { k: 'username', t: '사용자 이름', v: (r) => r.username || h('span', { class: 'mu' }, '—') },
-      { k: 'status', t: '상태', v: (r) => chip(...(STATUS[r.status] || STATUS.online)) },
+      { k: 'name', t: '이름', sort: false, v: (x) => x.name || h('span', { class: 'mu' }, '(이름 없음)') },
+      { k: 'username', t: '사용자 이름', sort: false, v: (x) => x.username || h('span', { class: 'mu' }, '—') },
+      { k: 'status', t: '상태', sort: false, v: (x) => chip(...(STATUS[x.status] || STATUS.online)) },
       { k: 'device', t: '기기 ID', cls: 'mono' },
       { k: 'account', t: '계정 ID', cls: 'mono' },
       { k: 'ip', t: 'IP', cls: 'mono' },
-      { k: 'transport', t: '연결', v: (r) => chip(...(TRANSPORT[r.transport] || (r.tls ? ['ok', 'TLS'] : ['wa', '평문']))) },
+      { k: 'transport', t: '연결', v: (x) => chip(...(TRANSPORT[x.transport] || (x.tls ? ['ok', 'TLS'] : ['wa', '평문']))) },
       { k: 'app', t: '앱', cls: 'mono' },
-      { k: 'since', t: '접속 시각', v: (r) => h('span', { title: tsFull(r.since) }, ts(r.since)) },
-      { k: 'dur', t: '접속 시간', cls: 'num', s: (r) => -r.since, v: (r) => dur(Date.now() - r.since) },
-      { k: 'act', t: '', sort: false, cls: 'act', v: (r) => h('button', { class: 'btn sm', onclick: () => kick(r.device, r.name) }, '끊기') },
-    ], list, { key: 'device', empty: '접속 중인 기기가 없습니다' }));
-    foot.textContent = `${list.length}개 표시 · 전체 ${rows.length}개 · 평문 ${rows.filter((r) => !r.tls).length}개`;
+      { k: 'since', t: '접속 시각', v: (x) => h('span', { title: tsFull(x.since) }, ts(x.since)) },
+      { k: 'dur', t: '접속 시간', cls: 'num', v: (x) => dur(Date.now() - x.since) },
+      { k: 'act', t: '', sort: false, cls: 'act', v: (x) => h('button', { class: 'btn sm', onclick: () => kick(x.device, x.name) }, '끊기') },
+    ], r.items, { key: 'device', order: L.order(), empty: L.st.q ? '조건에 맞는 연결이 없습니다' : '접속 중인 기기가 없습니다' }));
+    pg.replaceChildren(L.pager(r.total));
+    foot.textContent = `전체 ${num(r.all)}개 연결 · 암호화 안 된 연결 ${num(r.plain)}개`;
   }
+  L.reload = () => load().catch(fail);
   async function kick(id, name) {
     if (!(await confirmBox('연결 끊기', [`${name || id} 기기의 연결을 끊을까요?`, '클라이언트는 곧바로 다시 접속할 수 있습니다. 막으려면 기기를 정지하세요.'], '끊기', true))) return;
     try { await api('POST', `/api/devices/${encodeURIComponent(id)}/kick`); toast('연결을 끊었습니다'); load(); } catch (e) { fail(e); }
   }
-  c.append(h('div', { class: 'tb' }, q), host, foot);
+  c.append(h('div', { class: 'tb' }, L.search('이름, 사용자 이름, 계정·기기 ID, IP, 앱'), h('span', { class: 'sp' }), pg), host, foot);
   await load();
   every(3000, () => load().catch(fail));
 }
 
 // ---------------------------------------------------------------- accounts
 async function pAccounts(c, ph) {
-  const [{ accounts }, { settings }] = await Promise.all([api('GET', '/api/accounts'), api('GET', '/api/settings')]);
-  let rows = accounts;
+  const { settings } = await api('GET', '/api/settings');
   const pol = settings.policy;
-  let filter = new URLSearchParams(location.hash.split('?')[1] || '').get('state') || (rows.some((r) => r.state === 'pending') ? 'pending' : 'all');
+  const hashQ = new URLSearchParams(location.hash.split('?')[1] || '');
+  const L = lister('/api/accounts', { filter: hashQ.get('state') || '' });
+  let rows = [];
+  let counts = {};
   const sel = new Set();
-  const q = h('input', { type: 'search', placeholder: '사용자 이름, 표시 이름, ID, 메모', oninput: () => draw() });
   const seg = h('div', { class: 'seg' });
   const host = h('div');
   const foot = h('div', { class: 'foot' });
+  const pg = h('div');
   const bulkBtns = [
     ['approve', '승인', false], ['enable', '정지 해제', false], ['disable', '정지', true], ['delete', '삭제', true],
   ].map(([a, t, d]) => h('button', { class: 'btn' + (d ? ' dan' : ''), disabled: true, onclick: () => bulk(a, t) }, t));
@@ -412,32 +452,43 @@ async function pAccounts(c, ph) {
   ph.append(h('span', { class: 'sub' }, pol.auth === 'none' ? '로그온 방식이 "없음"이라 기기 하나가 계정 하나입니다' : ''), h('span', { class: 'sp' }),
     h('button', { class: 'btn pri', onclick: create }, '새 계정'));
 
-  async function reload() { rows = (await api('GET', '/api/accounts')).accounts; sel.forEach((id) => { if (!rows.some((r) => r.id === id)) sel.delete(id); }); draw(); refreshCounts(); }
+  async function reload() {
+    const r = await L.fetch();
+    rows = r.items;
+    counts = r.counts;
+    // Opened without a filter while sign-ups wait: show those first.
+    if (L.st.filter === '' && !hashQ.get('state') && counts.pending && !reload.done) { reload.done = true; L.st.filter = 'pending'; return reload(); }
+    reload.done = true;
+    sel.forEach((id) => { if (!rows.some((x) => x.id === id)) sel.delete(id); });
+    draw(r.total);
+    refreshCounts();
+  }
+  L.reload = () => reload().catch(fail);
   function onSel() {
     bulkBtns.forEach((b) => { b.disabled = !sel.size; });
     selInfo.textContent = sel.size ? `${sel.size}개 선택` : '';
   }
-  function draw() {
-    const n = (s) => rows.filter((r) => r.state === s).length;
-    seg.replaceChildren(...[['all', `전체 ${rows.length}`], ['active', `활성 ${n('active')}`], ['pending', `승인 대기 ${n('pending')}`], ['disabled', `정지 ${n('disabled')}`]]
-      .map(([k, t]) => h('button', { class: filter === k ? 'on' : '', onclick: () => { filter = k; draw(); } }, t)));
-    const s = q.value.trim().toLowerCase();
-    const list = rows.filter((r) => (filter === 'all' || r.state === filter) && (!s || `${r.username || ''} ${r.name} ${r.id} ${r.note}`.toLowerCase().includes(s)));
+  function draw(total) {
+    const f = L.st.filter || 'all';
+    seg.replaceChildren(...[['all', `전체 ${num(counts.all)}`], ['active', `활성 ${num(counts.active)}`], ['pending', `승인 대기 ${num(counts.pending)}`], ['disabled', `정지 ${num(counts.disabled)}`]]
+      .map(([k, t]) => h('button', { class: f === k ? 'on' : '', onclick: () => { L.st.filter = k === 'all' ? '' : k; L.st.page = 1; sel.clear(); L.reload(); } }, t)));
+    const list = rows;
     host.replaceChildren(grid('accounts', [
       { k: 'state', t: '상태', v: (r) => stateChip(r.state) },
       { k: 'username', t: '사용자 이름', v: (r) => r.username || h('span', { class: 'mu' }, '—') },
       { k: 'name', t: '표시 이름' },
       { k: 'id', t: '계정 ID', cls: 'mono' },
       { k: 'devices', t: '기기', cls: 'num', v: (r) => `${r.devices} / ${r.max_devices ?? pol.max_devices}${r.max_devices != null ? '*' : ''}` },
-      { k: 'online', t: '접속', cls: 'num', v: (r) => (r.online ? h('span', {}, h('span', { class: 'dot ok' }), ` ${r.online}`) : h('span', { class: 'mu' }, '0')) },
+      { k: 'online', t: '접속', cls: 'num', sort: false, v: (r) => (r.online ? h('span', {}, h('span', { class: 'dot ok' }), ` ${r.online}`) : h('span', { class: 'mu' }, '0')) },
       { k: 'pending', t: '받을 쪽지', cls: 'num', v: (r) => (r.pending ? num(r.pending) : h('span', { class: 'mu' }, '0')) },
       { k: 'stored_bytes', t: '보낸 첨부 보관', cls: 'num', v: (r) => (r.stored_bytes ? bytes(r.stored_bytes) : h('span', { class: 'mu' }, '—')) },
       { k: 'quota_mb', t: '저장 한도', cls: 'num', v: (r) => (r.quota_mb != null ? `${num(r.quota_mb)} MB*` : h('span', { class: 'mu' }, settings.account_quota_mb ? `${num(settings.account_quota_mb)} MB` : '무제한')) },
       { k: 'last_seen', t: '마지막 접속', v: (r) => ago(r.last_seen) },
       { k: 'created', t: '생성', v: (r) => h('span', { title: tsFull(r.created) }, ts(r.created)) },
       { k: 'note', t: '메모', cls: 'trunc', v: (r) => h('span', { title: r.note }, r.note) },
-    ], list, { sel, onSel, onRow: open, empty: filter === 'pending' ? '승인을 기다리는 가입 신청이 없습니다' : '계정이 없습니다' }));
-    foot.replaceChildren(`${list.length}개 표시 · 전체 ${rows.length}개`, h('span', {}, '* 계정별로 따로 정한 값'));
+    ], list, { sel, onSel, onRow: open, order: L.order(), empty: f === 'pending' ? '승인을 기다리는 가입 신청이 없습니다' : '계정이 없습니다' }));
+    pg.replaceChildren(L.pager(total));
+    foot.replaceChildren(`조건에 맞는 ${num(total)}개`, h('span', {}, '* 계정별로 따로 정한 값'), h('span', {}, '선택은 현재 쪽에만 적용됩니다'));
     onSel();
   }
 
@@ -481,8 +532,7 @@ async function pAccounts(c, ph) {
   }
 
   async function open(a) {
-    const { devices } = await api('GET', '/api/devices');
-    const devs = devices.filter((d) => d.account === a.id);
+    const devs = (await api('GET', `/api/devices?account=${encodeURIComponent(a.id)}&per=500`)).items;
     const f = {
       state: h('select', {}, Object.entries(STATE).map(([k, [, t]]) => h('option', { value: k, selected: a.state === k }, t))),
       username: h('input', { type: 'text', value: a.username || '', placeholder: '없음' }),
@@ -541,50 +591,52 @@ async function pAccounts(c, ph) {
     }
   }
 
-  c.append(h('div', { class: 'tb' }, seg, q, h('span', { class: 'sp' }), selInfo, bulkBtns), host, foot);
-  draw();
-  const want = new URLSearchParams(location.hash.split('?')[1] || '').get('id');
-  if (want) { const a = rows.find((r) => r.id === want); if (a) open(a); }
+  c.append(h('div', { class: 'tb' }, seg, L.search('사용자 이름, 표시 이름, ID, 메모'), selInfo, bulkBtns, h('span', { class: 'sp' }), pg), host, foot);
+  await reload();
+  const want = hashQ.get('id');
+  if (want) {
+    const a = rows.find((x) => x.id === want) || (await api('GET', `/api/accounts?q=${encodeURIComponent(want)}&per=10`)).items.find((x) => x.id === want);
+    if (a) open(a);
+  }
 }
 
 // ---------------------------------------------------------------- devices
 async function pDevices(c) {
-  let rows = (await api('GET', '/api/devices')).devices;
-  let filter = 'all';
-  const q = h('input', { type: 'search', placeholder: '이름, 계정, 기기 ID, IP, 호스트, 키 지문', oninput: () => draw() });
+  const L = lister('/api/devices', { filter: 'all' });
   const seg = h('div', { class: 'seg' });
   const host = h('div');
   const foot = h('div', { class: 'foot' });
-  async function reload() { rows = (await api('GET', '/api/devices')).devices; draw(); }
-  function draw() {
-    seg.replaceChildren(...[['all', `전체 ${rows.length}`], ['online', `접속 중 ${rows.filter((r) => r.online).length}`], ['disabled', `정지 ${rows.filter((r) => r.disabled).length}`], ['waiting', `받을 쪽지 있음 ${rows.filter((r) => r.pending).length}`]]
-      .map(([k, t]) => h('button', { class: filter === k ? 'on' : '', onclick: () => { filter = k; draw(); } }, t)));
-    const s = q.value.trim().toLowerCase();
-    const list = rows.filter((r) => (filter === 'all' || (filter === 'online' && r.online) || (filter === 'disabled' && r.disabled) || (filter === 'waiting' && r.pending))
-      && (!s || `${r.profile.name || ''} ${r.username || ''} ${r.account_name} ${r.id} ${r.account} ${r.last_ip} ${r.profile.host || ''} ${r.key}`.toLowerCase().includes(s)));
+  const pg = h('div');
+  async function reload() {
+    const r = await L.fetch();
+    const k = r.counts;
+    seg.replaceChildren(...[['all', `전체 ${num(k.all)}`], ['online', `접속 중 ${num(k.online)}`], ['disabled', `정지 ${num(k.disabled)}`], ['waiting', `받을 쪽지 있음 ${num(k.waiting)}`]]
+      .map(([f, t]) => h('button', { class: L.st.filter === f ? 'on' : '', onclick: () => { L.st.filter = f; L.st.page = 1; L.reload(); } }, t)));
     host.replaceChildren(grid('devices', [
-      { k: 'online', t: '', s: (r) => (r.online ? 0 : 1), v: (r) => h('span', { class: 'dot' + (r.online ? ' ok' : ''), title: r.online ? '접속 중' : '오프라인' }) },
-      { k: 'name', t: '기기 이름', s: (r) => r.profile.name, v: (r) => r.profile.name || h('span', { class: 'mu' }, '—') },
-      { k: 'account', t: '계정', s: (r) => r.username || r.account_name, v: (r) => h('a', { href: `#/accounts?state=all&id=${r.account}` }, r.username || r.account_name || short(r.account)) },
-      { k: 'account_state', t: '계정 상태', v: (r) => stateChip(r.account_state) },
-      { k: 'status', t: '상태 설정', s: (r) => r.profile.status, v: (r) => (r.profile.status ? chip(...(STATUS[r.profile.status] || STATUS.online)) : '') },
-      { k: 'host', t: '호스트', s: (r) => r.profile.host, v: (r) => r.profile.host || '' },
+      { k: 'online', t: '', sort: false, v: (x) => h('span', { class: 'dot' + (x.online ? ' ok' : ''), title: x.online ? '접속 중' : '오프라인' }) },
+      { k: 'name', t: '기기 이름', v: (x) => x.profile.name || h('span', { class: 'mu' }, '—') },
+      { k: 'account', t: '계정', v: (x) => h('a', { href: `#/accounts?state=all&id=${x.account}` }, x.username || x.account_name || short(x.account)) },
+      { k: 'account_state', t: '계정 상태', v: (x) => stateChip(x.account_state) },
+      { k: 'status', t: '상태 설정', v: (x) => (x.profile.status ? chip(...(STATUS[x.profile.status] || STATUS.online)) : '') },
+      { k: 'host', t: '호스트', v: (x) => x.profile.host || '' },
       { k: 'id', t: '기기 ID', cls: 'mono' },
       { k: 'app', t: '앱', cls: 'mono' },
       { k: 'last_ip', t: '마지막 IP', cls: 'mono' },
-      { k: 'key', t: 'E2EE 키 지문', cls: 'mono', v: (r) => r.key || h('span', { class: 'mu' }, '없음') },
-      { k: 'limits', t: '수신 한도', cls: 'num', sort: false, v: (r) => `${r.profile.max_files || '∞'}개 · ${r.profile.max_file_size ? bytes(r.profile.max_file_size) : '∞'}` },
-      { k: 'pending', t: '받을 쪽지', cls: 'num', v: (r) => (r.pending ? num(r.pending) : h('span', { class: 'mu' }, '0')) },
-      { k: 'last_seen', t: '마지막 접속', v: (r) => ago(r.last_seen) },
-      { k: 'created', t: '등록', v: (r) => h('span', { title: tsFull(r.created) }, ts(r.created)) },
-      { k: 'act', t: '', sort: false, cls: 'act', v: (r) => [
-        r.online && h('button', { class: 'btn sm', onclick: () => act(r, 'kick') }, '끊기'),
-        h('button', { class: 'btn sm', onclick: () => act(r, r.disabled ? 'enable' : 'disable') }, r.disabled ? '정지 해제' : '정지'),
-        h('button', { class: 'btn sm dan', onclick: () => act(r, 'delete') }, '등록 해제'),
+      { k: 'key', t: 'E2EE 키 지문', cls: 'mono', sort: false, v: (x) => x.key || h('span', { class: 'mu' }, '없음') },
+      { k: 'limits', t: '수신 한도', cls: 'num', sort: false, v: (x) => `${x.profile.max_files || '∞'}개 · ${x.profile.max_file_size ? bytes(x.profile.max_file_size) : '∞'}` },
+      { k: 'pending', t: '받을 쪽지', cls: 'num', v: (x) => (x.pending ? num(x.pending) : h('span', { class: 'mu' }, '0')) },
+      { k: 'last_seen', t: '마지막 접속', v: (x) => ago(x.last_seen) },
+      { k: 'created', t: '등록', v: (x) => h('span', { title: tsFull(x.created) }, ts(x.created)) },
+      { k: 'act', t: '', sort: false, cls: 'act', v: (x) => [
+        x.online && h('button', { class: 'btn sm', onclick: () => act(x, 'kick') }, '끊기'),
+        h('button', { class: 'btn sm', onclick: () => act(x, x.disabled ? 'enable' : 'disable') }, x.disabled ? '정지 해제' : '정지'),
+        h('button', { class: 'btn sm dan', onclick: () => act(x, 'delete') }, '등록 해제'),
       ] },
-    ], list, { empty: '기기가 없습니다' }));
-    foot.textContent = `${list.length}개 표시 · 전체 ${rows.length}개`;
+    ], r.items, { order: L.order(), empty: '기기가 없습니다' }));
+    pg.replaceChildren(L.pager(r.total));
+    foot.textContent = `조건에 맞는 ${num(r.total)}개`;
   }
+  L.reload = () => reload().catch(fail);
   async function act(d, what) {
     const name = d.profile.name || d.id;
     const T = {
@@ -602,38 +654,37 @@ async function pDevices(c) {
       reload();
     } catch (e) { fail(e); }
   }
-  c.append(h('div', { class: 'tb' }, seg, q), host, foot);
-  draw();
+  c.append(h('div', { class: 'tb' }, seg, L.search('이름, 계정, 기기 ID, IP, 호스트'), h('span', { class: 'sp' }), pg), host, foot);
+  await reload();
 }
 
 // ---------------------------------------------------------------- stored messages
 async function pMessages(c, ph) {
-  let rows = (await api('GET', '/api/messages')).messages;
-  const q = h('input', { type: 'search', placeholder: '보낸 사람, 받는 사람, ID', oninput: () => draw() });
+  const L = lister('/api/messages');
   const host = h('div');
   const foot = h('div', { class: 'foot' });
+  const pg = h('div');
   ph.append(h('span', { class: 'sub' }, '평문 쪽지는 행을 눌러 내용과 첨부파일을 열람할 수 있습니다. 열람 기록은 감사 로그에 남습니다'), h('span', { class: 'sp' }),
     h('button', { class: 'btn', onclick: sweep }, '만료 처리 지금 실행'));
-  async function reload() { rows = (await api('GET', '/api/messages')).messages; draw(); }
-  function draw() {
-    const s = q.value.trim().toLowerCase();
-    const list = rows.filter((r) => !s || `${r.from_name} ${r.to || ''} ${r.mid} ${r.from}`.toLowerCase().includes(s));
+  async function reload() {
+    const r = await L.fetch();
     host.replaceChildren(grid('messages', [
-      { k: 'created', t: '보관 시작', v: (r) => h('span', { title: tsFull(r.created) }, ts(r.created)) },
-      { k: 'from_name', t: '보낸 사람', v: (r) => h('a', { href: `#/accounts?state=all&id=${r.from}` }, r.from_name || short(r.from)) },
-      { k: 'to', t: '받는 사람', cls: 'trunc', v: (r) => h('span', { title: r.to || '' }, r.to || '—') },
-      { k: 'pending', t: '전달 대기', cls: 'num', v: (r) => `${r.pending} / ${r.deliveries} 기기` },
-      { k: 'files', t: '첨부', cls: 'num', v: (r) => (r.files ? (r.files_gone ? h('span', { class: 'mu' }, `${r.files}개 (삭제됨)`) : `${r.files}개`) : h('span', { class: 'mu' }, '—')) },
-      { k: 'bytes', t: '크기', cls: 'num', v: (r) => (r.bytes ? bytes(r.bytes) : h('span', { class: 'mu' }, '—')) },
-      { k: 'enc', t: '본문', v: (r) => (r.enc === 'none' ? chip('ne', '평문') : chip('ok', '암호화')) },
-      { k: 'files_expires', t: '첨부 만료', v: (r) => (!r.files || r.files_gone ? h('span', { class: 'mu' }, '—') : until(r.files_expires)) },
-      { k: 'text_expires', t: '쪽지 만료', v: (r) => until(r.text_expires) },
+      { k: 'created', t: '보관 시작', v: (x) => h('span', { title: tsFull(x.created) }, ts(x.created)) },
+      { k: 'from_name', t: '보낸 사람', v: (x) => h('a', { href: `#/accounts?state=all&id=${x.from}` }, x.from_name || short(x.from)) },
+      { k: 'to', t: '받는 사람', cls: 'trunc', sort: false, v: (x) => h('span', { title: x.to || '' }, x.to || '—') },
+      { k: 'pending', t: '전달 대기', cls: 'num', v: (x) => `${x.pending} / ${x.deliveries} 기기` },
+      { k: 'files', t: '첨부', cls: 'num', v: (x) => (x.files ? (x.files_gone ? h('span', { class: 'mu' }, `${x.files}개 (삭제됨)`) : `${x.files}개`) : h('span', { class: 'mu' }, '—')) },
+      { k: 'bytes', t: '크기', cls: 'num', v: (x) => (x.bytes ? bytes(x.bytes) : h('span', { class: 'mu' }, '—')) },
+      { k: 'enc', t: '본문', v: (x) => (x.enc === 'none' ? chip('ne', '평문') : chip('ok', '암호화')) },
+      { k: 'files_expires', t: '첨부 만료', v: (x) => (!x.files || x.files_gone ? h('span', { class: 'mu' }, '—') : until(x.files_expires)) },
+      { k: 'text_expires', t: '쪽지 만료', v: (x) => until(x.text_expires) },
       { k: 'mid', t: 'ID', cls: 'mono' },
-      { k: 'act', t: '', sort: false, cls: 'act', v: (r) => h('button', { class: 'btn sm dan', onclick: () => purge(r) }, '삭제') },
-    ], list, { key: 'mid', onRow: (r) => openMessage(r.mid, reload), empty: '보관 중인 쪽지가 없습니다' }));
-    const total = list.reduce((a, r) => a + (r.files_gone ? 0 : r.bytes), 0);
-    foot.textContent = `${list.length}건 표시 · 첨부 ${bytes(total)} · 전달 대기 ${num(list.reduce((a, r) => a + r.pending, 0))}건 (기기 단위)`;
+      { k: 'act', t: '', sort: false, cls: 'act', v: (x) => h('button', { class: 'btn sm dan', onclick: () => purge(x) }, '삭제') },
+    ], r.items, { key: 'mid', order: L.order(), onRow: (x) => openMessage(x.mid, L.reload), empty: '보관 중인 쪽지가 없습니다' }));
+    pg.replaceChildren(L.pager(r.total));
+    foot.textContent = `조건에 맞는 ${num(r.total)}건 · 첨부 ${bytes(r.bytes)} · 전달 대기 ${num(r.pending)}건 (기기 단위)`;
   }
+  L.reload = () => reload().catch(fail);
   async function purge(m) {
     if (!(await confirmBox('보관 쪽지 삭제', [`${m.from_name}님이 보낸 쪽지를 지금 삭제할까요?`, `아직 받지 못한 기기 ${m.pending}대는 이 쪽지를 받을 수 없게 되며, 만료 알림도 남지 않습니다.`], '삭제', true))) return;
     try { await api('DELETE', `/api/messages/${m.mid}`); toast('삭제했습니다'); reload(); } catch (e) { fail(e); }
@@ -645,8 +696,8 @@ async function pMessages(c, ph) {
       reload();
     } catch (e) { fail(e); }
   }
-  c.append(h('div', { class: 'tb' }, q), host, foot);
-  draw();
+  c.append(h('div', { class: 'tb' }, L.search('보낸 사람, 받는 사람, ID'), h('span', { class: 'sp' }), pg), host, foot);
+  await reload();
 }
 
 // Shared pieces of the message viewers.
@@ -707,26 +758,35 @@ async function pArchive(c, ph) {
   const from = h('input', { type: 'date', value: day(new Date(Date.now() - 7 * 86400000)) });
   const to = h('input', { type: 'date', value: day(new Date()) });
   const q = h('input', { type: 'search', placeholder: '본문, 보낸 사람, 받는 사람, 파일 이름' });
-  const lim = h('select', {}, [200, 1000, 5000, 20000].map((n) => h('option', { value: n, selected: n === 1000 }, `최대 ${num(n)}건`)));
-  const go = h('button', { class: 'btn pri', onclick: load }, '조회');
+  const go = h('button', { class: 'btn pri', onclick: () => { page = 1; load(); } }, '조회');
+  const pg = h('div');
+  let page = 1;
+  let per = 100;
+  let query = null; // the filters of the last search, kept while paging
   const host = h('div', { class: 'empty' }, '조건을 정하고 조회하세요. 조회할 때마다 감사 로그에 기록됩니다.');
   const foot = h('div', { class: 'foot' });
   let rows = [];
-  q.addEventListener('keydown', (e) => { if (e.key === 'Enter') load(); });
+  q.addEventListener('keydown', (e) => { if (e.key === 'Enter') { page = 1; load(); } });
   ph.append(h('span', { class: 'sub' }, '종단간 암호화가 아닌 쪽지의 사본 (전달 후에도 보관)'), h('span', { class: 'sp' }),
     h('button', {
       class: 'btn',
-      onclick: () => csv(`relay-messages-${day(new Date())}.csv`, ['time', 'from', 'from_account', 'to', 'text', 'files', 'bytes', 'id'],
-        rows.map((r) => [tsFull(r.created), r.from_name, r.from, recipientNames(r.recipients), r.preview + (r.length > r.preview.length ? '…' : ''), r.files.map((f) => f.name).join(' | '), r.bytes, r.mid])),
-    }, 'CSV 내보내기'));
+      onclick: async () => {
+        if (!query) return toast('먼저 조회하세요', true);
+        try {
+          const all = (await api('GET', `/api/archive?${new URLSearchParams({ ...query, page: 1, per: 20000 })}`)).items;
+          csv(`relay-messages-${day(new Date())}.csv`, ['time', 'from', 'from_account', 'to', 'text', 'files', 'bytes', 'id'],
+            all.map((r) => [tsFull(r.created), r.from_name, r.from, recipientNames(r.recipients), r.preview + (r.length > r.preview.length ? '…' : ''), r.files.map((f) => f.name).join(' | '), r.bytes, r.mid]));
+        } catch (e) { fail(e); }
+      },
+    }, 'CSV 내보내기 (최대 2만 건)'));
   async function load() {
     go.disabled = true;
     try {
       const f = from.value ? new Date(`${from.value}T00:00:00`).getTime() : '';
       const t = to.value ? new Date(`${to.value}T00:00:00`).getTime() + 86400000 : '';
-      const qs = new URLSearchParams({ q: q.value.trim(), limit: lim.value, ...(f ? { from: f } : {}), ...(t ? { to: t } : {}) });
-      const r = await api('GET', `/api/archive?${qs}`);
-      rows = r.archive;
+      if (page === 1 || !query) query = { q: q.value.trim(), ...(f ? { from: f } : {}), ...(t ? { to: t } : {}) };
+      const r = await api('GET', `/api/archive?${new URLSearchParams({ ...query, page, per })}`);
+      rows = r.items;
       host.replaceChildren(grid('archive', [
         { k: 'created', t: '보낸 시각', v: (x) => h('span', { title: tsFull(x.created) }, ts(x.created)) },
         { k: 'from_name', t: '보낸 사람', v: (x) => x.from_name || short(x.from) },
@@ -736,13 +796,20 @@ async function pArchive(c, ph) {
         { k: 'files', t: '첨부', cls: 'num', s: (x) => x.files.length, v: (x) => (x.files.length ? `${x.files.length}개${x.files_kept ? '' : ' (미보관)'}` : '') },
         { k: 'bytes', t: '크기', cls: 'num', v: (x) => (x.bytes ? bytes(x.bytes) : '') },
       ], rows, { key: 'mid', onRow: (x) => openArchived(x.mid, load), empty: '조건에 맞는 쪽지가 없습니다' }));
-      foot.textContent = `${num(rows.length)}건 표시 · 조건에 맞는 ${num(r.total)}건 · 전체 보관 ${num(r.all)}건`;
+      const pages = Math.max(1, Math.ceil(r.total / per));
+      const goto = (n) => () => { page = Math.min(pages, Math.max(1, n)); load(); };
+      pg.replaceChildren(h('div', { class: 'pager' },
+        h('button', { class: 'btn sm', disabled: page <= 1, onclick: goto(page - 1) }, '‹ 이전'),
+        h('span', { class: 'mu' }, `${num(page)}/${num(pages)}쪽 · ${num(r.total)}건`),
+        h('button', { class: 'btn sm', disabled: page >= pages, onclick: goto(page + 1) }, '다음 ›'),
+        h('select', { onchange: (e) => { per = Number(e.target.value); page = 1; load(); } }, [50, 100, 200, 500].map((n) => h('option', { value: n, selected: n === per }, `${n}개씩`)))));
+      foot.textContent = `조건에 맞는 ${num(r.total)}건 · 전체 보관 ${num(r.all)}건`;
     } catch (e) { fail(e); } finally { go.disabled = false; }
   }
   c.append(...[
     !settings.archive && h('div', { class: 'warnbox' }, '감사 보관이 꺼져 있어 새 쪽지는 보관되지 않습니다. ', h('a', { href: '#/policy' }, '정책 > 쪽지 감사'), '에서 켤 수 있습니다. 지금 서버에 맡겨진 쪽지는 "보관함"에서 열람할 수 있습니다.'),
     settings.archive && settings.policy.encryption === 'e2ee' && h('div', { class: 'warnbox' }, '현재 암호화 단계가 종단간 암호화라서 새 쪽지는 서버가 내용을 볼 수 없어 보관되지 않습니다.'),
-    h('div', { class: 'tb' }, h('span', { class: 'mu' }, '기간'), from, h('span', { class: 'mu' }, '~'), to, q, lim, go),
+    h('div', { class: 'tb' }, h('span', { class: 'mu' }, '기간'), from, h('span', { class: 'mu' }, '~'), to, q, go, h('span', { class: 'sp' }), pg),
     host, foot].filter(Boolean));
 }
 
@@ -778,39 +845,40 @@ const ACTIONS = {
   device_enable: '기기 정지 해제', device_delete: '기기 등록 해제', device_kick: '연결 끊기', message_purge: '보관 쪽지 삭제', sweep: '만료 처리 실행', login_locked: '로그인 잠금',
   message_view: '보관 쪽지 열람', message_file: '보관 첨부 다운로드', archive_list: '쪽지 감사 조회', archive_view: '쪽지 감사 열람',
   archive_file: '감사 첨부 다운로드', archive_delete: '감사 사본 삭제',
+  user_login: '포털 로그인', user_login_failed: '포털 로그인 실패', user_password: '포털 비밀번호 변경', user_name: '포털 이름 변경',
+  user_device_kick: '포털 기기 연결 끊기', user_device_delete: '포털 기기 등록 해제',
 };
 async function pAudit(c, ph) {
-  let limit = 1000;
-  let rows = [];
-  const q = h('input', { type: 'search', placeholder: '주체, 내용', oninput: () => draw() });
-  const act = h('select', { onchange: () => draw() });
-  const lim = h('select', { onchange: () => { limit = Number(lim.value); load(); } }, [500, 1000, 5000, 20000].map((n) => h('option', { value: n, selected: n === limit }, `최근 ${num(n)}건`)));
+  const L = lister('/api/audit');
+  const act = h('select', { onchange: () => { L.st.filter = act.value; L.st.page = 1; L.reload(); } });
   const host = h('div');
   const foot = h('div', { class: 'foot' });
-  let shown = [];
+  const pg = h('div');
   ph.append(h('span', { class: 'sp' }), h('button', {
     class: 'btn',
-    onclick: () => csv(`relay-audit-${ts(Date.now()).replace(/[: ]/g, '')}.csv`, ['time', 'actor', 'action', 'detail'], shown.map((r) => [tsFull(r.ts), r.actor, r.action, r.detail])),
-  }, 'CSV 내보내기'));
-  async function load() {
-    rows = (await api('GET', `/api/audit?limit=${limit}`)).audit;
-    const cur = act.value;
-    act.replaceChildren(h('option', { value: '' }, '모든 작업'), [...new Set(rows.map((r) => r.action))].sort().map((a) => h('option', { value: a, selected: a === cur }, ACTIONS[a] || a)));
-    draw();
-  }
-  function draw() {
-    const s = q.value.trim().toLowerCase();
-    shown = rows.filter((r) => (!act.value || r.action === act.value) && (!s || `${r.actor} ${r.detail}`.toLowerCase().includes(s)));
+    onclick: async () => {
+      try {
+        const qs = new URLSearchParams({ page: 1, per: 20000, q: L.st.q, filter: L.st.filter });
+        const all = (await api('GET', `/api/audit?${qs}`)).items;
+        csv(`relay-audit-${ts(Date.now()).replace(/[: ]/g, '')}.csv`, ['time', 'actor', 'action', 'detail', 'account'], all.map((r) => [tsFull(r.ts), r.actor, r.action, r.detail, r.account || '']));
+      } catch (e) { fail(e); }
+    },
+  }, 'CSV 내보내기 (최근 2만 건)'));
+  async function reload() {
+    const r = await L.fetch();
+    act.replaceChildren(h('option', { value: '' }, '모든 작업'), r.actions.map((a) => h('option', { value: a, selected: a === L.st.filter }, ACTIONS[a] || a)));
     host.replaceChildren(grid('audit', [
-      { k: 'ts', t: '시각', v: (r) => h('span', { class: 'mono' }, tsFull(r.ts)) },
-      { k: 'actor', t: '주체', cls: 'mono' },
-      { k: 'action', t: '작업', v: (r) => h('span', { title: r.action }, ACTIONS[r.action] || r.action) },
-      { k: 'detail', t: '내용', cls: 'wrap' },
-    ], shown, { key: 'ts', empty: '기록이 없습니다' }));
-    foot.textContent = `${shown.length}건 표시 · 불러온 ${rows.length}건`;
+      { k: 'ts', t: '시각', sort: false, v: (x) => h('span', { class: 'mono' }, tsFull(x.ts)) },
+      { k: 'actor', t: '주체', cls: 'mono', sort: false },
+      { k: 'action', t: '작업', sort: false, v: (x) => h('span', { title: x.action }, ACTIONS[x.action] || x.action) },
+      { k: 'detail', t: '내용', cls: 'wrap', sort: false },
+    ], r.items, { key: 'ts', empty: '기록이 없습니다' }));
+    pg.replaceChildren(L.pager(r.total));
+    foot.textContent = `조건에 맞는 ${num(r.total)}건 · 최신순`;
   }
-  c.append(h('div', { class: 'tb' }, act, q, h('span', { class: 'sp' }), lim), host, foot);
-  await load();
+  L.reload = () => reload().catch(fail);
+  c.append(h('div', { class: 'tb' }, act, L.search('주체, 내용'), h('span', { class: 'sp' }), pg), host, foot);
+  await reload();
 }
 
 // ---------------------------------------------------------------- policy
@@ -848,6 +916,7 @@ const POLICY = [
   ]],
   ['외부 공개 (HTTPS 프록시 · WebSocket)', [
     { p: 'public_url', t: '사용자 접속 주소', type: 'text', help: '사용자에게 안내할 주소. 예: https://relay.example.com (Cloudflare Tunnel 등) 또는 relay.example.com:45443 (TCP 직접)' },
+    { p: 'user_portal', t: '사용자 웹 포털', type: 'bool', label: '릴레이 주소를 브라우저로 열면 사용자가 자기 계정을 관리하는 화면을 보여 줌', help: '내 정보, 비밀번호 변경, 기기 연결 끊기·등록 해제, 내 활동 기록. 비밀번호 계정만 로그인할 수 있고, 암호화된 연결에서만 로그인됩니다' },
     { p: 'websocket', t: 'WebSocket 연결', type: 'bool', label: '릴레이 포트에서 WebSocket(HTTP 업그레이드)도 받음', help: 'Cloudflare Tunnel처럼 HTTP/HTTPS만 통과시키는 프록시를 거칠 때 필요합니다. 터널 서비스 주소는 http://localhost:45443' },
     { p: 'proxy_tls', t: '프록시가 TLS 처리', type: 'bool', label: '프록시가 HTTPS로 받았다고 표시한 WebSocket 연결을 암호화된 연결로 인정', dep: 'websocket', warn: '앞단 프록시가 HTTPS를 처리할 때만 켜세요. 켜면 프록시가 보낸 접속자 IP(CF-Connecting-IP / X-Forwarded-For)를 기록합니다', help: 'X-Forwarded-Proto: https 또는 CF-Visitor 헤더로 판단합니다' },
     { p: 'ws_chunk_kb', t: '스트리밍 단위', type: 'num', min: 16, max: 4096, unit: 'KB', dep: 'websocket', help: '첨부파일을 이 크기의 WebSocket 메시지로 나눠 보냅니다. HTTP 요청 하나로 올리지 않으므로 Cloudflare의 100MB 업로드 제한에 걸리지 않습니다. 기본 256KB' },

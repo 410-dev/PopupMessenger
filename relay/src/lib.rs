@@ -5,6 +5,7 @@ pub mod admin;
 pub mod frame;
 pub mod hub;
 pub mod janitor;
+pub mod portal;
 pub mod relay;
 pub mod settings;
 pub mod store;
@@ -97,6 +98,8 @@ pub struct Server {
     /// Failed-login counters: key -> (failures, locked until ms).
     pub lockouts: Mutex<HashMap<String, (u32, i64)>>,
     pub admin_sessions: Mutex<HashMap<String, AdminSession>>,
+    /// User portal (relay port) sessions: token -> session.
+    pub user_sessions: Mutex<HashMap<String, portal::UserSession>>,
     pub relay_port: u16,
 }
 
@@ -248,6 +251,7 @@ pub async fn start(cfg: Config) -> Result<Running, String> {
         tls,
         lockouts: Mutex::new(HashMap::new()),
         admin_sessions: Mutex::new(HashMap::new()),
+        user_sessions: Mutex::new(HashMap::new()),
         relay_port: relay_addr.port(),
     });
     // Attachments left half-written by a crash.

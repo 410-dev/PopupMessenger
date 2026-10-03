@@ -50,12 +50,36 @@ CREATE TABLE IF NOT EXISTS archive (
   from_name TEXT NOT NULL, recipients TEXT NOT NULL, text TEXT NOT NULL, names TEXT NOT NULL, sizes TEXT NOT NULL,
   grp TEXT, files_kept INTEGER NOT NULL DEFAULT 0);
 CREATE INDEX IF NOT EXISTS archive_created ON archive(created);
+CREATE INDEX IF NOT EXISTS accounts_created ON accounts(created);
+CREATE INDEX IF NOT EXISTS accounts_state ON accounts(state, created);
+CREATE INDEX IF NOT EXISTS devices_last_seen ON devices(last_seen);
+CREATE INDEX IF NOT EXISTS deliveries_account ON deliveries(account, acked);
+CREATE INDEX IF NOT EXISTS messages_created ON messages(created);
+CREATE INDEX IF NOT EXISTS audit_action ON audit(action);
 ";
+
+/// Which account an audit row is about, derived from its actor
+/// ("user:<username>", "device:<id>", "dev:<id>").
+const AUDIT_ACCOUNT: &str = "CASE
+  WHEN actor LIKE 'user:%' THEN (SELECT id FROM accounts WHERE username = substr(actor, 6))
+  WHEN actor LIKE 'device:%' THEN (SELECT account FROM devices WHERE id = substr(actor, 8))
+  WHEN actor LIKE 'dev:%' THEN (SELECT account FROM devices WHERE id = substr(actor, 5)) END";
 
 pub fn open(path: &Path) -> rusqlite::Result<Connection> {
     let c = Connection::open(path)?;
     c.busy_timeout(std::time::Duration::from_secs(5))?;
     c.execute_batch(SCHEMA)?;
+    // Added after the first release: the account an audit row concerns.
+    let has_account: bool = c
+        .prepare("SELECT 1 FROM pragma_table_info('audit') WHERE name = 'account'")?
+        .exists([])?;
+    if !has_account {
+        c.execute_batch(&format!(
+            "ALTER TABLE audit ADD COLUMN account TEXT;
+             UPDATE audit SET account = ({AUDIT_ACCOUNT}) WHERE account IS NULL;"
+        ))?;
+    }
+    c.execute_batch("CREATE INDEX IF NOT EXISTS audit_account ON audit(account, id);")?;
     Ok(c)
 }
 
@@ -104,11 +128,27 @@ pub fn kv_set(c: &Connection, k: &str, v: &str) {
     );
 }
 
+/// Records an action. The account it concerns is derived from a user or device actor.
 pub fn audit(c: &Connection, actor: &str, action: &str, detail: &str) {
-    let _ = c.execute(
-        "INSERT INTO audit (ts, actor, action, detail) VALUES (?1, ?2, ?3, ?4)",
-        params![now_ms(), actor, action, detail],
+    let sql = format!(
+        "INSERT INTO audit (ts, actor, action, detail, account)
+         SELECT ?1, ?2, ?3, ?4, {} FROM (SELECT ?2 AS actor)",
+        AUDIT_ACCOUNT
     );
+    let _ = c.execute(&sql, params![now_ms(), actor, action, detail]);
+}
+
+/// Records an action about `account` (admin actions on it, portal actions).
+pub fn audit_for(c: &Connection, actor: &str, action: &str, detail: &str, account: &str) {
+    let _ = c.execute(
+        "INSERT INTO audit (ts, actor, action, detail, account) VALUES (?1, ?2, ?3, ?4, ?5)",
+        params![now_ms(), actor, action, detail, account],
+    );
+}
+
+/// `%text%` for LIKE ... ESCAPE '\\'.
+pub fn like(text: &str) -> String {
+    format!("%{}%", text.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_"))
 }
 
 pub fn day() -> String {

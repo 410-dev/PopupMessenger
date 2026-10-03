@@ -547,7 +547,7 @@ async fn admin_first_login_and_api() {
     assert_eq!(v["settings"]["policy"]["max_devices"], 9999, "hard cap");
 
     let (_, _, v) = http(&r, "GET", "/api/audit", Some(&cookie), None, false).await;
-    assert!(v["audit"]
+    assert!(v["items"]
         .as_array()
         .unwrap()
         .iter()
@@ -595,8 +595,8 @@ async fn admin_audit_of_plaintext_messages() {
 
     let (_, _, v) = http(&r, "GET", "/api/archive?q=%EA%B0%90%EC%82%AC", Some(&cookie), None, false).await;
     assert_eq!(v["total"], 1, "{v}");
-    assert_eq!(v["archive"][0]["preview"], "감사 대상 본문");
-    assert_eq!(v["archive"][0]["recipients"][0]["account"], json!(b_acc));
+    assert_eq!(v["items"][0]["preview"], "감사 대상 본문");
+    assert_eq!(v["items"][0]["recipients"][0]["account"], json!(b_acc));
     let (_, _, v) = http(&r, "GET", "/api/archive?q=nothing-matches", Some(&cookie), None, false).await;
     assert_eq!(v["total"], 0);
 
@@ -612,7 +612,7 @@ async fn admin_audit_of_plaintext_messages() {
 
     // Every look is in the audit log.
     let (_, _, v) = http(&r, "GET", "/api/audit", Some(&cookie), None, false).await;
-    let actions: Vec<&str> = v["audit"].as_array().unwrap().iter().filter_map(|a| a["action"].as_str()).collect();
+    let actions: Vec<&str> = v["items"].as_array().unwrap().iter().filter_map(|a| a["action"].as_str()).collect();
     for want in ["message_view", "archive_list", "archive_file"] {
         assert!(actions.contains(&want), "{want} missing in {actions:?}");
     }
@@ -736,4 +736,184 @@ async fn websocket_behind_tls_proxy_streams_large_files() {
     let tcp = TcpStream::connect(r.relay_addr).await.unwrap();
     use tokio_tungstenite::tungstenite::client::IntoClientRequest;
     assert!(tokio_tungstenite::client_async("ws://x/".into_client_request().unwrap(), tcp).await.is_err());
+}
+
+// ---------------------------------------------------------------- user portal & paging
+
+/// Raw HTTP/1.1 request to any address; returns (status, set-cookie values, JSON body).
+async fn http_at(
+    addr: std::net::SocketAddr,
+    method: &str,
+    path: &str,
+    cookie: Option<&str>,
+    body: Option<Value>,
+    headers: &[(&str, &str)],
+) -> (u16, Vec<String>, Value) {
+    let mut s = TcpStream::connect(addr).await.unwrap();
+    let body = body.map(|b| b.to_string()).unwrap_or_default();
+    let mut req = format!("{method} {path} HTTP/1.1\r\nHost: relay.test\r\nConnection: close\r\nContent-Length: {}\r\n", body.len());
+    if !body.is_empty() {
+        req.push_str("Content-Type: application/json\r\n");
+    }
+    for (k, v) in headers {
+        req.push_str(&format!("{k}: {v}\r\n"));
+    }
+    if let Some(c) = cookie {
+        req.push_str(&format!("Cookie: {c}\r\n"));
+    }
+    req.push_str("\r\n");
+    req.push_str(&body);
+    s.write_all(req.as_bytes()).await.unwrap();
+    let mut out = String::new();
+    s.read_to_string(&mut out).await.unwrap();
+    let (head, body) = out.split_once("\r\n\r\n").unwrap();
+    let status: u16 = head.split(' ').nth(1).unwrap().parse().unwrap();
+    let cookies = head
+        .lines()
+        .filter_map(|l| l.strip_prefix("set-cookie: ").or_else(|| l.strip_prefix("Set-Cookie: ")))
+        .map(|c| c.split(';').next().unwrap().to_string())
+        .collect();
+    (status, cookies, serde_json::from_str(body).unwrap_or(Value::Null))
+}
+
+#[tokio::test]
+async fn user_portal_self_service() {
+    let r = server(|s| {
+        s.policy.auth = Auth::Password;
+        s.policy.registration = Registration::Open;
+        s.policy.encryption = Encryption::Tls;
+    })
+    .await;
+    for (dev, user) in [("pd1", "pat"), ("pq1", "quinn")] {
+        let mut c = Client::tls(&r).await;
+        c.hello().await;
+        let mut reg = login(dev, Some((user, "portal-pass1")));
+        reg["t"] = json!("register");
+        assert_eq!(c.req(reg).await["t"], "login");
+    }
+    let mut pd2 = Client::tls(&r).await;
+    pd2.hello().await;
+    assert_eq!(pd2.req(login("pd2", Some(("pat", "portal-pass1")))).await["t"], "login");
+
+    let csrf = ("X-Relay-User", "1");
+    let cred = json!({ "username": "pat", "password": "portal-pass1" });
+    // The page is served on the relay port, but plain HTTP must not carry passwords.
+    let (st, _, _) = http_at(r.relay_addr, "GET", "/", None, None, &[]).await;
+    assert_eq!(st, 200);
+    let (st, _, v) = http_at(r.relay_addr, "POST", "/api/me/login", None, Some(cred.clone()), &[csrf]).await;
+    assert_eq!(st, 400, "{v}");
+    // Behind a TLS proxy the admin trusts, it works.
+    let mut s = r.server.settings();
+    s.proxy_tls = true;
+    r.server.set_settings(s);
+    let https = ("X-Forwarded-Proto", "https");
+    let (st, _, _) = http_at(r.relay_addr, "POST", "/api/me/login", None, Some(cred.clone()), &[https]).await;
+    assert_eq!(st, 403, "CSRF header required");
+    let (st, cookies, v) = http_at(r.relay_addr, "POST", "/api/me/login", None, Some(cred), &[csrf, https]).await;
+    assert_eq!(st, 200, "{v}");
+    let cookie = cookies[0].clone();
+
+    let (st, _, me) = http_at(r.relay_addr, "GET", "/api/me", Some(&cookie), None, &[]).await;
+    assert_eq!(st, 200, "{me}");
+    assert_eq!(me["account"]["username"], "pat");
+    assert_eq!(me["devices"].as_array().unwrap().len(), 2);
+
+    // Someone else's device cannot be touched.
+    let (st, _, _) = http_at(r.relay_addr, "DELETE", "/api/me/devices/pq1", Some(&cookie), None, &[csrf]).await;
+    assert_eq!(st, 404);
+    // Own device: kick, then unregister.
+    let (st, _, v) = http_at(r.relay_addr, "POST", "/api/me/devices/pd2/kick", Some(&cookie), None, &[csrf]).await;
+    assert_eq!((st, v["ok"].clone()), (200, json!(true)));
+    let (st, _, _) = http_at(r.relay_addr, "DELETE", "/api/me/devices/pd2", Some(&cookie), None, &[csrf]).await;
+    assert_eq!(st, 200);
+    let (_, _, me) = http_at(r.relay_addr, "GET", "/api/me", Some(&cookie), None, &[]).await;
+    assert_eq!(me["devices"].as_array().unwrap().len(), 1);
+
+    // Activity: own events only, never what admins did.
+    let acc = me["account"]["id"].as_str().unwrap().to_string();
+    store::audit_for(&r.server.db(), "admin:root", "account_update", "secret admin note", &acc);
+    let (_, _, act) = http_at(r.relay_addr, "GET", "/api/me/activity", Some(&cookie), None, &[]).await;
+    let actions: Vec<&str> = act["items"].as_array().unwrap().iter().filter_map(|x| x["action"].as_str()).collect();
+    for want in ["register", "device_add", "user_login", "user_device_kick", "user_device_delete"] {
+        assert!(actions.contains(&want), "{want} missing in {actions:?}");
+    }
+    assert!(!act.to_string().contains("secret admin note"));
+
+    // Changing the password ends the other web sessions but keeps this one.
+    let other = json!({ "username": "pat", "password": "portal-pass1" });
+    let (_, other, _) = http_at(r.relay_addr, "POST", "/api/me/login", None, Some(other), &[csrf, https]).await;
+    let change = json!({ "old": "portal-pass1", "new": "portal-pass2" });
+    let (st, _, v) = http_at(r.relay_addr, "POST", "/api/me/password", Some(&cookie), Some(change), &[csrf]).await;
+    assert_eq!(st, 200, "{v}");
+    let (st, _, _) = http_at(r.relay_addr, "GET", "/api/me", Some(&other[0]), None, &[]).await;
+    assert_eq!(st, 401);
+    let (st, _, _) = http_at(r.relay_addr, "GET", "/api/me", Some(&cookie), None, &[]).await;
+    assert_eq!(st, 200);
+
+    // WebSocket clients still work on the same port.
+    let mut c = ws_client(&r, true).await;
+    assert_eq!(c.hello().await["t"], "hello");
+
+    // The portal can be switched off.
+    let mut s = r.server.settings();
+    s.user_portal = false;
+    r.server.set_settings(s);
+    let (st, _, _) = http_at(r.relay_addr, "GET", "/", None, None, &[]).await;
+    assert_eq!(st, 404);
+}
+
+#[tokio::test]
+async fn admin_lists_are_paged_on_the_server() {
+    let r = server(|s| s.policy.encryption = Encryption::Plain).await;
+    let setup = json!({ "username": "root", "password": "correct horse" });
+    let (_, cookies, _) = http(&r, "POST", "/api/setup", None, Some(setup), true).await;
+    let cookie = cookies[0].clone();
+    {
+        let db = r.server.db();
+        for i in 0..250i64 {
+            let state = if i % 10 == 0 { "pending" } else { "active" };
+            db.execute(
+                "INSERT INTO accounts (id, username, name, state, created, updated) VALUES (?1, ?2, ?3, ?4, ?5, ?5)",
+                rusqlite::params![format!("{i:016x}"), format!("user{i:03}"), format!("name{i}"), state, 1_000 + i],
+            )
+            .unwrap();
+            db.execute(
+                "INSERT INTO devices (id, account, secret, created, last_seen) VALUES (?1, ?2, ?3, ?4, ?4)",
+                rusqlite::params![format!("dev{i:03}"), format!("{i:016x}"), "x", 1_000 + i],
+            )
+            .unwrap();
+        }
+    }
+    let get = |path: String| {
+        let cookie = cookie.clone();
+        let r = &r;
+        async move { http(r, "GET", &path, Some(&cookie), None, false).await.2 }
+    };
+    let v = get("/api/accounts?per=100&page=3".into()).await;
+    assert_eq!((v["total"].clone(), v["items"].as_array().unwrap().len()), (json!(250), 50));
+    assert_eq!(v["counts"]["pending"], 25);
+    let v = get("/api/accounts?per=10&sort=username&dir=asc".into()).await;
+    assert_eq!(v["items"][0]["username"], "user000");
+    let v = get("/api/accounts?filter=pending&per=10&page=2".into()).await;
+    assert_eq!(v["total"], 25);
+    assert!(v["items"].as_array().unwrap().iter().all(|a| a["state"] == "pending"));
+    let v = get("/api/accounts?q=user12".into()).await;
+    assert_eq!(v["total"], 10, "user120..user129");
+    let v = get("/api/accounts?sort=x%3BDROP%20TABLE%20accounts&per=10".into()).await;
+    assert_eq!(v["items"].as_array().unwrap().len(), 10, "unknown sort keys fall back to the default");
+
+    let v = get("/api/devices?per=50&page=2&sort=id&dir=asc".into()).await;
+    assert_eq!(v["items"][0]["id"], "dev050");
+    assert_eq!(v["counts"]["all"], 250);
+    let v = get(format!("/api/devices?account={:016x}", 7)).await;
+    assert_eq!(v["total"], 1);
+    let v = get("/api/devices?filter=online".into()).await;
+    assert_eq!(v["total"], 0);
+
+    let v = get("/api/audit?per=10".into()).await;
+    assert!(v["actions"].as_array().unwrap().iter().any(|a| a == "admin_setup"));
+    let v = get("/api/connections".into()).await;
+    assert_eq!(v["total"], 0);
+    let v = get("/api/messages".into()).await;
+    assert_eq!(v["total"], 0);
 }

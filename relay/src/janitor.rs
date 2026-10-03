@@ -105,6 +105,7 @@ pub fn sweep(server: &Server, now: i64) -> Swept {
         .lock()
         .unwrap()
         .retain(|_, s| s.expires > now);
+    server.user_sessions.lock().unwrap().retain(|_, s| s.expires > now);
     server
         .lockouts
         .lock()

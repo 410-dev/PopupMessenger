@@ -535,6 +535,8 @@ dependencies = [
  "axum",
  "base64",
  "futures-util",
+ "hyper",
+ "hyper-util",
  "rand 0.8.8",
  "rcgen",
  "rusqlite",

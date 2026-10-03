@@ -194,3 +194,22 @@ table.g td.act .btn + .btn { margin-left: 4px; }
 table.g td.wide { max-width: 420px; }
 .drawer .kv { grid-template-columns: 110px 1fr; }
 a.btn { display: inline-flex; align-items: center; color: var(--fg); text-decoration: none; }
+
+/* ---------- pagination */
+.pager { display: inline-flex; align-items: center; gap: 6px; font-weight: 400; }
+.pager select { height: 22px; }
+
+/* ---------- user portal */
+.ptop { display: flex; align-items: center; gap: 10px; padding: 0 16px; height: 40px; background: var(--side); color: var(--side-fg); }
+.ptop b { color: #fff; }
+.ptop .sp { flex: 1; }
+.ptop .btn { background: transparent; color: var(--side-fg); border-color: #444c56; }
+.portal { max-width: 980px; margin: 0 auto; padding: 14px 16px 32px; display: flex; flex-direction: column; gap: 12px; }
+.portal .tw { max-height: none; border: 0; border-radius: 0; }
+.portal .kv { grid-template-columns: 120px 1fr; }
+.inl { display: flex; gap: 6px; align-items: center; }
+.inl input { width: 220px; max-width: 100%; }
+.pw { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 8px 12px; align-items: end; }
+.pw .fld { display: flex; flex-direction: column; gap: 3px; }
+.pw input { width: 100%; }
+.bd.note { padding: 6px 10px; border-bottom: 1px solid var(--bd2); }

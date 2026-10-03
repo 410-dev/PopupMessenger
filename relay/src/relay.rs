@@ -84,33 +84,28 @@ async fn handle(server: Arc<Server>, s: TcpStream, addr: SocketAddr) {
         return;
     }
     let st = server.settings();
-    let chunk = st.ws_chunk_kb as usize * 1024;
+    // HTTP requests start with an upper-case method name (GET, POST, ...).
+    let http = |c: u8| c.is_ascii_uppercase();
     let (io, secure, transport): (Box<dyn Io>, bool, &'static str) = if b[0] == 0x16 {
         let acc = tokio_rustls::TlsAcceptor::from(server.tls.config.clone());
         let Ok(Ok(mut t)) = timeout(HANDSHAKE, acc.accept(s)).await else { return };
-        // WebSocket inside TLS (wss:// straight to this port)?
+        // HTTP inside TLS (https:// or wss:// straight to this port)?
         let mut first = [0u8; 1];
         if !matches!(timeout(HANDSHAKE, t.read_exact(&mut first)).await, Ok(Ok(_))) {
             return;
         }
         let t = crate::ws::Rewind::new(first.to_vec(), t);
-        if first[0] == b'G' {
-            if !st.websocket {
-                return;
-            }
-            match timeout(HANDSHAKE, crate::ws::accept(t, chunk)).await {
-                Ok(Ok((d, _))) => (Box::new(d), true, "wss"),
-                _ => return,
+        if http(first[0]) {
+            match crate::portal::http(server.clone(), t, true, ip.clone()).await {
+                Some((d, _)) => (Box::new(d), true, "wss"),
+                None => return,
             }
         } else {
             (Box::new(t), true, "tls")
         }
-    } else if b[0] == b'G' {
-        if !st.websocket {
-            return;
-        }
-        match timeout(HANDSHAKE, crate::ws::accept(s, chunk)).await {
-            Ok(Ok((d, fwd))) => {
+    } else if http(b[0]) {
+        match crate::portal::http(server.clone(), s, false, ip.clone()).await {
+            Some((d, fwd)) => {
                 // Behind a TLS-terminating proxy (e.g. Cloudflare Tunnel), trusted only when the admin says so.
                 let proxied = st.proxy_tls && fwd.https;
                 if st.proxy_tls {
@@ -120,7 +115,7 @@ async fn handle(server: Arc<Server>, s: TcpStream, addr: SocketAddr) {
                 }
                 (Box::new(d), proxied, if proxied { "ws-proxy" } else { "ws" })
             }
-            _ => return,
+            None => return,
         }
     } else {
         (Box::new(s), false, "tcp")

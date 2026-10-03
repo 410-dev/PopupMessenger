@@ -464,6 +464,59 @@ async fn put_settings(State(server): S, a: Admin, Json(s): Json<Settings>) -> Re
     Ok(Json(json!({ "settings": new, "changes": changes })))
 }
 
+// ---------------------------------------------------------------- paging
+
+/// Common list parameters: `?page=1&per=100&q=...&sort=col&dir=asc|desc&filter=...`.
+#[derive(Deserialize, Default)]
+struct ListQ {
+    page: Option<i64>,
+    per: Option<i64>,
+    q: Option<String>,
+    sort: Option<String>,
+    dir: Option<String>,
+    filter: Option<String>,
+    /// Devices of one account.
+    account: Option<String>,
+}
+
+impl ListQ {
+    fn per(&self, max: i64) -> i64 {
+        self.per.unwrap_or(100).clamp(10, max)
+    }
+    fn page(&self) -> i64 {
+        self.page.unwrap_or(1).clamp(1, 1_000_000)
+    }
+    fn offset(&self, max: i64) -> i64 {
+        (self.page() - 1) * self.per(max)
+    }
+    fn query(&self) -> String {
+        self.q.clone().unwrap_or_default().trim().chars().take(200).collect()
+    }
+    fn filter(&self) -> String {
+        self.filter.clone().unwrap_or_default()
+    }
+    fn asc(&self) -> bool {
+        self.dir.as_deref() == Some("asc")
+    }
+    /// ORDER BY from a whitelist of sortable columns (never raw input).
+    fn order(&self, cols: &[(&str, &str)], default: &str, tie: &str) -> String {
+        match self.sort.as_deref().and_then(|k| cols.iter().find(|c| c.0 == k)) {
+            Some((_, expr)) => format!("ORDER BY {expr} {} NULLS LAST, {tie}", if self.asc() { "ASC" } else { "DESC" }),
+            None => format!("ORDER BY {default}, {tie}"),
+        }
+    }
+}
+
+fn page_json(items: Vec<Value>, total: i64, q: &ListQ, max: i64, extra: Value) -> Json<Value> {
+    let mut v = json!({ "items": items, "total": total, "page": q.page(), "per": q.per(max) });
+    if let Value::Object(m) = extra {
+        for (k, x) in m {
+            v[k] = x;
+        }
+    }
+    Json(v)
+}
+
 // ---------------------------------------------------------------- accounts
 
 fn online_by_account(server: &Server) -> HashMap<String, usize> {
@@ -474,21 +527,42 @@ fn online_by_account(server: &Server) -> HashMap<String, usize> {
     m
 }
 
-async fn accounts(State(server): S, _a: Admin) -> Res {
+async fn accounts(State(server): S, _a: Admin, Query(q): Query<ListQ>) -> Res {
+    const MAX: i64 = 500;
     let online = online_by_account(&server);
+    let text = q.query();
+    let state = match q.filter().as_str() {
+        f @ ("active" | "pending" | "disabled") => f.to_string(),
+        _ => String::new(),
+    };
+    let filter = "(?1 = '' OR a.state = ?1) AND (?2 = '' OR a.username LIKE ?3 ESCAPE '\\' OR a.name LIKE ?3 ESCAPE '\\'
+                  OR a.id LIKE ?3 ESCAPE '\\' OR a.note LIKE ?3 ESCAPE '\\')";
+    let order = q.order(
+        &[
+            ("state", "a.state"), ("username", "a.username"), ("name", "a.name"), ("id", "a.id"), ("devices", "devs"),
+            ("pending", "pend"), ("stored_bytes", "stored"), ("quota_mb", "a.quota_mb"), ("last_seen", "a.last_seen"),
+            ("created", "a.created"), ("note", "a.note"),
+        ],
+        "a.created DESC",
+        "a.rowid DESC",
+    );
     let db = server.db();
+    let pat = store::like(&text);
+    let total: i64 = db
+        .query_row(&format!("SELECT COUNT(*) FROM accounts a WHERE {filter}"), params![state, text, pat], |r| r.get(0))
+        .map_err(db_err)?;
     let mut st = db
-        .prepare(
+        .prepare(&format!(
             "SELECT a.id, a.username, a.name, a.state, a.max_devices, a.quota_mb, a.note, a.created, a.updated, a.last_seen,
-               (SELECT COUNT(*) FROM devices d WHERE d.account = a.id),
-               (SELECT COUNT(*) FROM deliveries x WHERE x.account = a.id AND x.acked IS NULL),
-               (SELECT COALESCE(SUM(bytes), 0) FROM messages m WHERE m.from_account = a.id AND m.files_gone = 0),
+               (SELECT COUNT(*) FROM devices d WHERE d.account = a.id) AS devs,
+               (SELECT COUNT(*) FROM deliveries x WHERE x.account = a.id AND x.acked IS NULL) AS pend,
+               (SELECT COALESCE(SUM(bytes), 0) FROM messages m WHERE m.from_account = a.id AND m.files_gone = 0) AS stored,
                a.pass IS NOT NULL
-             FROM accounts a ORDER BY a.created DESC",
-        )
+             FROM accounts a WHERE {filter} {order} LIMIT ?4 OFFSET ?5"
+        ))
         .map_err(db_err)?;
     let rows: Vec<Value> = st
-        .query_map([], |r| {
+        .query_map(params![state, text, pat, q.per(MAX), q.offset(MAX)], |r| {
             let id: String = r.get(0)?;
             Ok(json!({
                 "id": id, "username": r.get::<_, Option<String>>(1)?, "name": r.get::<_, String>(2)?,
@@ -503,7 +577,18 @@ async fn accounts(State(server): S, _a: Admin) -> Res {
         .map_err(db_err)?
         .filter_map(Result::ok)
         .collect();
-    Ok(Json(json!({ "accounts": rows })))
+    drop(st);
+    let mut counts = json!({ "all": 0, "active": 0, "pending": 0, "disabled": 0 });
+    let mut st = db.prepare("SELECT state, COUNT(*) FROM accounts GROUP BY state").map_err(db_err)?;
+    for (k, n) in st
+        .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))
+        .map_err(db_err)?
+        .filter_map(Result::ok)
+    {
+        counts["all"] = json!(counts["all"].as_i64().unwrap_or(0) + n);
+        counts[k] = json!(n);
+    }
+    Ok(page_json(rows, total, &q, MAX, json!({ "counts": counts })))
 }
 
 #[derive(Deserialize)]
@@ -793,18 +878,47 @@ async fn bulk_accounts(State(server): S, a: Admin, Json(b): Json<Bulk>) -> Res {
 
 // ---------------------------------------------------------------- devices
 
-async fn devices(State(server): S, _a: Admin) -> Res {
+async fn devices(State(server): S, _a: Admin, Query(q): Query<ListQ>) -> Res {
+    const MAX: i64 = 500;
     let online = server.hub.online();
+    let text = q.query();
+    let pat = store::like(&text);
+    let filter = q.filter();
+    let only_online: Vec<&String> = if filter == "online" { online.iter().collect() } else { vec![] };
+    let online_json = serde_json::to_string(&only_online).unwrap_or_else(|_| "[]".into());
+    let account = q.account.clone().unwrap_or_default();
+    let cond = "(?1 = '' OR d.account = ?1)
+        AND (?2 NOT IN ('online', 'disabled', 'waiting')
+             OR (?2 = 'online' AND d.id IN (SELECT value FROM json_each(?3)))
+             OR (?2 = 'disabled' AND d.disabled != 0)
+             OR (?2 = 'waiting' AND EXISTS (SELECT 1 FROM deliveries x WHERE x.device = d.id AND x.acked IS NULL)))
+        AND (?4 = '' OR json_extract(d.profile, '$.name') LIKE ?5 ESCAPE '\\' OR a.username LIKE ?5 ESCAPE '\\'
+             OR a.name LIKE ?5 ESCAPE '\\' OR d.id LIKE ?5 ESCAPE '\\' OR d.account LIKE ?5 ESCAPE '\\'
+             OR d.last_ip LIKE ?5 ESCAPE '\\' OR json_extract(d.profile, '$.host') LIKE ?5 ESCAPE '\\')";
+    let order = q.order(
+        &[
+            ("name", "json_extract(d.profile, '$.name')"), ("account", "COALESCE(a.username, a.name)"),
+            ("account_state", "a.state"), ("status", "json_extract(d.profile, '$.status')"),
+            ("host", "json_extract(d.profile, '$.host')"), ("id", "d.id"), ("app", "d.app"), ("last_ip", "d.last_ip"),
+            ("pending", "pend"), ("last_seen", "d.last_seen"), ("created", "d.created"),
+        ],
+        "d.last_seen DESC",
+        "d.rowid DESC",
+    );
     let db = server.db();
+    let base = params![account, filter, online_json, text, pat];
+    let total: i64 = db
+        .query_row(&format!("SELECT COUNT(*) FROM devices d JOIN accounts a ON a.id = d.account WHERE {cond}"), base, |r| r.get(0))
+        .map_err(db_err)?;
     let mut st = db
-        .prepare(
+        .prepare(&format!(
             "SELECT d.id, d.account, a.username, a.name, d.profile, d.pubkey, d.disabled, d.app, d.last_ip, d.created, d.last_seen,
-               (SELECT COUNT(*) FROM deliveries x WHERE x.device = d.id AND x.acked IS NULL), a.state
-             FROM devices d JOIN accounts a ON a.id = d.account ORDER BY d.last_seen DESC",
-        )
+               (SELECT COUNT(*) FROM deliveries x WHERE x.device = d.id AND x.acked IS NULL) AS pend, a.state
+             FROM devices d JOIN accounts a ON a.id = d.account WHERE {cond} {order} LIMIT ?6 OFFSET ?7"
+        ))
         .map_err(db_err)?;
     let rows: Vec<Value> = st
-        .query_map([], |r| {
+        .query_map(params![account, filter, online_json, text, pat, q.per(MAX), q.offset(MAX)], |r| {
             let id: String = r.get(0)?;
             let profile: Value = serde_json::from_str(&r.get::<_, String>(4)?).unwrap_or(json!({}));
             let pubkey: String = r.get(5)?;
@@ -820,7 +934,15 @@ async fn devices(State(server): S, _a: Admin) -> Res {
         .map_err(db_err)?
         .filter_map(Result::ok)
         .collect();
-    Ok(Json(json!({ "devices": rows })))
+    drop(st);
+    let one = |sql: &str| -> i64 { db.query_row(sql, [], |r| r.get(0)).unwrap_or(0) };
+    let counts = json!({
+        "all": one("SELECT COUNT(*) FROM devices"),
+        "online": online.len(),
+        "disabled": one("SELECT COUNT(*) FROM devices WHERE disabled != 0"),
+        "waiting": one("SELECT COUNT(DISTINCT device) FROM deliveries WHERE acked IS NULL"),
+    });
+    Ok(page_json(rows, total, &q, MAX, json!({ "counts": counts })))
 }
 
 fn device_account(server: &Server, id: &str) -> Result<String, ApiErr> {
@@ -900,47 +1022,111 @@ async fn kick_device(State(server): S, a: Admin, Path(id): Path<String>) -> Res 
     Ok(Json(json!({ "ok": ok })))
 }
 
-async fn connections(State(server): S, _a: Admin) -> Res {
-    let conns = server.hub.snapshot();
+async fn connections(State(server): S, _a: Admin, Query(q): Query<ListQ>) -> Res {
+    const MAX: i64 = 500;
+    let mut conns = server.hub.snapshot();
+    let all = conns.len();
+    let plain = conns.iter().filter(|c| !c.tls).count();
+    let text = q.query().to_lowercase();
     let db = server.db();
+    if !text.is_empty() {
+        // Names live in the database; ids, IPs and versions in memory.
+        let ids: Vec<&String> = conns.iter().map(|c| &c.device).collect();
+        let by_name: std::collections::HashSet<String> = db
+            .prepare(
+                "SELECT d.id FROM devices d JOIN accounts a ON a.id = d.account
+                 WHERE d.id IN (SELECT value FROM json_each(?1))
+                   AND (json_extract(d.profile, '$.name') LIKE ?2 ESCAPE '\\' OR a.username LIKE ?2 ESCAPE '\\' OR a.name LIKE ?2 ESCAPE '\\')",
+            )
+            .and_then(|mut st| {
+                st.query_map(params![serde_json::to_string(&ids).unwrap_or_default(), store::like(&text)], |r| r.get(0))?
+                    .collect()
+            })
+            .unwrap_or_default();
+        conns.retain(|c| {
+            by_name.contains(&c.device)
+                || format!("{} {} {} {}", c.device, c.account, c.ip, c.app).to_lowercase().contains(&text)
+        });
+    }
+    let asc = q.asc();
+    match q.sort.as_deref() {
+        Some("ip") => conns.sort_by(|a, b| a.ip.cmp(&b.ip)),
+        Some("app") => conns.sort_by(|a, b| a.app.cmp(&b.app)),
+        Some("transport") => conns.sort_by(|a, b| a.transport.cmp(b.transport)),
+        Some("device") => conns.sort_by(|a, b| a.device.cmp(&b.device)),
+        Some("account") => conns.sort_by(|a, b| a.account.cmp(&b.account)),
+        // "since" (default: newest first) and "dur" (longest first)
+        Some("dur") => conns.sort_by(|a, b| b.since.cmp(&a.since)),
+        _ => conns.sort_by(|a, b| a.since.cmp(&b.since)),
+    }
+    if !asc {
+        conns.reverse();
+    }
+    let total = conns.len() as i64;
     let rows: Vec<Value> = conns
         .into_iter()
+        .skip(q.offset(MAX) as usize)
+        .take(q.per(MAX) as usize)
         .map(|c| {
-            let (name, user): (String, Option<String>) = db
+            let (name, user, status): (String, Option<String>, String) = db
                 .query_row(
-                    "SELECT COALESCE(json_extract(d.profile, '$.name'), ''), a.username FROM devices d JOIN accounts a ON a.id = d.account WHERE d.id = ?1",
+                    "SELECT COALESCE(json_extract(d.profile, '$.name'), ''), a.username, COALESCE(json_extract(d.profile, '$.status'), '')
+                     FROM devices d JOIN accounts a ON a.id = d.account WHERE d.id = ?1",
                     [&c.device],
-                    |r| Ok((r.get(0)?, r.get(1)?)),
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
                 )
                 .unwrap_or_default();
-            let status: String = db
-                .query_row("SELECT COALESCE(json_extract(profile, '$.status'), '') FROM devices WHERE id = ?1", [&c.device], |r| r.get(0))
-                .unwrap_or_default();
-            json!({ "device": c.device, "account": c.account, "ip": c.ip, "tls": c.tls, "transport": c.transport, "app": c.app, "since": c.since,
-                    "name": name, "username": user, "status": status })
+            json!({ "device": c.device, "account": c.account, "ip": c.ip, "tls": c.tls, "transport": c.transport, "app": c.app,
+                    "since": c.since, "name": name, "username": user, "status": status })
         })
         .collect();
-    Ok(Json(json!({ "connections": rows })))
+    Ok(page_json(rows, total, &q, MAX, json!({ "all": all, "plain": plain })))
 }
 
 // ---------------------------------------------------------------- stored messages
 
-async fn messages(State(server): S, _a: Admin) -> Res {
+async fn messages(State(server): S, _a: Admin, Query(q): Query<ListQ>) -> Res {
+    const MAX: i64 = 500;
+    let text = q.query();
+    let pat = store::like(&text);
+    let cond = "(?1 = '' OR m.from_name LIKE ?2 ESCAPE '\\' OR m.mid LIKE ?2 ESCAPE '\\' OR m.from_account LIKE ?2 ESCAPE '\\'
+                 OR EXISTS (SELECT 1 FROM deliveries d JOIN accounts a ON a.id = d.account
+                            WHERE d.mid = m.mid AND (a.username LIKE ?2 ESCAPE '\\' OR a.name LIKE ?2 ESCAPE '\\')))";
+    let order = q.order(
+        &[
+            ("created", "m.created"), ("from_name", "m.from_name"), ("pending", "pend"), ("files", "json_array_length(m.files)"),
+            ("bytes", "m.bytes"), ("enc", "json_extract(m.body, '$.enc')"), ("files_expires", "m.files_expires"),
+            ("text_expires", "m.text_expires"), ("mid", "m.mid"),
+        ],
+        "m.created DESC",
+        "m.rowid DESC",
+    );
     let db = server.db();
+    let (total, bytes, pending): (i64, i64, i64) = db
+        .query_row(
+            &format!(
+                "SELECT COUNT(*), COALESCE(SUM(CASE WHEN m.files_gone = 0 THEN m.bytes END), 0),
+                   COALESCE(SUM((SELECT COUNT(*) FROM deliveries d WHERE d.mid = m.mid AND d.acked IS NULL)), 0)
+                 FROM messages m WHERE {cond}"
+            ),
+            params![text, pat],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .map_err(db_err)?;
     // Metadata only; the body is shown per message (GET /api/messages/{mid}), which is audited.
     let mut st = db
-        .prepare(
+        .prepare(&format!(
             "SELECT m.mid, m.from_account, m.from_name, m.bytes, m.files, m.created, m.text_expires, m.files_expires, m.files_gone,
                COALESCE(json_extract(m.body, '$.enc'), 'none'),
-               (SELECT COUNT(*) FROM deliveries d WHERE d.mid = m.mid AND d.acked IS NULL),
+               (SELECT COUNT(*) FROM deliveries d WHERE d.mid = m.mid AND d.acked IS NULL) AS pend,
                (SELECT COUNT(*) FROM deliveries d WHERE d.mid = m.mid),
                (SELECT COUNT(DISTINCT account) FROM deliveries d WHERE d.mid = m.mid),
                (SELECT group_concat(DISTINCT COALESCE(a.username, a.name)) FROM deliveries d JOIN accounts a ON a.id = d.account WHERE d.mid = m.mid)
-             FROM messages m ORDER BY m.created DESC LIMIT 5000",
-        )
+             FROM messages m WHERE {cond} {order} LIMIT ?3 OFFSET ?4"
+        ))
         .map_err(db_err)?;
     let rows: Vec<Value> = st
-        .query_map([], |r| {
+        .query_map(params![text, pat, q.per(MAX), q.offset(MAX)], |r| {
             let files: Vec<u64> = serde_json::from_str(&r.get::<_, String>(4)?).unwrap_or_default();
             Ok(json!({
                 "mid": r.get::<_, String>(0)?, "from": r.get::<_, String>(1)?, "from_name": r.get::<_, String>(2)?,
@@ -953,7 +1139,7 @@ async fn messages(State(server): S, _a: Admin) -> Res {
         .map_err(db_err)?
         .filter_map(Result::ok)
         .collect();
-    Ok(Json(json!({ "messages": rows })))
+    Ok(page_json(rows, total, &q, MAX, json!({ "bytes": bytes, "pending": pending })))
 }
 
 fn hex_id(s: &str) -> Result<(), ApiErr> {
@@ -1106,7 +1292,8 @@ struct ArchiveQ {
     q: Option<String>,
     from: Option<i64>,
     to: Option<i64>,
-    limit: Option<i64>,
+    page: Option<i64>,
+    per: Option<i64>,
 }
 
 const ARCHIVE_COLS: &str =
@@ -1143,7 +1330,8 @@ async fn archive_list(State(server): S, a: Admin, Query(q): Query<ArchiveQ>) -> 
     let query: String = q.q.unwrap_or_default().trim().chars().take(200).collect();
     let pat = format!("%{}%", query.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_"));
     let (from, to) = (q.from.unwrap_or(0), q.to.unwrap_or(i64::MAX));
-    let limit = q.limit.unwrap_or(1000).clamp(1, 20_000);
+    let per = q.per.unwrap_or(100).clamp(10, 20_000);
+    let page = q.page.unwrap_or(1).max(1);
     let filter = "created >= ?1 AND created < ?2 AND (?3 = '' OR text LIKE ?4 ESCAPE '\\' OR from_name LIKE ?4 ESCAPE '\\'
                   OR recipients LIKE ?4 ESCAPE '\\' OR names LIKE ?4 ESCAPE '\\')";
     let db = server.db();
@@ -1151,10 +1339,10 @@ async fn archive_list(State(server): S, a: Admin, Query(q): Query<ArchiveQ>) -> 
         .query_row(&format!("SELECT COUNT(*) FROM archive WHERE {filter}"), params![from, to, query, pat], |r| r.get(0))
         .map_err(db_err)?;
     let mut st = db
-        .prepare(&format!("SELECT {ARCHIVE_COLS} FROM archive WHERE {filter} ORDER BY created DESC LIMIT ?5"))
+        .prepare(&format!("SELECT {ARCHIVE_COLS} FROM archive WHERE {filter} ORDER BY created DESC LIMIT ?5 OFFSET ?6"))
         .map_err(db_err)?;
     let rows: Vec<Value> = st
-        .query_map(params![from, to, query, pat, limit], |r| archive_row(r, false))
+        .query_map(params![from, to, query, pat, per, (page - 1) * per], |r| archive_row(r, false))
         .map_err(db_err)?
         .filter_map(Result::ok)
         .collect();
@@ -1162,13 +1350,13 @@ async fn archive_list(State(server): S, a: Admin, Query(q): Query<ArchiveQ>) -> 
     let all: i64 = db.query_row("SELECT COUNT(*) FROM archive", [], |r| r.get(0)).unwrap_or(0);
     let range = |t: i64, none: bool| if none { "-".to_string() } else { t.to_string() };
     let detail = format!(
-        "query={query:?} from={} to={} -> {} rows",
+        "query={query:?} from={} to={} page={page} -> {} rows",
         range(from, from == 0),
         range(to, to == i64::MAX),
         rows.len()
     );
     store::audit(&db, &a.actor(), "archive_list", &detail);
-    Ok(Json(json!({ "archive": rows, "total": total, "all": all })))
+    Ok(Json(json!({ "items": rows, "total": total, "all": all, "page": page, "per": per })))
 }
 
 async fn archive_get(State(server): S, a: Admin, Path(mid): Path<String>) -> Res {
@@ -1237,25 +1425,34 @@ async fn sweep(State(server): S, a: Admin) -> Res {
 
 // ---------------------------------------------------------------- audit / admins
 
-#[derive(Deserialize)]
-struct AuditQ {
-    limit: Option<i64>,
-}
-
-async fn audit(State(server): S, _a: Admin, Query(q): Query<AuditQ>) -> Res {
+/// Audit log page. `per` goes up to 20000 for CSV export.
+async fn audit(State(server): S, _a: Admin, Query(q): Query<ListQ>) -> Res {
+    const MAX: i64 = 20_000;
+    let text = q.query();
+    let pat = store::like(&text);
+    let action = q.filter();
+    let cond = "(?1 = '' OR action = ?1) AND (?2 = '' OR actor LIKE ?3 ESCAPE '\\' OR detail LIKE ?3 ESCAPE '\\')";
     let db = server.db();
+    let total: i64 = db
+        .query_row(&format!("SELECT COUNT(*) FROM audit WHERE {cond}"), params![action, text, pat], |r| r.get(0))
+        .map_err(db_err)?;
     let mut st = db
-        .prepare("SELECT ts, actor, action, detail FROM audit ORDER BY id DESC LIMIT ?1")
+        .prepare(&format!("SELECT ts, actor, action, detail, account FROM audit WHERE {cond} ORDER BY id DESC LIMIT ?4 OFFSET ?5"))
         .map_err(db_err)?;
     let rows: Vec<Value> = st
-        .query_map([q.limit.unwrap_or(1000).clamp(1, 20_000)], |r| {
+        .query_map(params![action, text, pat, q.per(MAX), q.offset(MAX)], |r| {
             Ok(json!({ "ts": r.get::<_, i64>(0)?, "actor": r.get::<_, String>(1)?, "action": r.get::<_, String>(2)?,
-                       "detail": r.get::<_, String>(3)? }))
+                       "detail": r.get::<_, String>(3)?, "account": r.get::<_, Option<String>>(4)? }))
         })
         .map_err(db_err)?
         .filter_map(Result::ok)
         .collect();
-    Ok(Json(json!({ "audit": rows })))
+    drop(st);
+    let actions: Vec<String> = db
+        .prepare("SELECT action FROM audit GROUP BY action ORDER BY action")
+        .and_then(|mut st| st.query_map([], |r| r.get(0))?.collect())
+        .unwrap_or_default();
+    Ok(page_json(rows, total, &q, MAX, json!({ "actions": actions })))
 }
 
 async fn admins(State(server): S, a: Admin) -> Res {

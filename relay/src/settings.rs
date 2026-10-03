@@ -116,6 +116,8 @@ pub struct Settings {
     pub ws_chunk_kb: u32,
     /// Address users should enter, shown in the admin UI (e.g. https://relay.example.com).
     pub public_url: String,
+    /// Web page on the relay port where account holders manage their own account.
+    pub user_portal: bool,
 }
 
 impl Default for Settings {
@@ -140,6 +142,7 @@ impl Default for Settings {
             proxy_tls: false,
             ws_chunk_kb: 256,
             public_url: String::new(),
+            user_portal: true,
         }
     }
 }
