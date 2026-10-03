@@ -376,7 +376,22 @@ async function groups() {
     const box = h('div', { class: 'grow' });
     const count = h('span', { class: 'status muted' });
     // Members missing from the peer list stay selected and listed.
-    const extra = g ? g.members.filter((x) => !peers.some((p) => p.id === x.id)).map((x) => ({ id: x.id, display: x.display, host: '', ip: '', online: false })) : [];
+    let extra = g ? g.members.filter((x) => !peers.some((p) => p.id === x.id)).map((x) => ({ id: x.id, display: x.display, host: '', ip: '', online: false, gone: true })) : [];
+    // Offline, not on the LAN and not a relay contact: can be removed from the list.
+    const stale = (p) => !p.online && !p.relay && !p.reach;
+    async function forget(p, e) {
+      e.preventDefault();
+      e.stopPropagation();
+      if (!p.gone && !confirm(`'${p.display}' 님을 목록에서 지울까요?\n오프라인이고 LAN과 릴레이 연락처에 없는 사용자입니다. 모든 그룹에서도 빠집니다.`)) return;
+      try {
+        if (!p.gone) await invoke('forget_peer', { id: p.id });
+        sel.delete(p.id);
+        peers.splice(0, peers.length, ...peers.filter((x) => x.id !== p.id));
+        extra = extra.filter((x) => x.id !== p.id);
+        draw();
+        counted();
+      } catch (x) { err.textContent = String(x); }
+    }
     function draw() {
       const s = q.value.trim().toLowerCase();
       const shown = [...peers, ...extra].filter((p) => !s || `${p.display} ${p.host} ${p.ip}`.toLowerCase().includes(s));
@@ -384,8 +399,9 @@ async function groups() {
         const cb = h('input', { type: 'checkbox', checked: sel.has(p.id), onchange: () => { cb.checked ? sel.add(p.id) : sel.delete(p.id); counted(); } });
         return h('label', { class: 'check row' + (p.online ? '' : ' off') }, cb,
           h('span', { class: 'name' }, p.display),
-          !p.online && h('span', { class: 'muted' }, '오프라인'),
-          p.host && h('span', { class: 'muted' }, p.host));
+          !p.online && h('span', { class: 'muted' }, p.reach ? '보관 전달' : '오프라인'),
+          p.host && h('span', { class: 'muted' }, p.host),
+          stale(p) && h('button', { type: 'button', class: 'mini', title: '목록에서 지우기', onclick: (e) => forget(p, e) }, '−'));
       }) : [h('div', { class: 'empty muted' }, '아는 사용자가 없습니다')]));
     }
     const counted = () => { count.textContent = `${sel.size}명 선택`; };
@@ -408,6 +424,40 @@ async function groups() {
   listen('groups', () => { if (list.isConnected) drawList(); });
   listen('peers', () => { if (list.isConnected) drawList(); });
   await drawList();
+}
+
+// ---------------------------------------------------------------- contact search
+async function search() {
+  const q = h('input', { placeholder: '이름 / 사용자 이름 / 호스트 / IP', oninput: () => { clearTimeout(timer); timer = setTimeout(run, 250); } });
+  const scope = h('div', { class: 'muted' });
+  const list = h('div', { class: 'grow' });
+  let timer = null;
+  let seq = 0;
+  const SRC = { lan: 'LAN', relay: '릴레이', history: '주고받은 기록' };
+  async function run() {
+    const my = ++seq;
+    const r = await invoke('search_contacts', { query: q.value });
+    if (my !== seq) return; // a newer search is running
+    scope.textContent = r.relay
+      ? `릴레이 서버${r.server ? ` "${r.server}"` : ''}와 LAN에서 찾습니다.${r.lookup ? ' 이 서버는 아직 주고받지 않은 사람을 사용자 이름이나 계정 ID를 정확히 입력해야 찾을 수 있습니다.' : ''}${r.online ? '' : ' (지금 릴레이에 연결되어 있지 않습니다)'}`
+      : 'LAN과 주고받은 기록에서만 찾습니다. 릴레이 서버를 연결하면 다른 네트워크의 사용자도 찾을 수 있습니다.';
+    list.replaceChildren(...(r.results.length ? r.results.map((p) => {
+      const can = p.online || p.reach;
+      const st = p.online ? (p.status === 'dnd' ? '방해금지' : '온라인') : p.reach ? '오프라인 · 보관 전달' : '오프라인';
+      return h('div', { class: 'row' + (p.online ? '' : ' off') },
+        h('span', { class: 'name', title: can ? '클릭하면 쪽지 쓰기' : '', onclick: () => can && write(p) }, p.display),
+        p.username && h('span', { class: 'muted' }, `@${p.username}`),
+        h('span', { class: p.status === 'dnd' && p.online ? 'warn' : 'muted' }, st),
+        h('span', { class: 'tag' }, SRC[p.source] || p.source),
+        h('button', { class: 'mini', disabled: !can, title: can ? '쪽지 쓰기' : '오프라인이라 보낼 수 없습니다 (릴레이 미등록)', onclick: () => write(p) }, '쓰기'));
+    }) : [h('div', { class: 'empty muted' }, q.value.trim() ? '찾는 사람이 없습니다' : '아는 사용자가 없습니다')]));
+  }
+  const write = (p) => invoke('open_compose', { to: [p.id], files: [], reply: null });
+  q.addEventListener('keydown', (e) => { if (e.key === 'Enter') { clearTimeout(timer); run(); } });
+  listen('peers', () => { clearTimeout(timer); timer = setTimeout(run, 400); });
+  render(q, scope, list);
+  q.focus();
+  await run();
 }
 
 // ---------------------------------------------------------------- receiving
@@ -676,7 +726,7 @@ async function relaysetup() {
 }
 
 // ---------------------------------------------------------------- boot
-const views = { popup, sent, compose, pick, inbox, recv, settings, groups, relaysetup };
+const views = { popup, sent, compose, pick, inbox, recv, settings, groups, relaysetup, search };
 
 // Renders first and only then shows the window, so a pre-warmed (spare) window
 // never flashes blank. Showing an already visible window is a no-op.

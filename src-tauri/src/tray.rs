@@ -84,6 +84,7 @@ fn build_menu(app: &AppHandle) -> tauri::Result<Menu<Wry>> {
         m.append(&MenuItem::with_id(app, "more", format!("더보기… (전체 {}명)", peers.len()), true, None::<&str>)?)?;
     }
     m.append(&PredefinedMenuItem::separator(app)?)?;
+    m.append(&MenuItem::with_id(app, "search", "연락처 검색…", true, None::<&str>)?)?;
     let inbox = if unread > 0 { format!("받은 쪽지 ({unread})") } else { "받은 쪽지".into() };
     m.append(&MenuItem::with_id(app, "inbox", inbox, true, None::<&str>)?)?;
     m.append(&CheckMenuItem::with_id(app, "notify", "알림 팝업", true, notify, None::<&str>)?)?;
@@ -132,6 +133,7 @@ fn on_menu(app: &AppHandle, id: &str) {
         "inbox" => ui::open_inbox(app),
         "more" => ui::open_picker(app, vec![]),
         "groups" => ui::open_groups(app),
+        "search" => ui::open_search(app),
         "settings" => ui::open_settings(app),
         "scan" => {
             st.scan.notify_one();

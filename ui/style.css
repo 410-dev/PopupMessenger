@@ -70,3 +70,5 @@ fieldset.relay { gap: 8px; }
 .fp { font-family: ui-monospace, Consolas, Menlo, monospace; font-size: 13px; letter-spacing: .5px; user-select: text; word-break: break-all; }
 .form { display: flex; flex-direction: column; gap: 8px; }
 .version { text-align: center; font-size: 10.5px; color: var(--mu); opacity: .8; user-select: text; }
+button.mini { padding: 0 8px; height: 22px; font-size: 12px; line-height: 20px; }
+.tag { font-size: 11px; color: var(--mu); border: 1px solid var(--bd); border-radius: 8px; padding: 0 6px; white-space: nowrap; }

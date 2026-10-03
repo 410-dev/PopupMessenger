@@ -155,6 +155,86 @@ fn delete_group(app: AppHandle, id: String) {
     groups_changed(&app);
 }
 
+/// Forgets a stale user (offline, not on the LAN, not a relay contact).
+#[tauri::command]
+fn forget_peer(app: AppHandle, id: String) -> Result<(), String> {
+    app.state::<AppState>().forget_peer(&id)?;
+    tray::refresh(&app);
+    let _ = app.emit("peers", ());
+    groups_changed(&app);
+    Ok(())
+}
+
+/// Contact search, offline people included. With a relay: LAN users and relay
+/// contacts (plus an exact server lookup when the server only lists people you
+/// have talked to). Without one: LAN users and people from the message history.
+#[tauri::command]
+async fn search_contacts(app: AppHandle, query: String) -> Value {
+    let st = app.state::<AppState>();
+    let q = query.trim().to_lowercase();
+    let relay = st.relay.configured();
+    let (lookup_scope, server) = {
+        let c = st.relay.cfg.lock().unwrap();
+        c.as_ref()
+            .map(|c| (c.policy["contacts"] == "lookup", c.server_name.clone()))
+            .unwrap_or((false, String::new()))
+    };
+    let mut looked_up = None;
+    if relay && lookup_scope && st.relay.online() && q.chars().count() >= 2 {
+        looked_up = relay::lookup(&app, query.trim()).await;
+    }
+    let users = relay::usernames(&app);
+    let me = st.my_id();
+    let mut out: Vec<Value> = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for p in st.peers(false) {
+        let acc = p.id.strip_prefix("r:").unwrap_or("");
+        let user = users.get(acc).cloned().unwrap_or_default();
+        let hay = format!("{} {} {} {} {}", p.display, p.name, p.host, p.ip, user).to_lowercase();
+        let exact = looked_up.as_deref().is_some_and(|a| a == acc);
+        if !q.is_empty() && !hay.contains(&q) && !exact {
+            continue;
+        }
+        seen.insert(p.id.clone());
+        out.push(json!({
+            "id": p.id, "display": p.display, "host": p.host, "username": user, "online": p.online,
+            "status": p.status, "reach": p.reach, "source": if p.relay { "relay" } else { "lan" },
+            "forgettable": !p.online && !p.relay && !p.reach,
+        }));
+    }
+    if !relay {
+        // People only known from received or sent messages.
+        let d = st.data.lock().unwrap();
+        let mut hist: Vec<(String, String, u64)> = Vec::new();
+        for m in &d.inbox {
+            hist.push((m.from_id.clone(), m.from_name.clone(), m.ts));
+        }
+        for s in &d.sent {
+            for r in &s.to {
+                hist.push((r.id.clone(), r.name.clone(), s.ts));
+            }
+        }
+        hist.sort_by(|a, b| b.2.cmp(&a.2));
+        for (id, name, ts) in hist {
+            if id == me || id.is_empty() || seen.contains(&id) || (!q.is_empty() && !name.to_lowercase().contains(&q)) {
+                continue;
+            }
+            seen.insert(id.clone());
+            out.push(json!({
+                "id": id, "display": name, "host": "", "username": "", "online": false, "status": "offline",
+                "reach": false, "source": "history", "last": ts, "forgettable": false,
+            }));
+        }
+    }
+    out.truncate(500);
+    json!({ "relay": relay, "online": st.relay.online(), "server": server, "lookup": lookup_scope, "results": out })
+}
+
+#[tauri::command]
+async fn open_search(app: AppHandle) {
+    ui::open_search(&app);
+}
+
 fn groups_changed(app: &AppHandle) {
     tray::refresh(app);
     let _ = app.emit("groups", ());
@@ -396,6 +476,9 @@ fn main() {
             save_group,
             delete_group,
             open_groups,
+            forget_peer,
+            search_contacts,
+            open_search,
             open_picker,
             open_message,
             open_settings,

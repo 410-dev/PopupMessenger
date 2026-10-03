@@ -829,6 +829,36 @@ pub fn refresh(app: &AppHandle) {
 
 // ---------------------------------------------------------------- contacts
 
+/// Asks the server for an account by exact username or account id (needed on
+/// "lookup" servers, where contacts only hold people you have talked to).
+pub async fn lookup(app: &AppHandle, query: &str) -> Option<String> {
+    let r = request(app, json!({ "t": "lookup", "query": query })).await.ok()?;
+    let entry = r["contact"].clone();
+    let acc = entry["account"].as_str()?.to_string();
+    // Unchanged contacts are left alone: rebuilding emits "peers", which makes an
+    // open search window search (and look up) again.
+    let known = app.state::<AppState>().relay.cfg.lock().unwrap().as_ref().and_then(|c| c.contacts.get(&acc).cloned());
+    if known.as_ref() != Some(&entry) {
+        apply_contacts(app, std::slice::from_ref(&entry), false);
+        rebuild_peers(app);
+    }
+    Some(acc)
+}
+
+/// Relay account id -> username, for searching contacts by username.
+pub fn usernames(app: &AppHandle) -> HashMap<String, String> {
+    let st = app.state::<AppState>();
+    let cfg = st.relay.cfg.lock().unwrap();
+    cfg.as_ref()
+        .map(|c| {
+            c.contacts
+                .iter()
+                .filter_map(|(a, e)| e["username"].as_str().map(|u| (a.clone(), u.to_string())))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 async fn sync_contacts(app: &AppHandle) {
     let st = app.state::<AppState>();
     let since = st.relay.cfg.lock().unwrap().as_ref().map(|c| c.contacts_since).unwrap_or(0);

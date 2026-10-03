@@ -1,6 +1,6 @@
 [package]
 name = "popup-messenger"
-version = "0.1.6"
+version = "0.1.7"
 description = "LAN popup messenger"
 edition = "2021"
 

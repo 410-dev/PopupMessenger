@@ -200,6 +200,10 @@ pub fn open_group_compose(app: &AppHandle, group: &str) {
     open(app, &label, json!({ "v": "compose", "to": [], "files": [], "group": group }), "그룹 쪽지 쓰기", (420.0, 420.0), false);
 }
 
+pub fn open_search(app: &AppHandle) {
+    open(app, "search", json!({ "v": "search" }), "연락처 검색", (380.0, 520.0), false);
+}
+
 pub fn open_groups(app: &AppHandle) {
     open(app, "groups", json!({ "v": "groups" }), "전송 그룹 관리", (380.0, 520.0), false);
 }

@@ -503,6 +503,28 @@ impl AppState {
             .collect()
     }
 
+    /// Removes a user that is offline, not on the LAN and not a relay contact,
+    /// together with its send count and group memberships.
+    pub fn forget_peer(&self, id: &str) -> Result<(), String> {
+        {
+            let mut d = self.data.lock().unwrap();
+            match d.peers.get(id) {
+                None => {}
+                Some(p) if p.online || id.starts_with("r:") || !p.relay_account.is_empty() => {
+                    return Err("접속 중이거나 릴레이 연락처에 있는 사용자는 지울 수 없습니다".into());
+                }
+                Some(_) => {}
+            }
+            d.peers.remove(id);
+            d.counts.remove(id);
+            for g in d.groups.iter_mut() {
+                g.members.retain(|m| m != id);
+            }
+        }
+        self.save_data();
+        Ok(())
+    }
+
     /// Whether a user seen on the LAN recently (other than this one) uses `name`.
     pub fn name_in_use(&self, name: &str) -> bool {
         let me = self.my_id();
