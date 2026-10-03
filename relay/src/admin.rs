@@ -409,6 +409,7 @@ async fn overview(State(server): S, _a: Admin) -> Res {
             "id": server.id, "name": s.server_name, "version": crate::VERSION, "started": server.started, "now": now_ms(),
             "relay_port": server.relay_port, "tls_fingerprint": server.tls.fingerprint, "tls_self_signed": server.tls.self_signed,
             "data_dir": server.dir.display().to_string(), "db_bytes": db_size,
+            "public_url": s.public_url, "websocket": s.websocket, "proxy_tls": s.proxy_tls, "ws_chunk_kb": s.ws_chunk_kb,
         },
         "policy": s.policy,
         "counts": counts,
@@ -908,7 +909,7 @@ async fn connections(State(server): S, _a: Admin) -> Res {
             let status: String = db
                 .query_row("SELECT COALESCE(json_extract(profile, '$.status'), '') FROM devices WHERE id = ?1", [&c.device], |r| r.get(0))
                 .unwrap_or_default();
-            json!({ "device": c.device, "account": c.account, "ip": c.ip, "tls": c.tls, "app": c.app, "since": c.since,
+            json!({ "device": c.device, "account": c.account, "ip": c.ip, "tls": c.tls, "transport": c.transport, "app": c.app, "since": c.since,
                     "name": name, "username": user, "status": status })
         })
         .collect();

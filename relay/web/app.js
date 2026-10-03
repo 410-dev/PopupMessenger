@@ -179,6 +179,8 @@ const STATUS = { online: ['ok', '온라인'], dnd: ['wa', '방해금지'], offli
 const ENC = { plain: '평문', tls: '서버 통신 암호화 (TLS)', e2ee: '종단간 암호화' };
 const REG = { closed: '닫힘', approval: '승인제', open: '열림' };
 const AUTH = { password: '사용자 이름 + 비밀번호', none: '없음 (기기 인증)' };
+const TRANSPORT = { tcp: ['wa', 'TCP 평문'], tls: ['ok', 'TCP · TLS'], ws: ['wa', 'WebSocket 평문'], wss: ['ok', 'WebSocket · TLS'], 'ws-proxy': ['ok', 'WebSocket · 프록시 TLS'] };
+
 
 function csv(name, header, rows) {
   const q = (v) => `"${String(v ?? '').replace(/"/g, '""')}"`;
@@ -308,7 +310,7 @@ async function pOverview(c, ph) {
     const maxMsgs = Math.max(1, ...o.stats.map((x) => x.msgs));
     c.replaceChildren(
       h('div', { class: 'kpis' },
-        kpi('접속 중인 기기', num(k.online), k.online_plain ? `평문 연결 ${k.online_plain}` : 'TLS 연결만', false),
+        kpi('접속 중인 기기', num(k.online), k.online_plain ? `암호화 안 된 연결 ${k.online_plain}` : '모두 암호화된 연결', false),
         kpi('활성 계정', num(k.active), `전체 ${num(k.accounts)} · 정지 ${num(k.disabled)}`),
         kpi('승인 대기', num(k.pending), p.registration === 'approval' ? '가입 승인제' : `가입: ${REG[p.registration]}`, k.pending > 0),
         kpi('등록 기기', num(k.devices), `정지 ${num(k.devices_disabled)}`),
@@ -324,7 +326,11 @@ async function pOverview(c, ph) {
           h('div', {}, '서버 ID'), h('div', { class: 'mono' }, s.id),
           h('div', {}, '버전'), h('div', {}, s.version),
           h('div', {}, '가동 시간'), h('div', { title: tsFull(s.started) }, dur(s.now - s.started)),
-          h('div', {}, '릴레이 포트'), h('div', {}, `${s.relay_port} (TCP · TLS 1.3 / 평문 자동 판별)`),
+          h('div', {}, '사용자 접속 주소'), h('div', {}, s.public_url
+            ? [h('span', { class: 'mono' }, s.public_url), ' ', h('a', { onclick: () => navigator.clipboard.writeText(s.public_url).then(() => toast('복사했습니다')) }, '복사')]
+            : h('span', { class: 'mu' }, '정책 > 외부 공개에서 정할 수 있습니다')),
+          h('div', {}, '릴레이 포트'), h('div', {}, `${s.relay_port} (TLS 1.3 · 평문 TCP${s.websocket ? ' · WebSocket' : ''} 자동 판별)`),
+          s.websocket && h('div', {}, 'WebSocket'), s.websocket && h('div', {}, `${s.ws_chunk_kb}KB 단위 스트리밍${s.proxy_tls ? ' · 프록시가 TLS 처리' : ''}`),
           h('div', {}, '인증서'), h('div', {}, s.tls_self_signed ? chip('wa', '자체 서명') : chip('ok', '운영자 제공')),
           h('div', {}, 'SHA-256 지문'), h('div', { class: 'mono' }, s.tls_fingerprint.match(/../g).join(':'), ' ',
             h('a', { onclick: () => navigator.clipboard.writeText(s.tls_fingerprint).then(() => toast('복사했습니다')) }, '복사')),
@@ -370,7 +376,7 @@ async function pConnections(c, ph) {
       { k: 'device', t: '기기 ID', cls: 'mono' },
       { k: 'account', t: '계정 ID', cls: 'mono' },
       { k: 'ip', t: 'IP', cls: 'mono' },
-      { k: 'tls', t: '연결', v: (r) => (r.tls ? chip('ok', 'TLS') : chip('wa', '평문')) },
+      { k: 'transport', t: '연결', v: (r) => chip(...(TRANSPORT[r.transport] || (r.tls ? ['ok', 'TLS'] : ['wa', '평문']))) },
       { k: 'app', t: '앱', cls: 'mono' },
       { k: 'since', t: '접속 시각', v: (r) => h('span', { title: tsFull(r.since) }, ts(r.since)) },
       { k: 'dur', t: '접속 시간', cls: 'num', s: (r) => -r.since, v: (r) => dur(Date.now() - r.since) },
@@ -838,6 +844,12 @@ const POLICY = [
     { p: 'policy.retention_hours.files', t: '첨부파일 보관 시간', type: 'num', min: 1, max: 87600, unit: '시간', help: '쪽지 보관 시간보다 길게 정해도 쪽지 보관 시간으로 맞춰집니다' },
     { p: 'storage_quota_mb', t: '전체 저장 한도', type: 'num', min: 0, unit: 'MB', help: '첨부파일 기준. 0이면 무제한' },
     { p: 'account_quota_mb', t: '계정별 저장 한도', type: 'num', min: 0, unit: 'MB', help: '보낸 계정 기준. 0이면 무제한. 계정마다 따로 정할 수 있습니다' },
+  ]],
+  ['외부 공개 (HTTPS 프록시 · WebSocket)', [
+    { p: 'public_url', t: '사용자 접속 주소', type: 'text', help: '사용자에게 안내할 주소. 예: https://relay.example.com (Cloudflare Tunnel 등) 또는 relay.example.com:45443 (TCP 직접)' },
+    { p: 'websocket', t: 'WebSocket 연결', type: 'bool', label: '릴레이 포트에서 WebSocket(HTTP 업그레이드)도 받음', help: 'Cloudflare Tunnel처럼 HTTP/HTTPS만 통과시키는 프록시를 거칠 때 필요합니다. 터널 서비스 주소는 http://localhost:45443' },
+    { p: 'proxy_tls', t: '프록시가 TLS 처리', type: 'bool', label: '프록시가 HTTPS로 받았다고 표시한 WebSocket 연결을 암호화된 연결로 인정', dep: 'websocket', warn: '앞단 프록시가 HTTPS를 처리할 때만 켜세요. 켜면 프록시가 보낸 접속자 IP(CF-Connecting-IP / X-Forwarded-For)를 기록합니다', help: 'X-Forwarded-Proto: https 또는 CF-Visitor 헤더로 판단합니다' },
+    { p: 'ws_chunk_kb', t: '스트리밍 단위', type: 'num', min: 16, max: 4096, unit: 'KB', dep: 'websocket', help: '첨부파일을 이 크기의 WebSocket 메시지로 나눠 보냅니다. HTTP 요청 하나로 올리지 않으므로 Cloudflare의 100MB 업로드 제한에 걸리지 않습니다. 기본 256KB' },
   ]],
   ['쪽지 감사', [
     { p: 'archive', t: '감사 보관', type: 'bool', label: '종단간 암호화가 아닌 쪽지의 사본을 전달 후에도 보관', warn: '사용자에게는 알리지 않습니다. 조직의 정보 보호 방침에 따라 쓰세요', help: '켠 뒤부터 릴레이를 거치는 쪽지가 보관됩니다. LAN 직접 전송은 서버를 거치지 않아 보관되지 않습니다' },

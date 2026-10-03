@@ -9,6 +9,7 @@ pub mod relay;
 pub mod settings;
 pub mod store;
 pub mod tls;
+pub mod ws;
 
 use rusqlite::Connection;
 use serde_json::json;

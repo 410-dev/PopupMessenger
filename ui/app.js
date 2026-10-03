@@ -541,7 +541,8 @@ async function drawRelay(box) {
       ['계정', r.username || '(계정 없음 — 기기 등록)'],
       ['계정 ID', h('span', { class: 'mono' }, r.account || '—')],
       ['기기 ID', h('span', { class: 'mono' }, r.device)],
-      ['연결', r.tls ? h('span', { title: r.fingerprint }, 'TLS 1.3 · 인증서 ', h('span', { class: 'mono' }, fp(r.fingerprint).slice(0, 19))) : h('span', { class: 'warn' }, '⚠ 암호화되지 않은 연결')],
+      ['연결', h('span', {}, /^https?:\/\//i.test(r.url) ? 'WebSocket · ' : 'TCP · ',
+        r.tls ? h('span', { title: r.fingerprint }, 'TLS · 인증서 ', h('span', { class: 'mono' }, fp(r.fingerprint).slice(0, 19))) : h('span', { class: 'warn' }, '⚠ 암호화되지 않은 연결'))],
       p.encryption && ['로그온', AUTH[p.auth] || p.auth],
       ...(p.encryption ? policyRows(p) : []),
       p.encryption === 'e2ee' && ['내 보안 키', h('span', { class: 'mono' }, fp(r.my_key))],
@@ -566,7 +567,7 @@ async function relaysetup() {
   const head = (i) => h('div', { class: 'steps' }, steps.map((t, j) => h('span', { class: j === i ? 'on' : j < i ? 'done' : '' }, `${j + 1}. ${t}`)));
 
   function stepAddr(value = '') {
-    const url = h('input', { value, placeholder: '예: relay.example.com 또는 192.168.0.10:45443' });
+    const url = h('input', { value, placeholder: '예: https://relay.example.com 또는 192.168.0.10:45443' });
     const next = h('button', { class: 'primary', onclick: go }, '다음');
     async function go() {
       err.textContent = '';
@@ -579,7 +580,7 @@ async function relaysetup() {
     render(head(0),
       h('div', { class: 'grow form' },
         h('label', {}, h('span', { class: 'muted' }, '릴레이 서버 주소'), url),
-        h('div', { class: 'muted' }, `관리자에게 받은 주소를 입력하세요. 포트를 생략하면 45443을 씁니다.`),
+        h('div', { class: 'muted' }, '관리자에게 받은 주소를 입력하세요. https://로 시작하는 주소는 WebSocket으로 연결합니다 (Cloudflare Tunnel 같은 HTTPS 프록시). 그 밖의 주소는 TCP로 직접 연결하며, 포트를 생략하면 45443을 씁니다.'),
         err),
       h('div', { class: 'bar' }, h('button', { onclick: close }, '취소'), next));
     url.focus();
@@ -592,6 +593,7 @@ async function relaysetup() {
         kv([
           ['서버 이름', h('b', {}, s.name || '(이름 없음)')],
           ['주소', probe.url],
+          ['연결 방식', probe.ws ? `WebSocket${probe.tls ? ' (HTTPS)' : ' (암호화 없음)'}` : `TCP${probe.tls ? ' · TLS' : ' (암호화 없음)'}`],
           ['서버 버전', s.version || '—'],
           ['로그온', AUTH[p.auth] || p.auth],
           ['가입', REG[p.registration] || p.registration],

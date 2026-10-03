@@ -69,27 +69,63 @@ pub async fn serve(server: Arc<Server>, l: TcpListener) {
 
 async fn handle(server: Arc<Server>, s: TcpStream, addr: SocketAddr) {
     let _ = s.set_nodelay(true);
-    // TLS records start with 0x16 (handshake); our frames start with a length whose
-    // first byte is 0 (frames are at most 8 MiB).
-    let mut b = [0u8; 1];
-    let tls = matches!(timeout(HANDSHAKE, s.peek(&mut b)).await, Ok(Ok(1))) && b[0] == 0x16;
-    let io: Box<dyn Io> = if tls {
-        let acc = tokio_rustls::TlsAcceptor::from(server.tls.config.clone());
-        match timeout(HANDSHAKE, acc.accept(s)).await {
-            Ok(Ok(t)) => Box::new(t),
-            _ => return,
-        }
-    } else {
-        Box::new(s)
-    };
-    let ip = match addr.ip() {
+    let mut ip = match addr.ip() {
         std::net::IpAddr::V6(v6) => v6
             .to_ipv4_mapped()
             .map(|v4| v4.to_string())
             .unwrap_or_else(|| v6.to_string()),
         v4 => v4.to_string(),
     };
-    let _ = session(server, io, ip, tls).await;
+    // The first byte tells the transport apart: 0x16 starts a TLS handshake, 'G' an
+    // HTTP request (WebSocket upgrade), and our frames start with a length whose
+    // first byte is 0 (frames are at most 8 MiB).
+    let mut b = [0u8; 1];
+    if !matches!(timeout(HANDSHAKE, s.peek(&mut b)).await, Ok(Ok(1))) {
+        return;
+    }
+    let st = server.settings();
+    let chunk = st.ws_chunk_kb as usize * 1024;
+    let (io, secure, transport): (Box<dyn Io>, bool, &'static str) = if b[0] == 0x16 {
+        let acc = tokio_rustls::TlsAcceptor::from(server.tls.config.clone());
+        let Ok(Ok(mut t)) = timeout(HANDSHAKE, acc.accept(s)).await else { return };
+        // WebSocket inside TLS (wss:// straight to this port)?
+        let mut first = [0u8; 1];
+        if !matches!(timeout(HANDSHAKE, t.read_exact(&mut first)).await, Ok(Ok(_))) {
+            return;
+        }
+        let t = crate::ws::Rewind::new(first.to_vec(), t);
+        if first[0] == b'G' {
+            if !st.websocket {
+                return;
+            }
+            match timeout(HANDSHAKE, crate::ws::accept(t, chunk)).await {
+                Ok(Ok((d, _))) => (Box::new(d), true, "wss"),
+                _ => return,
+            }
+        } else {
+            (Box::new(t), true, "tls")
+        }
+    } else if b[0] == b'G' {
+        if !st.websocket {
+            return;
+        }
+        match timeout(HANDSHAKE, crate::ws::accept(s, chunk)).await {
+            Ok(Ok((d, fwd))) => {
+                // Behind a TLS-terminating proxy (e.g. Cloudflare Tunnel), trusted only when the admin says so.
+                let proxied = st.proxy_tls && fwd.https;
+                if st.proxy_tls {
+                    if let Some(real) = fwd.client_ip {
+                        ip = real;
+                    }
+                }
+                (Box::new(d), proxied, if proxied { "ws-proxy" } else { "ws" })
+            }
+            _ => return,
+        }
+    } else {
+        (Box::new(s), false, "tcp")
+    };
+    let _ = session(server, io, ip, secure, transport).await;
 }
 
 async fn session(
@@ -97,6 +133,7 @@ async fn session(
     mut io: Box<dyn Io>,
     ip: String,
     tls: bool,
+    transport: &'static str,
 ) -> Result<(), String> {
     let hello = frame::read(&mut io, HANDSHAKE).await?.ok_or("eof")?;
     let rid = hello["rid"].clone();
@@ -124,6 +161,7 @@ async fn session(
     let reply = json!({
         "t": "hello", "rid": rid, "proto": 1,
         "server": { "id": server.id, "name": s.server_name, "version": crate::VERSION },
+        "transport": { "kind": transport, "ws_chunk": s.ws_chunk_kb as usize * 1024 },
         "policy": s.policy,
     });
     frame::write(&mut io, &reply).await?;
@@ -134,7 +172,7 @@ async fn session(
 
     let req = frame::read(&mut io, HANDSHAKE).await?.ok_or("eof")?;
     match req["t"].as_str() {
-        Some("login") | Some("register") => control(server, io, ip, tls, app, req).await,
+        Some("login") | Some("register") => control(server, io, ip, tls, transport, app, req).await,
         Some("auth") => transfer(server, io, req).await,
         _ => {
             frame::write(
@@ -517,6 +555,7 @@ async fn control(
     mut io: Box<dyn Io>,
     ip: String,
     tls: bool,
+    transport: &'static str,
     app: String,
     req: Value,
 ) -> Result<(), String> {
@@ -543,6 +582,7 @@ async fn control(
             account: me.account.clone(),
             ip,
             tls,
+            transport,
             app,
             since: now_ms(),
         },

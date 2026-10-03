@@ -21,6 +21,8 @@ pub struct Conn {
     pub account: String,
     pub ip: String,
     pub tls: bool,
+    /// tcp | tls | ws | wss | ws-proxy
+    pub transport: &'static str,
     pub app: String,
     pub since: i64,
 }
@@ -31,6 +33,7 @@ pub struct ConnView {
     pub account: String,
     pub ip: String,
     pub tls: bool,
+    pub transport: &'static str,
     pub app: String,
     pub since: i64,
 }
@@ -137,6 +140,7 @@ impl Hub {
                 account: c.account.clone(),
                 ip: c.ip.clone(),
                 tls: c.tls,
+                transport: c.transport,
                 app: c.app.clone(),
                 since: c.since,
             })

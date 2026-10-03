@@ -656,3 +656,84 @@ async fn e2ee_messages_are_never_archived() {
     let n: i64 = r.server.db().query_row("SELECT COUNT(*) FROM archive", [], |x| x.get(0)).unwrap();
     assert_eq!(n, 0);
 }
+
+// ---------------------------------------------------------------- WebSocket transport
+
+async fn ws_client(r: &Running, https_proxy: bool) -> Client {
+    use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+    let tcp = TcpStream::connect(r.relay_addr).await.unwrap();
+    let mut req = "ws://pms-relay.example/".into_client_request().unwrap();
+    if https_proxy {
+        req.headers_mut().insert("x-forwarded-proto", "https".parse().unwrap());
+        req.headers_mut().insert("cf-connecting-ip", "203.0.113.7".parse().unwrap());
+    }
+    let (ws, _) = tokio_tungstenite::client_async(req, tcp).await.unwrap();
+    Client { io: Box::new(popup_relay::ws::bridge(ws, 16 * 1024)), rid: 0, events: vec![] }
+}
+
+#[tokio::test]
+async fn websocket_behind_tls_proxy_streams_large_files() {
+    let r = server(|s| {
+        s.policy.auth = Auth::None;
+        s.policy.registration = Registration::Open;
+        s.policy.encryption = Encryption::Tls;
+        s.policy.relay_max_file_size = 1 << 30;
+        s.ws_chunk_kb = 16;
+    })
+    .await;
+
+    // Not trusted as TLS until the admin says a proxy terminates it.
+    let mut c = ws_client(&r, true).await;
+    let h = c.hello().await;
+    assert_eq!(h["transport"]["kind"], "ws");
+    assert_eq!(h["transport"]["ws_chunk"], 16 * 1024);
+    assert_eq!(frame::read(&mut c.io, T).await.unwrap().unwrap()["code"], "tls_required");
+
+    let mut s = r.server.settings();
+    s.proxy_tls = true;
+    r.server.set_settings(s);
+    let mut b = ws_client(&r, true).await;
+    assert_eq!(b.hello().await["transport"]["kind"], "ws-proxy");
+    let lb = b.req(login("wsb", None)).await;
+    assert_eq!(lb["t"], "login", "{lb}");
+    let mut a = ws_client(&r, true).await;
+    a.hello().await;
+    let la = a.req(login("wsa", None)).await;
+    let conns = r.server.hub.snapshot();
+    assert!(conns.iter().all(|c| c.transport == "ws-proxy" && c.ip == "203.0.113.7"));
+
+    // A 3 MB attachment crosses as ~200 WebSocket messages of 16 KB.
+    let file: Vec<u8> = (0..3_000_000u32).map(|i| (i * 7 % 251) as u8).collect();
+    let mut t = ws_client(&r, true).await;
+    t.hello().await;
+    assert_eq!(t.req(json!({ "t": "auth", "session": la["session"] })).await["t"], "ok");
+    let ready = t
+        .req(json!({ "t": "send", "msg": "w", "to": [lb["account"]], "files": [{ "size": file.len() }],
+                     "body": { "enc": "none", "text": "ws", "names": ["big.bin"] } }))
+        .await;
+    assert_eq!(ready["t"], "ready", "{ready}");
+    t.io.write_all(&file).await.unwrap();
+    t.io.flush().await.unwrap();
+    let sent = frame::read(&mut t.io, T).await.unwrap().unwrap();
+    assert_eq!(sent["result"][0]["state"], "delivered", "{sent}");
+
+    let mid = b.wait_event("inbox").await;
+    assert_eq!(mid["count"], 1);
+    let mid = b.req(json!({ "t": "inbox" })).await["list"][0]["mid"].clone();
+    let mut f = ws_client(&r, true).await;
+    f.hello().await;
+    f.req(json!({ "t": "auth", "session": lb["session"] })).await;
+    f.req(json!({ "t": "fetch", "mid": mid })).await;
+    let mut got = vec![0u8; file.len()];
+    f.io.read_exact(&mut got).await.unwrap();
+    assert!(got == file);
+    assert_eq!(f.req(json!({ "t": "ack", "mid": mid })).await["t"], "ok");
+
+    // WebSocket can be switched off entirely.
+    let mut s = r.server.settings();
+    s.websocket = false;
+    r.server.set_settings(s);
+    let tcp = TcpStream::connect(r.relay_addr).await.unwrap();
+    use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+    assert!(tokio_tungstenite::client_async("ws://x/".into_client_request().unwrap(), tcp).await.is_err());
+}

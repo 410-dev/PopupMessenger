@@ -11,7 +11,7 @@ docker compose up -d --build
 
 | 포트 | 용도 |
 |---|---|
-| `45443/tcp` | 클라이언트 프로토콜. TLS 1.3과 평문(정책이 허용할 때)을 같은 포트에서 자동으로 구분 |
+| `45443/tcp` | 클라이언트 프로토콜. TLS 1.3, 평문(정책이 허용할 때), WebSocket을 같은 포트에서 자동으로 구분 |
 | `127.0.0.1:8080` | 관리자 웹 UI. 기본으로 서버 자신에만 열림 |
 
 1. 서버에서 `http://127.0.0.1:8080`을 엽니다. 원격이면 `ssh -L 8080:127.0.0.1:8080 서버`로 터널을 연 뒤 내 PC에서 엽니다.
@@ -29,6 +29,16 @@ docker compose up -d --build
 | `ADMIN_BIND` | `0.0.0.0:8080` | 관리 UI 주소 (Docker는 compose에서 호스트 loopback으로만 공개) |
 | `TLS_CERT`, `TLS_KEY` | (없음) | PEM 인증서 체인과 개인 키. 없으면 `DATA_DIR/tls`에 자체 서명 인증서를 만들어 씀 |
 | `TLS_NAMES` | `localhost` | 자체 서명 인증서의 이름(쉼표 구분). 서버의 도메인이나 IP를 넣으세요 |
+
+## Cloudflare Tunnel 등 HTTPS 프록시 뒤에서 쓰기
+
+Cloudflare Tunnel은 HTTP/HTTPS(WebSocket 포함)만 통과시키므로, 클라이언트는 `https://` 주소로 WebSocket 연결을 씁니다.
+
+1. 터널의 Public Hostname을 추가합니다. 예: `pms-relay.example.com` → Service `HTTP` `localhost:45443` (Docker가 호스트에 공개한 릴레이 포트). 대시보드에서 저장하면 DNS CNAME(`<터널 ID>.cfargotunnel.com`)이 자동으로 만들어집니다. `nslookup` 결과가 "Non-existent domain"이면 이 레코드가 없는 것입니다.
+2. 관리 화면 > 정책 > 외부 공개에서 "WebSocket 연결"과 "프록시가 TLS 처리"를 켜고, 사용자 접속 주소에 `https://pms-relay.example.com`을 적습니다.
+3. 사용자는 앱의 릴레이 서버 연결 창에 `https://pms-relay.example.com`을 입력합니다.
+
+첨부파일은 "스트리밍 단위"(기본 256KB) 크기의 WebSocket 메시지로 나뉘어 오가므로, Cloudflare의 HTTP 업로드 100MB 제한과 관계없이 릴레이 정책의 파일 크기 한도까지 보낼 수 있습니다.
 
 자체 서명 인증서를 쓰면 클라이언트는 처음 연결할 때 SHA-256 지문을 보여 주고 고정합니다. 지문은 관리 UI의 개요 화면에 있습니다.
 

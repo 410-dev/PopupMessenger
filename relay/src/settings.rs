@@ -106,6 +106,16 @@ pub struct Settings {
     /// Also keep the attachments of archived messages.
     pub archive_files: bool,
     pub archive_days: u32,
+    /// Accept the protocol over WebSocket (HTTP upgrade on the relay port), for
+    /// HTTPS-only proxies such as Cloudflare Tunnel.
+    pub websocket: bool,
+    /// A proxy in front terminates TLS: WebSocket connections it marks as HTTPS
+    /// (X-Forwarded-Proto / CF-Visitor) count as encrypted, and its client IP header is used.
+    pub proxy_tls: bool,
+    /// Largest WebSocket message; attachments are streamed in pieces of this size.
+    pub ws_chunk_kb: u32,
+    /// Address users should enter, shown in the admin UI (e.g. https://relay.example.com).
+    pub public_url: String,
 }
 
 impl Default for Settings {
@@ -126,6 +136,10 @@ impl Default for Settings {
             archive: false,
             archive_files: false,
             archive_days: 90,
+            websocket: true,
+            proxy_tls: false,
+            ws_chunk_kb: 256,
+            public_url: String::new(),
         }
     }
 }
@@ -153,6 +167,8 @@ impl Settings {
         self.audit_days = self.audit_days.clamp(1, 3650);
         self.admin_session_hours = self.admin_session_hours.clamp(1, 24 * 30);
         self.archive_days = self.archive_days.clamp(1, 3650);
+        self.ws_chunk_kb = self.ws_chunk_kb.clamp(16, 4096);
+        self.public_url = self.public_url.trim().chars().take(200).collect();
         if !self.archive {
             self.archive_files = false;
         }
