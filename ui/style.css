@@ -69,3 +69,4 @@ fieldset.relay { gap: 8px; }
 .note { border: 1px solid var(--bd); border-radius: 4px; padding: 8px; display: flex; flex-direction: column; gap: 6px; }
 .fp { font-family: ui-monospace, Consolas, Menlo, monospace; font-size: 13px; letter-spacing: .5px; user-select: text; word-break: break-all; }
 .form { display: flex; flex-direction: column; gap: 8px; }
+.version { text-align: center; font-size: 10.5px; color: var(--mu); opacity: .8; user-select: text; }

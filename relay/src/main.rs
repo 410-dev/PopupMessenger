@@ -6,7 +6,7 @@ async fn main() {
     match start(cfg).await {
         Ok(r) => {
             let s = &r.server;
-            println!("popup-relay {} · server id {}", popup_relay::VERSION, s.id);
+            println!("popup-relay {} · server id {}", popup_relay::version(), s.id);
             println!("relay  : {} (TLS 1.3 + plain, auto-detected)", r.relay_addr);
             println!("admin  : http://{}", r.admin_addr);
             println!(

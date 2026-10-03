@@ -20,7 +20,7 @@ use tauri::{AppHandle, Emitter, Manager, RunEvent, State};
 
 #[tauri::command]
 fn me(st: State<AppState>) -> Value {
-    json!({ "meta": st.my_meta(), "port": st.port, "os": std::env::consts::OS })
+    json!({ "meta": st.my_meta(), "port": st.port, "os": std::env::consts::OS, "version": env!("CARGO_PKG_VERSION") })
 }
 
 #[tauri::command]

@@ -32,6 +32,7 @@ a:hover { text-decoration: underline; }
 .top { grid-column: 1 / 3; display: flex; align-items: center; gap: 10px; padding: 0 12px;
   background: var(--side); color: var(--side-fg); border-bottom: 1px solid #000; }
 .top .brand { font-weight: 600; color: #fff; letter-spacing: .2px; }
+.top .ver { font-size: 11px; opacity: .55; font-family: var(--mono); }
 .top .srv { color: var(--side-fg); opacity: .8; }
 .top .sp { flex: 1; }
 .top .who { opacity: .85; }

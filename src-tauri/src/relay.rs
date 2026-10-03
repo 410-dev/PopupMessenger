@@ -53,6 +53,8 @@ pub struct RelayConfig {
     pub fingerprint: String,
     pub server_id: String,
     pub server_name: String,
+    /// "<protocol>.<YYMMDD>.<NN>" as the server reported it.
+    pub server_version: String,
     pub account: String,
     pub username: Option<String>,
     pub policy: Value,
@@ -508,6 +510,7 @@ pub async fn join(app: &AppHandle, url: &str, tls: bool, fingerprint: &str, mode
         fingerprint: if seen.fingerprint.is_empty() { fingerprint.to_string() } else { seen.fingerprint },
         server_id,
         server_name: h["server"]["name"].as_str().unwrap_or("").to_string(),
+        server_version: h["server"]["version"].as_str().unwrap_or("").to_string(),
         account: r["account"].as_str().unwrap_or("").to_string(),
         username,
         policy: h["policy"].clone(),
@@ -588,7 +591,7 @@ pub fn info(app: &AppHandle) -> Value {
         .collect();
     json!({
         "configured": true, "state": conn.state, "message": conn.message,
-        "url": c.url, "tls": c.tls, "fingerprint": c.fingerprint, "server_id": c.server_id, "server_name": c.server_name,
+        "url": c.url, "tls": c.tls, "fingerprint": c.fingerprint, "server_id": c.server_id, "server_name": c.server_name, "server_version": c.server_version,
         "username": c.username, "account": c.account, "device": st.my_id(), "policy": c.policy,
         "contacts": c.contacts.len().saturating_sub(1), "my_key": my_key, "key_changed": changed,
     })
@@ -712,6 +715,7 @@ async fn session(app: &AppHandle, cfg: &RelayConfig) -> Stop {
         if let Some(c) = c.as_mut() {
             c.policy = h["policy"].clone();
             c.server_name = h["server"]["name"].as_str().unwrap_or(&c.server_name).to_string();
+            c.server_version = h["server"]["version"].as_str().unwrap_or(&c.server_version).to_string();
             c.account = r["account"].as_str().unwrap_or(&c.account).to_string();
             if r["username"].is_string() {
                 c.username = r["username"].as_str().map(str::to_string);

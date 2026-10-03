@@ -20,7 +20,28 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex, MutexGuard, RwLock};
 use tokio::net::TcpListener;
 
-pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+/// Relay protocol version: the first part of the server version, and what
+/// clients must send in `hello`.
+pub const PROTOCOL: u64 = 1;
+
+/// Server version "<protocol>.<YYMMDD>.<NN>" (build date and build of that day),
+/// kept in the VERSION file and bumped by bump-version.py.
+pub fn version() -> &'static str {
+    include_str!("../VERSION").trim()
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn version_format() {
+        let v = super::version();
+        let parts: Vec<&str> = v.split('.').collect();
+        assert_eq!(parts.len(), 3, "{v}");
+        assert_eq!(parts[0], super::PROTOCOL.to_string(), "VERSION must start with PROTOCOL: run bump-version.py");
+        assert!(parts[1].len() == 6 && parts[1].chars().all(|c| c.is_ascii_digit()), "{v}");
+        assert!(parts[2].len() >= 2 && parts[2].chars().all(|c| c.is_ascii_digit()), "{v}");
+    }
+}
 
 pub struct Config {
     pub data_dir: PathBuf,

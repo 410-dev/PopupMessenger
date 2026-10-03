@@ -144,7 +144,7 @@ async fn session(
         )
         .await;
     }
-    if hello["proto"].as_u64() != Some(1) {
+    if hello["proto"].as_u64() != Some(crate::PROTOCOL) {
         return frame::write(
             &mut io,
             &err_frame(&rid, &perr("version", "지원하지 않는 프로토콜 버전입니다")),
@@ -159,8 +159,8 @@ async fn session(
         .collect();
     let s = server.settings();
     let reply = json!({
-        "t": "hello", "rid": rid, "proto": 1,
-        "server": { "id": server.id, "name": s.server_name, "version": crate::VERSION },
+        "t": "hello", "rid": rid, "proto": crate::PROTOCOL,
+        "server": { "id": server.id, "name": s.server_name, "version": crate::version() },
         "transport": { "kind": transport, "ws_chunk": s.ws_chunk_kb as usize * 1024 },
         "policy": s.policy,
     });

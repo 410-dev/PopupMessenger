@@ -502,7 +502,8 @@ async function settings() {
     h('div', { class: 'muted' }, `내 포트 ${me.port} · 디스크 여유 ${size(me.meta.free_space)} · 실제 허용 ${size(me.meta.max_file_size)}/파일`),
     relayBox,
     err,
-    h('div', { class: 'bar' }, h('button', { type: 'button', onclick: close }, '취소'), h('button', { class: 'primary' }, '저장'))));
+    h('div', { class: 'bar' }, h('button', { type: 'button', onclick: close }, '취소'), h('button', { class: 'primary' }, '저장')),
+    h('div', { class: 'version' }, `PopupMessenger v${me.version}`)));
 }
 
 // ---------------------------------------------------------------- relay
@@ -537,6 +538,7 @@ async function drawRelay(box) {
   box.replaceChildren(legend,
     kv([
       ['서버', `${r.server_name || '(이름 없음)'} · ${r.url}`],
+      r.server_version && ['서버 버전', h('span', { class: 'mono' }, r.server_version)],
       ['상태', h('span', {}, h('span', { class: 'conn ' + cls }, '● ', label), r.message ? h('span', { class: 'muted' }, ` ${r.message}`) : '')],
       ['계정', r.username || '(계정 없음 — 기기 등록)'],
       ['계정 ID', h('span', { class: 'mono' }, r.account || '—')],

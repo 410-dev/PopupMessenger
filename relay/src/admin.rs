@@ -147,7 +147,8 @@ pub async fn serve(server: Arc<Server>, l: TcpListener) {
 
 // ---------------------------------------------------------------- static
 
-fn asset(ct: &'static str, body: &'static str) -> Response {
+fn asset(ct: &'static str, body: impl Into<axum::body::Body>) -> Response {
+    let body: axum::body::Body = body.into();
     (
         [
             (header::CONTENT_TYPE, ct),
@@ -164,11 +165,16 @@ fn asset(ct: &'static str, body: &'static str) -> Response {
         .into_response()
 }
 
+/// The page links its script and stylesheet with the server version, so a browser
+/// never keeps using the previous build's UI after an upgrade.
 async fn index() -> Response {
-    asset(
-        "text/html; charset=utf-8",
-        include_str!("../web/index.html"),
-    )
+    let v = crate::version();
+    let html = include_str!("../web/index.html")
+        .replace("\"app.js\"", &format!("\"app.js?v={v}\""))
+        .replace("\"style.css\"", &format!("\"style.css?v={v}\""));
+    let mut r = asset("text/html; charset=utf-8", html);
+    r.headers_mut().insert(header::CACHE_CONTROL, "no-store".parse().unwrap());
+    r
 }
 
 async fn app_js() -> Response {
@@ -206,6 +212,7 @@ async fn session_info(State(server): S, h: HeaderMap) -> Json<Value> {
         "user": user,
         "server_name": server.settings().server_name,
         "min_password_len": server.settings().min_password_len,
+        "version": crate::version(),
     }))
 }
 
@@ -406,7 +413,7 @@ async fn overview(State(server): S, _a: Admin) -> Res {
             .unwrap_or(0);
     Ok(Json(json!({
         "server": {
-            "id": server.id, "name": s.server_name, "version": crate::VERSION, "started": server.started, "now": now_ms(),
+            "id": server.id, "name": s.server_name, "version": crate::version(), "started": server.started, "now": now_ms(),
             "relay_port": server.relay_port, "tls_fingerprint": server.tls.fingerprint, "tls_self_signed": server.tls.self_signed,
             "data_dir": server.dir.display().to_string(), "db_bytes": db_size,
             "public_url": s.public_url, "websocket": s.websocket, "proxy_tls": s.proxy_tls, "ws_chunk_kb": s.ws_chunk_kb,

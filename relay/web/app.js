@@ -248,15 +248,16 @@ let nav, main;
 
 function shell() {
   const srv = h('span', { class: 'srv' });
+  const ver = h('span', { class: 'ver' });
   nav = h('nav', { class: 'side' });
   main = h('main', { class: 'main' });
   $app.replaceChildren(h('div', { class: 'shell' },
     h('header', { class: 'top' },
-      h('span', { class: 'brand' }, 'Relay Admin'), srv, h('span', { class: 'sp' }),
+      h('span', { class: 'brand' }, 'Relay Admin'), srv, ver, h('span', { class: 'sp' }),
       h('span', { class: 'who' }, ME),
       h('button', { onclick: async () => { try { await api('POST', '/api/logout'); } catch { /* ignore */ } authScreen(); } }, '로그아웃')),
     nav, main));
-  fetch('/api/session', { credentials: 'same-origin' }).then((r) => r.json()).then((s) => { srv.textContent = s.server_name; });
+  fetch('/api/session', { credentials: 'same-origin' }).then((r) => r.json()).then((s) => { srv.textContent = s.server_name; ver.textContent = s.version ? `v${s.version}` : ''; });
   route();
   refreshCounts();
 }
