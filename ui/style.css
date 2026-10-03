@@ -54,3 +54,18 @@ label.check input { width: auto; }
 fieldset { border: 1px solid var(--bd); border-radius: 4px; padding: 6px 8px; display: flex; flex-direction: column; gap: 4px; }
 legend { padding: 0 4px; }
 .drop { outline: 2px dashed var(--ac); outline-offset: -4px; }
+details.group { border: 1px solid var(--bd); border-radius: 4px; padding: 4px 8px; }
+details.group summary { cursor: pointer; }
+details.group .members { padding-top: 4px; user-select: text; word-break: break-word; }
+label.check.row { padding: 5px 6px; }
+.kv { display: grid; grid-template-columns: auto 1fr; gap: 3px 10px; align-items: baseline; }
+.kv > span { min-width: 0; overflow-wrap: anywhere; }
+.mono { font-family: ui-monospace, Consolas, Menlo, monospace; font-size: 12px; }
+.conn.ok { color: #2e9d4f; } .conn.busy { color: var(--mu); } .conn.warn { color: #b8860b; } .conn.err { color: var(--er); } .conn.muted { color: var(--mu); }
+fieldset.relay { gap: 8px; }
+.steps { display: flex; gap: 10px; font-size: 12px; color: var(--mu); border-bottom: 1px solid var(--bd); padding-bottom: 6px; }
+.steps .on { color: var(--fg); font-weight: 600; }
+.steps .done { color: var(--ac); }
+.note { border: 1px solid var(--bd); border-radius: 4px; padding: 8px; display: flex; flex-direction: column; gap: 6px; }
+.fp { font-family: ui-monospace, Consolas, Menlo, monospace; font-size: 13px; letter-spacing: .5px; user-select: text; word-break: break-all; }
+.form { display: flex; flex-direction: column; gap: 8px; }

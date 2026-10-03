@@ -1,6 +1,8 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod e2ee;
 mod net;
+mod relay;
 mod shell;
 mod state;
 mod tray;
@@ -9,7 +11,7 @@ mod ui;
 mod windrop;
 
 use serde_json::{json, Value};
-use state::{AppState, Message, PeerView, Sent, Settings};
+use state::{AppState, Group, GroupView, Message, PeerView, Sent, Settings};
 use std::sync::atomic::Ordering;
 use tauri::{AppHandle, Emitter, Manager, RunEvent, State};
 
@@ -72,6 +74,7 @@ async fn save_settings(app: AppHandle, s: Settings) -> Result<(), String> {
     tray::refresh(&app);
     let _ = app.emit("peers", ()); // display names depend on show_host
     st.scan.notify_one();
+    relay::announce(&app);
     Ok(())
 }
 
@@ -88,13 +91,78 @@ fn stat_paths(paths: Vec<String>) -> Vec<Value> {
 }
 
 #[tauri::command]
-async fn send_message(app: AppHandle, job: String, to: Vec<String>, text: String, files: Vec<String>) -> Vec<net::SendResult> {
-    net::send(app, job, to, text, files).await
+async fn send_message(
+    app: AppHandle,
+    job: String,
+    to: Vec<String>,
+    text: String,
+    files: Vec<String>,
+    group: Option<String>,
+    reveal: bool,
+) -> Vec<net::SendResult> {
+    net::send(app, job, to, text, files, group, reveal).await
 }
 
 #[tauri::command]
 async fn open_compose(app: AppHandle, to: Vec<String>, files: Vec<String>, reply: Option<String>) {
     ui::open_compose(&app, to, files, reply);
+}
+
+#[tauri::command]
+async fn open_group_compose(app: AppHandle, id: String) {
+    ui::open_group_compose(&app, &id);
+}
+
+#[tauri::command]
+fn groups(st: State<AppState>) -> Vec<GroupView> {
+    st.groups()
+}
+
+/// Creates (empty id) or replaces a group.
+#[tauri::command]
+fn save_group(app: AppHandle, mut g: Group) -> Result<String, String> {
+    g.name = g.name.trim().to_string();
+    if g.name.is_empty() {
+        return Err("그룹 이름을 입력하세요".into());
+    }
+    let st = app.state::<AppState>();
+    let me = st.my_id();
+    let mut seen = std::collections::HashSet::new();
+    g.members.retain(|m| *m != me && seen.insert(m.clone()));
+    if g.members.is_empty() {
+        return Err("받는 사람을 한 명 이상 고르세요".into());
+    }
+    {
+        let mut d = st.data.lock().unwrap();
+        match d.groups.iter_mut().find(|x| !g.id.is_empty() && x.id == g.id) {
+            Some(x) => *x = g.clone(),
+            None => {
+                g.id = state::new_id();
+                d.groups.push(g.clone());
+            }
+        }
+    }
+    st.save_data();
+    groups_changed(&app);
+    Ok(g.id)
+}
+
+#[tauri::command]
+fn delete_group(app: AppHandle, id: String) {
+    let st = app.state::<AppState>();
+    st.data.lock().unwrap().groups.retain(|g| g.id != id);
+    st.save_data();
+    groups_changed(&app);
+}
+
+fn groups_changed(app: &AppHandle) {
+    tray::refresh(app);
+    let _ = app.emit("groups", ());
+}
+
+#[tauri::command]
+async fn open_groups(app: AppHandle) {
+    ui::open_groups(&app);
 }
 
 #[tauri::command]
@@ -235,23 +303,80 @@ async fn pick_dir(app: AppHandle) -> Option<String> {
 }
 
 #[tauri::command]
-fn rescan(st: State<AppState>) {
-    st.scan.notify_one();
+fn rescan(app: AppHandle) {
+    app.state::<AppState>().scan.notify_one();
+    relay::refresh(&app);
+}
+
+#[tauri::command]
+fn relay_info(app: AppHandle) -> Value {
+    relay::info(&app)
+}
+
+/// Contacts the server at `url` and returns its identity and policy for the user to confirm.
+#[tauri::command]
+async fn relay_probe(url: String) -> Result<Value, String> {
+    relay::probe(&url).await
+}
+
+/// `mode`: "device" (servers without accounts), "login" or "register".
+#[tauri::command]
+async fn relay_join(
+    app: AppHandle,
+    url: String,
+    tls: bool,
+    fingerprint: String,
+    mode: String,
+    user: String,
+    pass: String,
+) -> Result<Value, String> {
+    relay::join(&app, &url, tls, &fingerprint, &mode, &user, &pass).await
+}
+
+#[tauri::command]
+async fn relay_disconnect(app: AppHandle) {
+    relay::disconnect(&app).await;
+}
+
+#[tauri::command]
+fn relay_reconnect(app: AppHandle) {
+    relay::reconnect(&app);
+}
+
+#[tauri::command]
+fn relay_accept_keys(app: AppHandle) {
+    relay::accept_keys(&app);
+}
+
+#[tauri::command]
+async fn open_relay_setup(app: AppHandle) {
+    ui::open_relay_setup(&app);
+}
+
+/// `POPUPMESSENGER_PROFILE=<name>` runs a separate instance for testing: its own
+/// data folder, no single-instance hand-off, and no autostart/context-menu registration.
+pub fn profile() -> Option<String> {
+    std::env::var("POPUPMESSENGER_PROFILE")
+        .ok()
+        .filter(|p| !p.is_empty() && p.len() <= 32 && p.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_'))
 }
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let cwd = std::env::current_dir().map(|p| p.to_string_lossy().into_owned()).unwrap_or_default();
 
-    tauri::Builder::default()
-        .plugin(tauri_plugin_single_instance::init(|app, argv, cwd| {
+    let mut builder = tauri::Builder::default();
+    if profile().is_none() {
+        builder = builder.plugin(tauri_plugin_single_instance::init(|app, argv, cwd| {
             let files = shell::files_from_args(&argv, &cwd);
             if files.is_empty() {
                 ui::open_inbox(app);
             } else {
                 shell::queue_files(app, files);
             }
-        }))
+        }));
+    }
+    builder
         .plugin(tauri_plugin_autostart::init(
             tauri_plugin_autostart::MacosLauncher::LaunchAgent,
             Some(vec!["--autostart"]),
@@ -266,6 +391,11 @@ fn main() {
             save_settings,
             send_message,
             open_compose,
+            open_group_compose,
+            groups,
+            save_group,
+            delete_group,
+            open_groups,
             open_picker,
             open_message,
             open_settings,
@@ -284,7 +414,14 @@ fn main() {
             open_url,
             pick_files,
             pick_dir,
-            rescan
+            rescan,
+            relay_info,
+            relay_probe,
+            relay_join,
+            relay_disconnect,
+            relay_reconnect,
+            relay_accept_keys,
+            open_relay_setup
         ])
         .on_window_event(|w, e| {
             if let tauri::WindowEvent::Destroyed = e {
@@ -295,17 +432,20 @@ fn main() {
             #[cfg(target_os = "macos")]
             app.set_activation_policy(tauri::ActivationPolicy::Accessory);
 
-            let dir = app.path().app_data_dir()?;
+            let mut dir = app.path().app_data_dir()?;
+            if let Some(p) = profile() {
+                let name = format!("{}.profile-{p}", dir.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default());
+                dir = dir.with_file_name(name);
+            }
             std::fs::create_dir_all(&dir)?;
             let mut settings = AppState::load_settings(&dir);
             if settings.auto_online {
                 settings.status = state::Status::Online;
             }
-            let dl = app
-                .path()
-                .download_dir()
-                .map(|d| d.join("PopupMessenger"))
-                .unwrap_or_else(|_| dir.join("received"));
+            let dl = match profile() {
+                Some(_) => dir.join("received"),
+                None => app.path().download_dir().map(|d| d.join("PopupMessenger")).unwrap_or_else(|_| dir.join("received")),
+            };
             let (tcp, udp, port) = net::bind().ok_or("55000~65500 범위에 사용 가능한 포트가 없습니다")?;
             app.manage(AppState::new(dir, port, settings, dl));
             app.state::<AppState>().save_settings();
@@ -314,6 +454,8 @@ fn main() {
             shell::apply(&h);
             tray::create(&h)?;
             net::start(h.clone(), tcp, udp);
+            relay::rebuild_peers(&h);
+            relay::start(h.clone());
             shell::queue_files(&h, shell::files_from_args(&args, &cwd));
             ui::warm(&h);
             Ok(())

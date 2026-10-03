@@ -11,6 +11,9 @@ use tauri::{AppHandle, Manager};
 const BATCH_GAP: Duration = Duration::from_millis(600);
 
 pub fn apply(app: &AppHandle) {
+    if crate::profile().is_some() {
+        return; // test instances never touch the user's registration
+    }
     let (auto, ctx) = {
         let s = app.state::<AppState>();
         let s = s.settings.lock().unwrap();

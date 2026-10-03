@@ -54,11 +54,29 @@ fn open(app: &AppHandle, label: &str, view: Value, title: &str, size: (f64, f64)
     let b = b.visible_on_all_workspaces(on_top);
     #[cfg(windows)]
     let b = b.disable_drag_drop_handler(); // see windrop.rs
+    let b = profile_webview(app, b);
     let _w = b.build();
     #[cfg(windows)]
     if let Ok(w) = &_w {
         crate::windrop::attach(w);
     }
+}
+
+/// Test profiles (see `profile()`) keep their own WebView2 data folder, and
+/// `POPUPMESSENGER_CDP_PORT` opens the remote debugging port so tests can drive the
+/// windows. The other browser flags are wry's defaults, which this replaces.
+fn profile_webview<'a>(app: &AppHandle, b: WebviewWindowBuilder<'a, tauri::Wry, AppHandle>) -> WebviewWindowBuilder<'a, tauri::Wry, AppHandle> {
+    if crate::profile().is_none() {
+        return b;
+    }
+    let b = b.data_directory(app.state::<AppState>().dir.join("webview"));
+    #[cfg(windows)]
+    if let Some(p) = std::env::var("POPUPMESSENGER_CDP_PORT").ok().and_then(|p| p.parse::<u16>().ok()) {
+        return b.additional_browser_args(&format!(
+            "--disable-features=msWebOOUI,msPdfOOUI,msSmartScreenProtection --remote-debugging-port={p}"
+        ));
+    }
+    b
 }
 
 fn take_spare(app: &AppHandle) -> Option<WebviewWindow> {
@@ -97,6 +115,7 @@ pub fn warm(app: &AppHandle) {
         .initialization_script("window.__SPARE=true;");
     #[cfg(windows)]
     let b = b.disable_drag_drop_handler(); // see windrop.rs
+    let b = profile_webview(app, b);
     match b.build() {
         #[cfg(windows)]
         Ok(w) => crate::windrop::attach(&w),
@@ -176,6 +195,15 @@ pub fn open_compose(app: &AppHandle, to: Vec<String>, files: Vec<String>, reply:
     open(app, &label, json!({ "v": "compose", "to": to, "files": files, "reply": reply }), title, (420.0, 400.0), false);
 }
 
+pub fn open_group_compose(app: &AppHandle, group: &str) {
+    let label = format!("compose-{}", next(app));
+    open(app, &label, json!({ "v": "compose", "to": [], "files": [], "group": group }), "그룹 쪽지 쓰기", (420.0, 420.0), false);
+}
+
+pub fn open_groups(app: &AppHandle) {
+    open(app, "groups", json!({ "v": "groups" }), "전송 그룹 관리", (380.0, 520.0), false);
+}
+
 pub fn open_picker(app: &AppHandle, files: Vec<String>) {
     let label = format!("picker-{}", next(app));
     let title = if files.is_empty() { "받는 사람".to_string() } else { format!("받는 사람 - 파일 {}개", files.len()) };
@@ -184,6 +212,10 @@ pub fn open_picker(app: &AppHandle, files: Vec<String>) {
 
 pub fn open_inbox(app: &AppHandle) {
     open(app, "inbox", json!({ "v": "inbox" }), "쪽지함", (460.0, 500.0), false);
+}
+
+pub fn open_relay_setup(app: &AppHandle) {
+    open(app, "relay-setup", json!({ "v": "relaysetup" }), "릴레이 서버 연결", (440.0, 560.0), false);
 }
 
 pub fn open_settings(app: &AppHandle) {

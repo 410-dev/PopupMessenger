@@ -51,6 +51,8 @@ fn label(s: &str) -> String {
 fn build_menu(app: &AppHandle) -> tauri::Result<Menu<Wry>> {
     let st = app.state::<AppState>();
     let peers = st.peers(true);
+    // Groups with nobody online are left out to keep the menu short.
+    let groups: Vec<_> = st.groups().into_iter().filter(|g| g.online > 0).collect();
     let unread = st.unread();
     let (notify, status) = {
         let s = st.settings.lock().unwrap();
@@ -61,6 +63,12 @@ fn build_menu(app: &AppHandle) -> tauri::Result<Menu<Wry>> {
     let item = |s: Status| CheckMenuItem::with_id(app, format!("st:{}", s.label()), s.label(), true, status == s, None::<&str>);
     let (on, dnd, off) = (item(Status::Online)?, item(Status::Dnd)?, item(Status::Offline)?);
     m.append(&Submenu::with_items(app, format!("상태: {}", status.label()), true, &[&on, &dnd, &off])?)?;
+    m.append(&PredefinedMenuItem::separator(app)?)?;
+    for g in &groups {
+        let text = format!("[그룹] {}  ({}/{}명)", g.name, g.online, g.members.len());
+        m.append(&MenuItem::with_id(app, format!("g:{}", g.id), label(&text), true, None::<&str>)?)?;
+    }
+    m.append(&MenuItem::with_id(app, "groups", "전송 그룹 관리…", true, None::<&str>)?)?;
     m.append(&PredefinedMenuItem::separator(app)?)?;
     if peers.is_empty() {
         m.append(&MenuItem::with_id(app, "none", "(접속 중인 사용자 없음)", false, None::<&str>)?)?;
@@ -123,8 +131,12 @@ fn on_menu(app: &AppHandle, id: &str) {
     match id {
         "inbox" => ui::open_inbox(app),
         "more" => ui::open_picker(app, vec![]),
+        "groups" => ui::open_groups(app),
         "settings" => ui::open_settings(app),
-        "scan" => st.scan.notify_one(),
+        "scan" => {
+            st.scan.notify_one();
+            crate::relay::refresh(app);
+        }
         "notify" => {
             {
                 let mut s = st.settings.lock().unwrap();
@@ -132,12 +144,14 @@ fn on_menu(app: &AppHandle, id: &str) {
             }
             st.save_settings();
             st.scan.notify_one(); // re-announce the new notify flag
+            crate::relay::announce(app);
             refresh(app);
         }
         "quit" => {
             let a = app.clone();
             tauri::async_runtime::spawn(async move {
                 net::send_bye(&a).await;
+                crate::relay::logout(&a).await;
                 a.exit(0);
             });
         }
@@ -147,9 +161,11 @@ fn on_menu(app: &AppHandle, id: &str) {
                 st.settings.lock().unwrap().status = status;
                 st.save_settings();
                 st.scan.notify_one(); // announce the new status right away
+                crate::relay::announce(app);
                 refresh(app);
             }
         }
+        s if s.starts_with("g:") => ui::open_group_compose(app, &s[2..]),
         s if s.starts_with("p:") => ui::open_compose(app, vec![s[2..].to_string()], vec![], None),
         _ => {}
     }

@@ -11,6 +11,10 @@ const GB: f64 = 1024.0 * 1024.0 * 1024.0;
 const INBOX_CAP: usize = 1000;
 /// Peers heard from within this window count as present on the network.
 pub const RECENT: Duration = Duration::from_secs(95);
+/// Protocol version sent in `Meta.ver`. 3: group info in message headers.
+pub const PROTO_VER: u32 = 3;
+/// Upper bound on group members kept from a received header.
+pub const MAX_GROUP_MEMBERS: usize = 1000;
 
 pub fn now_ms() -> u64 {
     SystemTime::now()
@@ -117,7 +121,7 @@ impl Default for Settings {
             id: new_id(),
             name: default_name(),
             name_custom: false,
-            show_host: true,
+            show_host: false,
             notify: true,
             autostart: true,
             max_files: 10,
@@ -176,6 +180,11 @@ pub struct Peer {
     pub max_files: u32,
     pub max_file_size: u64,
     pub status: Status,
+    /// Protocol version from the peer's last announcement.
+    pub ver: u32,
+    /// Relay account this peer belongs to: its own for "r:<account>" peers, and the
+    /// owning account for a LAN peer that is also one of that account's devices.
+    pub relay_account: String,
     /// Recently seen and not in `Offline` status.
     #[serde(skip)]
     pub online: bool,
@@ -196,6 +205,10 @@ pub struct PeerView {
     pub status: Status,
     pub notify: bool,
     pub count: u32,
+    /// A relay contact ("r:<account>").
+    pub relay: bool,
+    /// Online, or reachable through the relay (stored if offline).
+    pub reach: bool,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -203,6 +216,49 @@ pub struct FileEntry {
     pub name: String,
     pub size: u64,
     pub path: String,
+}
+
+/// A saved recipient list. Members are peer ids, so renames keep membership.
+#[derive(Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Group {
+    pub id: String,
+    pub name: String,
+    pub members: Vec<String>,
+    /// Default for "show the group name and other recipients" when sending.
+    pub reveal: bool,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+pub struct Member {
+    pub id: String,
+    pub name: String,
+}
+
+/// Group details sent to v3+ peers when the sender chose to reveal them.
+#[derive(Clone, Serialize, Deserialize)]
+pub struct GroupInfo {
+    pub name: String,
+    pub members: Vec<Member>,
+}
+
+#[derive(Serialize)]
+pub struct MemberView {
+    pub id: String,
+    pub display: String,
+    pub online: bool,
+    pub status: Status,
+    /// Offline but reachable through the relay.
+    pub relay: bool,
+}
+
+#[derive(Serialize)]
+pub struct GroupView {
+    pub id: String,
+    pub name: String,
+    pub reveal: bool,
+    pub members: Vec<MemberView>,
+    pub online: usize,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -217,6 +273,8 @@ pub struct Message {
     pub read: bool,
     #[serde(default)]
     pub note: String,
+    #[serde(default)]
+    pub group: Option<GroupInfo>,
 }
 
 #[derive(Default, Serialize, Deserialize)]
@@ -227,6 +285,7 @@ pub struct Data {
     pub counts: HashMap<String, u32>,
     pub peers: HashMap<String, Peer>,
     pub sent: Vec<Sent>,
+    pub groups: Vec<Group>,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -236,6 +295,9 @@ pub struct Recipient {
     pub ok: bool,
     #[serde(default)]
     pub error: String,
+    /// "lan", "relay" or "stored" (kept on the relay for an offline recipient).
+    #[serde(default)]
+    pub via: String,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -246,6 +308,9 @@ pub struct Sent {
     /// `path` is the local source file.
     pub files: Vec<FileEntry>,
     pub ts: u64,
+    /// Name of the group it was sent to.
+    #[serde(default)]
+    pub group: Option<String>,
 }
 
 pub struct AppState {
@@ -262,6 +327,7 @@ pub struct AppState {
     /// The hidden pre-rendered window (label, page ready) in performance mode.
     pub spare: Mutex<Option<(String, bool)>>,
     pub scan: tokio::sync::Notify,
+    pub relay: crate::relay::Relay,
 }
 
 fn load<T: for<'de> Deserialize<'de>>(p: &Path) -> Option<T> {
@@ -282,6 +348,7 @@ impl AppState {
         }
         let _ = std::fs::create_dir_all(&settings.download_dir);
         let data: Data = load(&dir.join("data.json")).unwrap_or_default();
+        let dir_for_relay = dir.clone();
         Self {
             host: gethostname::gethostname().to_string_lossy().into_owned(),
             dir,
@@ -294,6 +361,7 @@ impl AppState {
             aliases: Mutex::new(HashMap::new()),
             spare: Mutex::new(None),
             scan: tokio::sync::Notify::new(),
+            relay: crate::relay::Relay::load(&dir_for_relay),
         }
     }
 
@@ -344,28 +412,35 @@ impl AppState {
             max_files,
             max_file_size,
             free_space,
-            ver: 2,
+            ver: PROTO_VER,
         }
     }
 
+    /// One entry per person: a relay contact is hidden while one of its devices is
+    /// online on the LAN, and an offline LAN device of a relay account is hidden
+    /// behind that account's relay contact.
     pub fn peers(&self, online_only: bool) -> Vec<PeerView> {
         let show_host = self.settings.lock().unwrap().show_host;
+        let relay = self.relay.configured();
         let d = self.data.lock().unwrap();
+        let on_lan: HashSet<&str> = d
+            .peers
+            .values()
+            .filter(|p| !p.id.starts_with("r:") && p.online && !p.relay_account.is_empty())
+            .map(|p| p.relay_account.as_str())
+            .collect();
         let mut v: Vec<PeerView> = d
             .peers
             .values()
             .filter(|p| p.online || !online_only)
-            .map(|p| PeerView {
-                id: p.id.clone(),
-                name: p.name.clone(),
-                display: p.name.clone(),
-                host: if show_host { p.host.clone() } else { String::new() },
-                ip: p.ip.clone(),
-                online: p.online,
-                status: p.status,
-                notify: p.notify,
-                count: d.counts.get(&p.id).copied().unwrap_or(0),
+            .filter(|p| {
+                if p.id.starts_with("r:") {
+                    relay && !on_lan.contains(p.relay_account.as_str())
+                } else {
+                    p.online || !relay || p.relay_account.is_empty()
+                }
             })
+            .map(|p| peer_view(p, &d, show_host, relay))
             .collect();
         v.sort_by(|a, b| {
             b.online
@@ -388,6 +463,44 @@ impl AppState {
             }
         }
         v
+    }
+
+    /// Groups with their members resolved to display names, in saved order.
+    pub fn groups(&self) -> Vec<GroupView> {
+        let show_host = self.settings.lock().unwrap().show_host;
+        let relay = self.relay.configured();
+        let shown = self.peers(false);
+        let all: Vec<PeerView> = {
+            let d = self.data.lock().unwrap();
+            d.peers.values().map(|p| peer_view(p, &d, show_host, relay)).collect()
+        };
+        let groups = self.data.lock().unwrap().groups.clone();
+        groups
+            .into_iter()
+            .map(|g| {
+                let members: Vec<MemberView> = g
+                    .members
+                    .iter()
+                    .map(|id| match shown.iter().chain(&all).find(|p| &p.id == id) {
+                        Some(p) => MemberView {
+                            id: id.clone(),
+                            display: p.display.clone(),
+                            online: p.online,
+                            status: p.status,
+                            relay: !p.online && p.reach,
+                        },
+                        None => MemberView { id: id.clone(), display: id.clone(), online: false, status: Status::Offline, relay: false },
+                    })
+                    .collect();
+                GroupView {
+                    id: g.id,
+                    name: g.name,
+                    reveal: g.reveal,
+                    online: members.iter().filter(|m| m.online).count(),
+                    members,
+                }
+            })
+            .collect()
     }
 
     /// Whether a user seen on the LAN recently (other than this one) uses `name`.
@@ -421,5 +534,21 @@ impl AppState {
             d.inbox.truncate(INBOX_CAP);
         }
         self.save_data();
+    }
+}
+
+fn peer_view(p: &Peer, d: &Data, show_host: bool, relay: bool) -> PeerView {
+    PeerView {
+        id: p.id.clone(),
+        name: p.name.clone(),
+        display: p.name.clone(),
+        host: if show_host { p.host.clone() } else { String::new() },
+        ip: if p.id.starts_with("r:") { "릴레이".into() } else { p.ip.clone() },
+        online: p.online,
+        status: p.status,
+        notify: p.notify,
+        count: d.counts.get(&p.id).copied().unwrap_or(0),
+        relay: p.id.starts_with("r:"),
+        reach: p.online || (relay && !p.relay_account.is_empty()),
     }
 }
