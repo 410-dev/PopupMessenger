@@ -162,6 +162,16 @@ pub struct Meta {
     /// Missing in 0.1.0/0.1.1 peers, which are always online.
     #[serde(default)]
     pub status: Status,
+    /// The relay account this device is registered to (0.1.8+), so LAN peers on
+    /// the same relay server can fall back to it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub relay: Option<RelayId>,
+}
+
+#[derive(Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct RelayId {
+    pub server: String,
+    pub account: String,
 }
 
 fn yes() -> bool {
@@ -185,6 +195,9 @@ pub struct Peer {
     /// Relay account this peer belongs to: its own for "r:<account>" peers, and the
     /// owning account for a LAN peer that is also one of that account's devices.
     pub relay_account: String,
+    /// Relay account the device itself announced on the LAN for our relay server.
+    #[serde(default)]
+    pub relay_self: String,
     /// Recently seen and not in `Offline` status.
     #[serde(skip)]
     pub online: bool,
@@ -209,6 +222,8 @@ pub struct PeerView {
     pub relay: bool,
     /// Online, or reachable through the relay (stored if offline).
     pub reach: bool,
+    /// Relay account: the contact's own, or the one a LAN device belongs to.
+    pub account: String,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -413,34 +428,30 @@ impl AppState {
             max_file_size,
             free_space,
             ver: PROTO_VER,
+            relay: self.relay.identity(),
         }
     }
 
-    /// One entry per person: a relay contact is hidden while one of its devices is
-    /// online on the LAN, and an offline LAN device of a relay account is hidden
-    /// behind that account's relay contact.
+    /// With a relay, each relay account is one entry ("r:<account>", sending to the
+    /// user: LAN first, then the relay) that reads as online while any of its devices
+    /// is; its LAN devices are listed too while online (`account` ties them to it),
+    /// and offline ones are hidden behind the account.
     pub fn peers(&self, online_only: bool) -> Vec<PeerView> {
         let show_host = self.settings.lock().unwrap().show_host;
         let relay = self.relay.configured();
         let d = self.data.lock().unwrap();
-        let on_lan: HashSet<&str> = d
-            .peers
-            .values()
-            .filter(|p| !p.id.starts_with("r:") && p.online && !p.relay_account.is_empty())
-            .map(|p| p.relay_account.as_str())
-            .collect();
         let mut v: Vec<PeerView> = d
             .peers
             .values()
-            .filter(|p| p.online || !online_only)
             .filter(|p| {
                 if p.id.starts_with("r:") {
-                    relay && !on_lan.contains(p.relay_account.as_str())
+                    relay
                 } else {
                     p.online || !relay || p.relay_account.is_empty()
                 }
             })
-            .map(|p| peer_view(p, &d, show_host, relay))
+            .map(|p| account_view(p, &d, show_host, relay))
+            .filter(|p| p.online || !online_only)
             .collect();
         v.sort_by(|a, b| {
             b.online
@@ -453,7 +464,12 @@ impl AppState {
             let mut taken: HashSet<String> = v.iter().filter(|p| p.online).map(|p| p.name.to_lowercase()).collect();
             for i in 0..v.len() {
                 let dup = v[i].online
-                    && v.iter().filter(|q| q.online && q.name.eq_ignore_ascii_case(&v[i].name)).count() > 1;
+                    && v.iter()
+                        .filter(|q| q.online && q.name.eq_ignore_ascii_case(&v[i].name))
+                        // An account and its own devices are the same person.
+                        .filter(|q| q.id == v[i].id || q.account.is_empty() || q.account != v[i].account)
+                        .count()
+                        > 1;
                 if dup {
                     let host = d.peers.get(&v[i].id).map(|p| p.host.clone()).unwrap_or_default();
                     let tag = tagged(&v[i].name, &host, |c| taken.contains(&c.to_lowercase()));
@@ -472,7 +488,7 @@ impl AppState {
         let shown = self.peers(false);
         let all: Vec<PeerView> = {
             let d = self.data.lock().unwrap();
-            d.peers.values().map(|p| peer_view(p, &d, show_host, relay)).collect()
+            d.peers.values().map(|p| account_view(p, &d, show_host, relay)).collect()
         };
         let groups = self.data.lock().unwrap().groups.clone();
         groups
@@ -559,6 +575,24 @@ impl AppState {
     }
 }
 
+/// The LAN devices of relay account `acc`.
+pub fn devices_of<'a>(d: &'a Data, acc: &'a str) -> impl Iterator<Item = &'a Peer> + 'a {
+    d.peers.values().filter(move |p| !p.id.starts_with("r:") && p.relay_account == acc)
+}
+
+/// `peer_view`, with a relay account taking its online state and status from the
+/// LAN when the relay does not show it online.
+fn account_view(p: &Peer, d: &Data, show_host: bool, relay: bool) -> PeerView {
+    let mut v = peer_view(p, d, show_host, relay);
+    if v.relay && !v.online {
+        if let Some(dev) = devices_of(d, &p.relay_account).filter(|x| x.online).min_by_key(|x| x.status == Status::Dnd) {
+            v.online = true;
+            v.status = dev.status;
+        }
+    }
+    v
+}
+
 fn peer_view(p: &Peer, d: &Data, show_host: bool, relay: bool) -> PeerView {
     PeerView {
         id: p.id.clone(),
@@ -572,5 +606,6 @@ fn peer_view(p: &Peer, d: &Data, show_host: bool, relay: bool) -> PeerView {
         count: d.counts.get(&p.id).copied().unwrap_or(0),
         relay: p.id.starts_with("r:"),
         reach: p.online || (relay && !p.relay_account.is_empty()),
+        account: p.relay_account.clone(),
     }
 }

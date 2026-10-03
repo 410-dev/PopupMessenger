@@ -37,6 +37,7 @@ a:hover { text-decoration: underline; }
 .row:hover { background: var(--hi); }
 .row .name { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; cursor: pointer; }
 .row.off { opacity: .5; }
+.row.dev { padding-left: 28px; font-size: 12px; }
 .row input[type=checkbox] { width: auto; }
 .msg { cursor: pointer; }
 .msg .name { flex: 0 0 90px; }

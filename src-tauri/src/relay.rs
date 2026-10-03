@@ -12,7 +12,7 @@ use base64::engine::general_purpose::STANDARD as B64;
 use base64::Engine;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -123,6 +123,14 @@ impl Relay {
         if std::fs::write(&tmp, serde_json::to_vec(&f).unwrap_or_default()).is_ok() {
             let _ = std::fs::rename(&tmp, &p);
         }
+    }
+
+    /// What this device announces on the LAN about its relay registration.
+    pub fn identity(&self) -> Option<crate::state::RelayId> {
+        self.cfg.lock().unwrap().as_ref().filter(|c| !c.account.is_empty()).map(|c| crate::state::RelayId {
+            server: c.server_id.clone(),
+            account: c.account.clone(),
+        })
     }
 
     pub fn configured(&self) -> bool {
@@ -948,14 +956,50 @@ pub fn rebuild_peers(app: &AppHandle) {
             p.relay_account = acc.clone();
             p.online = live;
         }
+        let relay = cfg.is_some();
         for (id, p) in d.peers.iter_mut() {
             if !id.starts_with("r:") {
-                p.relay_account = owner.get(id).cloned().unwrap_or_default();
+                p.relay_account = match owner.get(id) {
+                    Some(a) => a.clone(),
+                    // Announced on the LAN: the relay can still be tried for it.
+                    None if relay && p.relay_self != me => p.relay_self.clone(),
+                    None => String::new(),
+                };
             }
         }
     }
     st.save_data();
     net::peers_changed(app);
+    // Joining or leaving a relay changes what we announce on the LAN.
+    static ANNOUNCED: Mutex<Option<Option<crate::state::RelayId>>> = Mutex::new(None);
+    let id = st.relay.identity();
+    let mut last = ANNOUNCED.lock().unwrap();
+    if last.as_ref() != Some(&id) {
+        let first = last.is_none();
+        *last = Some(id);
+        if !first {
+            st.scan.notify_one();
+        }
+    }
+}
+
+/// A LAN device announced relay account `acc` on our server: link it as a contact
+/// (once per run) so the relay knows its devices and keys.
+pub fn learn_account(app: &AppHandle, acc: &str) {
+    static TRIED: Mutex<Option<HashSet<String>>> = Mutex::new(None);
+    let st = app.state::<AppState>();
+    if !st.relay.online() || st.relay.cfg.lock().unwrap().as_ref().is_some_and(|c| c.contacts.contains_key(acc) || c.account == acc) {
+        return;
+    }
+    if !TRIED.lock().unwrap().get_or_insert_with(HashSet::new).insert(acc.to_string()) {
+        return;
+    }
+    let (app, acc) = (app.clone(), acc.to_string());
+    tauri::async_runtime::spawn(async move {
+        if lookup(&app, &acc).await.is_none() {
+            rebuild_peers(&app);
+        }
+    });
 }
 
 // ---------------------------------------------------------------- transfers
@@ -1023,6 +1067,10 @@ pub async fn send(
                 let devs = cfg.contacts.get(&t.account).and_then(|e| e["devices"].as_array().cloned()).unwrap_or_default();
                 if devs.iter().any(|d| cfg.key_changed.iter().any(|x| d["id"] == json!(x))) {
                     out.push((t.peer.clone(), Err("받는 사람의 보안 키가 바뀌었습니다. 설정 > 릴레이 서버에서 확인하세요".into())));
+                    continue;
+                }
+                if !devs.iter().any(|d| d["pubkey"].as_str().is_some_and(|k| !k.is_empty())) {
+                    out.push((t.peer.clone(), Err("받는 사람의 보안 키를 알 수 없습니다".into())));
                     continue;
                 }
                 for d in devs {

@@ -248,19 +248,25 @@ async function pick() {
   }
   function draw() {
     const s = q.value.trim().toLowerCase();
-    const shown = peers.filter((p) => p.reach && (!s || `${p.display} ${p.host} ${p.ip}`.toLowerCase().includes(s)));
+    const found = peers.filter((p) => p.reach && (!s || `${p.display} ${p.host} ${p.ip}`.toLowerCase().includes(s)));
+    // A relay user's LAN devices are listed under the user, to send to one device only.
+    const users = new Set(found.filter((p) => p.relay).map((p) => p.account));
+    const dev = (p) => !p.relay && p.account && users.has(p.account);
+    const shown = found.filter((p) => !dev(p)).flatMap((p) => (p.relay ? [p, ...found.filter((d) => dev(d) && d.account === p.account)] : [p]));
     list.replaceChildren(...(shown.length ? shown.map((p) => {
       const cb = h('input', { type: 'checkbox', checked: sel.has(p.id), onchange: () => {
         cb.checked ? sel.add(p.id) : sel.delete(p.id);
         go.disabled = !sel.size;
         go.textContent = sel.size ? `${sel.size}명에게 쓰기` : '쓰기';
       } });
-      return h('div', { class: 'row' + (p.online ? '' : ' off') }, cb,
-        h('span', { class: 'name', title: '클릭하면 바로 쓰기', onclick: () => open([p.id]) }, p.display),
+      const d = dev(p);
+      return h('div', { class: 'row' + (p.online ? '' : ' off') + (d ? ' dev' : '') }, cb,
+        h('span', { class: 'name', title: '클릭하면 바로 쓰기', onclick: () => open([p.id]) }, d ? (p.host || p.ip) : p.display),
         p.status === 'dnd' && h('span', { class: 'warn', title: '알림 없이 쪽지함으로 전달됩니다' }, '방해금지'),
         !p.online && h('span', { class: 'muted', title: '릴레이 서버에 보관했다가 접속하면 전달합니다' }, '보관 전달'),
-        p.relay && p.online && h('span', { class: 'muted', title: '릴레이 서버를 거쳐 전달합니다' }, '릴레이'),
-        p.host && h('span', { class: 'muted' }, p.host));
+        p.relay && p.online && h('span', { class: 'muted', title: '이 사용자의 기기로 보냅니다. LAN에 있는 기기에는 직접, 아니면 릴레이 서버를 거쳐 전달합니다' }, '사용자'),
+        d && h('span', { class: 'muted', title: '이 기기에만 보냅니다. LAN으로 안 되면 릴레이 서버를 거칩니다' }, '이 기기만'),
+        !d && p.host && h('span', { class: 'muted' }, p.host));
     }) : [h('div', { class: 'empty muted' }, '보낼 수 있는 사용자가 없습니다')]));
   }
   listen('peers', async () => { peers = await invoke('peers'); draw(); });

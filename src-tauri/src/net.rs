@@ -184,6 +184,7 @@ pub fn upsert_peer(app: &AppHandle, m: Meta, ip: IpAddr) {
     let st = app.state::<AppState>();
     let ip = ip.to_string();
     let other_name = m.name.clone();
+    let mut learn: Option<String> = None;
     let (changed, persist) = {
         let mut d = st.data.lock().unwrap();
         let e = d.peers.entry(m.id.clone()).or_insert_with(|| Peer { id: m.id.clone(), ..Default::default() });
@@ -199,15 +200,31 @@ pub fn upsert_peer(app: &AppHandle, m: Meta, ip: IpAddr) {
         e.max_file_size = m.max_file_size;
         e.status = m.status;
         e.ver = m.ver;
+        // Same relay server as ours: remember the account so the relay can be the fallback.
+        let mine = st.relay.cfg.lock().unwrap().as_ref().map(|c| c.server_id.clone());
+        let acc = m.relay.filter(|r| Some(&r.server) == mine.as_ref()).map(|r| r.account).unwrap_or_default();
+        if e.relay_self != acc {
+            e.relay_self = acc.clone();
+            if !acc.is_empty() && e.relay_account.is_empty() {
+                e.relay_account = acc.clone();
+            }
+            learn = Some(acc);
+        }
         e.online = online;
         e.seen = Some(Instant::now());
-        (changed, persist)
+        (changed || learn.is_some(), persist || learn.is_some())
     };
     if persist {
         st.save_data();
     }
-    if changed {
-        peers_changed(app);
+    match learn {
+        Some(acc) if !acc.is_empty() => {
+            crate::relay::rebuild_peers(app);
+            crate::relay::learn_account(app, &acc);
+        }
+        Some(_) => crate::relay::rebuild_peers(app),
+        None if changed => peers_changed(app),
+        None => {}
     }
     avoid_name_clash(app, &other_name);
 }
@@ -601,8 +618,10 @@ pub async fn send(
         sources.push(p.clone());
     }
 
-    // Route per recipient (docs/relay-protocol.md 5): relay contacts, forced relay,
-    // offline relay users and failed LAN connections go through the relay in one batch.
+    // Route per recipient (docs/relay-protocol.md 5). The relay server's policy comes
+    // first (forced relay, blocked outsiders); otherwise the LAN is tried and the relay
+    // is the fallback for every recipient with a relay account: offline devices, LAN
+    // failures, and users ("r:<account>") with no device reachable on the LAN.
     let relay_on = st.relay.configured();
     let pol = st.relay.cfg.lock().unwrap().as_ref().map(|c| c.policy.clone()).unwrap_or_default();
     let force = relay_on && pol["force_relay"] == true;
@@ -617,7 +636,32 @@ pub async fn send(
             Err(bad.clone())
         } else if let Some(p) = peer {
             let acc = Some(p.relay_account.clone()).filter(|a| relay_on && !a.is_empty());
-            if id.starts_with("r:") || (acc.is_some() && (force || !p.online)) {
+            if id.starts_with("r:") {
+                // A user: every device of theirs online on the LAN, else the relay.
+                let devs: Vec<Peer> = if force {
+                    Vec::new()
+                } else {
+                    let d = st.data.lock().unwrap();
+                    crate::state::devices_of(&d, &p.relay_account).filter(|x| x.online).cloned().collect()
+                };
+                let mut lan = Err(String::new());
+                for dev in &devs {
+                    let info = info.as_ref().filter(|_| dev.ver >= 3);
+                    match send_one(&app, &job, dev, &text, &list, info).await {
+                        Ok(()) => lan = Ok("lan".to_string()),
+                        Err(e) if lan.is_err() => lan = Err(e.1),
+                        Err(_) => {}
+                    }
+                }
+                if lan.is_err() {
+                    if acc.is_some() {
+                        relay_target = acc;
+                    } else {
+                        lan = Err("릴레이 서버가 설정되어 있지 않습니다".into());
+                    }
+                }
+                lan
+            } else if acc.is_some() && (force || !p.online) {
                 relay_target = acc;
                 Err(String::new())
             } else if block && acc.is_none() {
@@ -626,12 +670,12 @@ pub async fn send(
                 let info = info.as_ref().filter(|_| p.ver >= 3);
                 match send_one(&app, &job, &p, &text, &list, info).await {
                     Ok(()) => Ok("lan".into()),
-                    // Could not reach it on the LAN: try the relay instead.
-                    Err(e) if acc.is_some() && e.starts_with("연결") => {
+                    // The LAN failed (not a refusal by the recipient): try the relay.
+                    Err((true, e)) if acc.is_some() => {
                         relay_target = acc;
                         Err(e)
                     }
-                    Err(e) => Err(e),
+                    Err((_, e)) => Err(e),
                 }
             }
         } else {
@@ -658,7 +702,8 @@ pub async fn send(
                         o.via = v.clone();
                         o.error.clear();
                     }
-                    Err(e) => o.error = e.clone(),
+                    Err(e) if o.error.is_empty() => o.error = e.clone(),
+                    Err(e) => o.error = format!("{} / 릴레이: {e}", o.error),
                 }
             }
         }
@@ -730,13 +775,42 @@ async fn send_one(
     text: &str,
     files: &[(String, String, u64)],
     group: Option<&GroupInfo>,
-) -> Result<(), String> {
+) -> Result<(), (bool, String)> {
+    // (true, _) is a network failure the relay may get past; (false, _) a refusal.
+    let refuse = |e: String| (false, e);
+    let fail = |e: String| (true, e);
+    send_lan(app, job, p, text, files, group).await.map_err(|e| match e {
+        LanErr::Refused(e) => refuse(e),
+        LanErr::Net(e) => fail(e),
+    })
+}
+
+enum LanErr {
+    Refused(String),
+    Net(String),
+}
+
+impl From<String> for LanErr {
+    fn from(e: String) -> Self {
+        LanErr::Net(e)
+    }
+}
+
+async fn send_lan(
+    app: &AppHandle,
+    job: &str,
+    p: &Peer,
+    text: &str,
+    files: &[(String, String, u64)],
+    group: Option<&GroupInfo>,
+) -> Result<(), LanErr> {
+    let refused = |e: String| LanErr::Refused(e);
     if p.max_files > 0 && files.len() > p.max_files as usize {
-        return Err(format!("받는 사람은 첨부파일을 {}개까지 받습니다", p.max_files));
+        return Err(refused(format!("받는 사람은 첨부파일을 {}개까지 받습니다", p.max_files)));
     }
     if p.max_file_size > 0 {
         if let Some((_, n, _)) = files.iter().find(|f| f.2 > p.max_file_size) {
-            return Err(format!("'{n}' 파일이 받는 사람의 허용 크기({})를 초과합니다", human(p.max_file_size)));
+            return Err(refused(format!("'{n}' 파일이 받는 사람의 허용 크기({})를 초과합니다", human(p.max_file_size))));
         }
     }
     let ip: IpAddr = p.ip.parse().map_err(|_| "주소 없음".to_string())?;
@@ -755,7 +829,7 @@ async fn send_one(
     write_frame(&mut s, &hdr).await?;
     let r = read_frame(&mut s, IO_TIMEOUT).await?;
     if r["t"] != "ok" {
-        return Err(r["reason"].as_str().unwrap_or("거부되었습니다").to_string());
+        return Err(refused(r["reason"].as_str().unwrap_or("거부되었습니다").to_string()));
     }
 
     let total: u64 = files.iter().map(|f| f.2).sum();
@@ -769,7 +843,7 @@ async fn send_one(
             let want = remain.min(CHUNK as u64) as usize;
             let n = f.read(&mut buf[..want]).await.map_err(es)?;
             if n == 0 {
-                return Err("전송 중 파일이 변경되었습니다".into());
+                return Err(refused("전송 중 파일이 변경되었습니다".into()));
             }
             timeout(IO_TIMEOUT, s.write_all(&buf[..n]))
                 .await
@@ -785,5 +859,5 @@ async fn send_one(
     }
     let _ = s.flush().await;
     let r = read_frame(&mut s, IO_TIMEOUT * 2).await?;
-    if r["t"] == "done" { Ok(()) } else { Err("전송이 완료되지 않았습니다".into()) }
+    if r["t"] == "done" { Ok(()) } else { Err("전송이 완료되지 않았습니다".to_string().into()) }
 }

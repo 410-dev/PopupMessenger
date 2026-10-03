@@ -50,7 +50,10 @@ fn label(s: &str) -> String {
 
 fn build_menu(app: &AppHandle) -> tauri::Result<Menu<Wry>> {
     let st = app.state::<AppState>();
-    let peers = st.peers(true);
+    let mut peers = st.peers(true);
+    // A user with a relay account is one entry; their devices are in the picker.
+    let users: std::collections::HashSet<String> = peers.iter().filter(|p| p.relay).map(|p| p.account.clone()).collect();
+    peers.retain(|p| p.relay || p.account.is_empty() || !users.contains(&p.account));
     // Groups with nobody online are left out to keep the menu short.
     let groups: Vec<_> = st.groups().into_iter().filter(|g| g.online > 0).collect();
     let unread = st.unread();
