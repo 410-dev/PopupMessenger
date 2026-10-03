@@ -31,6 +31,20 @@ const time = (ts) => {
   return d.toDateString() === now.toDateString() ? hm : `${d.getMonth() + 1}/${d.getDate()} ${hm}`;
 };
 const base = (p) => p.split(/[\\/]/).pop();
+// Reachability dot (PeerView.state): blue = LAN, green = relay, red = do not disturb,
+// gray = unreachable; filled when connected through the relay, a ring otherwise.
+const STATE = {
+  both: 'LAN과 릴레이에 온라인',
+  lan: 'LAN에 온라인',
+  relay: '릴레이로만 온라인',
+  hold: '오프라인 · 릴레이 서버에 보관했다가 접속하면 전달',
+  dnd: '방해금지 · 알림 없이 쪽지함으로 전달',
+  off: '오프라인',
+};
+const dot = (state) => h('span', { class: `dot s-${state || 'off'}`, title: STATE[state] || STATE.off });
+const handle = (p) => p.username && h('span', { class: 'handle', title: '릴레이 사용자 이름' }, `@${p.username}`);
+const VIA = { lan: 'LAN', relay: '릴레이', stored: '릴레이 보관' };
+const viaTag = (v) => v && h('span', { class: `tag via-${v}`, title: v === 'stored' ? '릴레이 서버에 보관했다가 접속하면 전달' : '' }, VIA[v] || v);
 const MAC = navigator.userAgent.includes('Mac');
 const SEND_KEY = MAC ? '⌘+Enter' : 'Ctrl+Enter';
 const isSendKey = (e) => e.key === 'Enter' && (e.ctrlKey || e.metaKey);
@@ -98,7 +112,8 @@ async function popup() {
   const others = m.group ? m.group.members.filter((x) => x.id !== myId) : [];
   const replyAll = () => { invoke('open_compose', { to: [m.from_id, ...others.map((x) => x.id)], files: [], reply: m.id }); close(); };
   render(
-    h('div', { class: 'head' }, h('b', {}, m.from_name), h('span', { class: 'muted' }, `${m.from_ip} · ${time(m.ts)}`)),
+    h('div', { class: 'head' }, h('b', {}, m.from_name), viaTag(m.via || (m.from_ip === '릴레이' ? 'relay' : 'lan')),
+      h('span', { class: 'muted' }, `${m.from_ip === '릴레이' ? '' : `${m.from_ip} · `}${time(m.ts)}`)),
     m.group && groupInfo(m.group, others),
     h('div', { class: 'body grow' }, linkify(m.text)),
     m.files.length && h('div', { class: 'files' }, m.files.map((f) =>
@@ -132,7 +147,7 @@ async function compose() {
   let group = V.group ? (await invoke('groups')).find((g) => g.id === V.group) : null;
   if (V.group && !group) return close();
   let tried = false; // after a send attempt, `to` holds only the failures
-  const groupTo = () => group.members.filter((x) => x.online || x.relay).map((x) => x.id);
+  const groupTo = () => group.members.filter((x) => x.state !== 'off').map((x) => x.id);
   if (group) to = groupTo();
   const reveal = group && h('input', { type: 'checkbox', checked: group.reveal });
   const { signature } = await invoke('get_settings');
@@ -154,11 +169,11 @@ async function compose() {
   const drawTo = () => {
     toLine.textContent = `받는 사람: ${to.map(nameOf).join(', ')}`;
     if (group) {
-      const off = group.members.filter((x) => !x.online && !x.relay).map((x) => x.display);
+      const off = group.members.filter((x) => x.state === 'off').map((x) => x.display);
       toLine.replaceChildren(h('b', {}, `[그룹] ${group.name}`), ` → ${to.map(nameOf).join(', ') || '(보낼 수 있는 사람 없음)'}`,
         off.length ? h('div', {}, `오프라인이라 제외: ${off.join(', ')}`) : '');
     }
-    const stored = to.filter((id) => { const p = peers.find((x) => x.id === id); return p && !p.online && p.reach; }).map(nameOf);
+    const stored = to.filter((id) => (peers.find((x) => x.id === id) || {}).state === 'hold').map(nameOf);
     relayLine.hidden = !stored.length;
     relayLine.textContent = `📮 ${stored.join(', ')} 님은 오프라인입니다. 릴레이 서버에 보관했다가 접속하면 전달합니다.`;
     const dnd = to.filter((id) => (peers.find((p) => p.id === id) || {}).status === 'dnd').map(nameOf);
@@ -238,7 +253,7 @@ function quote(m) {
 async function pick() {
   let peers = await invoke('peers');
   const sel = new Set();
-  const q = h('input', { placeholder: '이름 / 호스트 / IP 검색', oninput: draw });
+  const q = h('input', { placeholder: '이름 / 사용자 이름 / 호스트 / IP 검색', oninput: draw });
   const list = h('div', { class: 'grow' });
   const go = h('button', { class: 'primary', disabled: true, onclick: () => open([...sel]) }, '쓰기');
   function open(ids) {
@@ -248,25 +263,17 @@ async function pick() {
   }
   function draw() {
     const s = q.value.trim().toLowerCase();
-    const found = peers.filter((p) => p.reach && (!s || `${p.display} ${p.host} ${p.ip}`.toLowerCase().includes(s)));
-    // A relay user's LAN devices are listed under the user, to send to one device only.
-    const users = new Set(found.filter((p) => p.relay).map((p) => p.account));
-    const dev = (p) => !p.relay && p.account && users.has(p.account);
-    const shown = found.filter((p) => !dev(p)).flatMap((p) => (p.relay ? [p, ...found.filter((d) => dev(d) && d.account === p.account)] : [p]));
+    const shown = peers.filter((p) => p.reach && (!s || `${p.display} ${p.username} ${p.host} ${p.ip}`.toLowerCase().includes(s)));
     list.replaceChildren(...(shown.length ? shown.map((p) => {
       const cb = h('input', { type: 'checkbox', checked: sel.has(p.id), onchange: () => {
         cb.checked ? sel.add(p.id) : sel.delete(p.id);
         go.disabled = !sel.size;
         go.textContent = sel.size ? `${sel.size}명에게 쓰기` : '쓰기';
       } });
-      const d = dev(p);
-      return h('div', { class: 'row' + (p.online ? '' : ' off') + (d ? ' dev' : '') }, cb,
-        h('span', { class: 'name', title: '클릭하면 바로 쓰기', onclick: () => open([p.id]) }, d ? (p.host || p.ip) : p.display),
-        p.status === 'dnd' && h('span', { class: 'warn', title: '알림 없이 쪽지함으로 전달됩니다' }, '방해금지'),
-        !p.online && h('span', { class: 'muted', title: '릴레이 서버에 보관했다가 접속하면 전달합니다' }, '보관 전달'),
-        p.relay && p.online && h('span', { class: 'muted', title: '이 사용자의 기기로 보냅니다. LAN에 있는 기기에는 직접, 아니면 릴레이 서버를 거쳐 전달합니다' }, '사용자'),
-        d && h('span', { class: 'muted', title: '이 기기에만 보냅니다. LAN으로 안 되면 릴레이 서버를 거칩니다' }, '이 기기만'),
-        !d && p.host && h('span', { class: 'muted' }, p.host));
+      return h('div', { class: 'row' + (p.state === 'off' ? ' off' : '') }, cb, dot(p.state),
+        h('span', { class: 'name', title: '클릭하면 바로 쓰기', onclick: () => open([p.id]) }, p.display),
+        handle(p),
+        p.host && h('span', { class: 'muted' }, p.host));
     }) : [h('div', { class: 'empty muted' }, '보낼 수 있는 사용자가 없습니다')]));
   }
   listen('peers', async () => { peers = await invoke('peers'); draw(); });
@@ -289,35 +296,47 @@ async function inbox() {
   const tIn = h('button', { onclick: () => show('in') }, '받은 쪽지');
   const tOut = h('button', { onclick: () => show('out') }, '보낸 쪽지');
   const readAll = h('button', { onclick: () => invoke('mark_all_read') }, '모두 읽음');
+  const q = h('input', { type: 'search', placeholder: '검색 (사람 / 내용 / 파일 이름 / 그룹)', oninput: () => show(tab) });
   const stop = (fn) => (e) => { e.stopPropagation(); fn(); };
   const preview = (text, files) => (files.length ? `[${files.length}] ` : '') + (text.split('\n')[0] || '');
+  const hit = (...parts) => {
+    const s = q.value.trim().toLowerCase();
+    return !s || parts.flat().join('\n').toLowerCase().includes(s);
+  };
+  // Messages from before 0.1.8 have no route: those from the relay say so in from_ip.
+  const viaOf = (m) => m.via || (m.from_ip === '릴레이' ? 'relay' : 'lan');
+  const empty = (none) => [h('div', { class: 'empty muted' }, q.value.trim() ? '찾는 쪽지가 없습니다' : none)];
 
   async function drawIn() {
     const ms = await invoke('inbox');
     const unread = ms.filter((m) => !m.read).length;
     tIn.textContent = unread ? `받은 쪽지 (${unread})` : '받은 쪽지';
     if (tab !== 'in') return;
-    list.replaceChildren(...(ms.length ? ms.map((m) =>
+    const shown = ms.filter((m) => hit(m.from_name, m.text, m.note, m.files.map((f) => f.name), m.group ? m.group.name : ''));
+    list.replaceChildren(...(shown.length ? shown.map((m) =>
       h('div', { class: 'row msg' + (m.read ? '' : ' unread'), onclick: () => invoke('open_message', { id: m.id }) },
         h('span', { class: 'name' }, m.from_name),
         h('span', { class: 'preview' }, (m.group ? `[${m.group.name}] ` : '') + preview(m.text, m.files)),
+        viaTag(viaOf(m)),
         h('span', { class: 'muted' }, time(m.ts)),
         h('a', { onclick: stop(() => invoke('open_compose', { to: [m.from_id], files: [], reply: m.id })) }, '답장'),
         h('a', { class: 'muted', title: '삭제', onclick: stop(() => invoke('delete_message', { id: m.id })) }, '✕')))
-      : [h('div', { class: 'empty muted' }, '받은 쪽지가 없습니다')]));
+      : empty('받은 쪽지가 없습니다')));
   }
   async function drawOut() {
     if (tab !== 'out') return;
-    const ss = await invoke('sent_list');
+    const ss = (await invoke('sent_list')).filter((s) => hit(s.to.map((r) => r.name), s.text, s.files.map((f) => f.name), s.group || ''));
     list.replaceChildren(...(ss.length ? ss.map((s) => {
       const failed = s.to.some((r) => !r.ok);
+      const vias = [...new Set(s.to.filter((r) => r.ok).map((r) => r.via || 'lan'))];
       return h('div', { class: 'row msg', onclick: () => invoke('open_sent', { id: s.id }) },
         h('span', { class: 'name', title: s.to.map((r) => r.name).join(', ') }, '→ ' + (s.group ? `[${s.group}] ` : '') + s.to.map((r) => r.name).join(', ')),
         h('span', { class: 'preview' }, preview(s.text, s.files)),
+        vias.map(viaTag),
         failed && h('span', { class: 'err' }, '실패'),
         h('span', { class: 'muted' }, time(s.ts)),
         h('a', { class: 'muted', title: '삭제', onclick: stop(() => invoke('delete_sent', { id: s.id })) }, '✕'));
-    }) : [h('div', { class: 'empty muted' }, '보낸 쪽지가 없습니다')]));
+    }) : empty('보낸 쪽지가 없습니다')));
   }
   function show(t) {
     tab = t;
@@ -329,7 +348,7 @@ async function inbox() {
   listen('inbox', drawIn);
   listen('sent', drawOut);
   await show('in');
-  render(h('div', { class: 'tabs' }, tIn, tOut), list, h('div', { class: 'bar' },
+  render(h('div', { class: 'tabs' }, tIn, tOut), q, list, h('div', { class: 'bar' },
     readAll,
     h('button', { onclick: () => invoke('open_settings') }, '설정'),
     h('button', { class: 'primary', onclick: () => invoke('open_picker', { files: [] }) }, '새 쪽지')));
@@ -346,8 +365,8 @@ async function sent() {
       h('div', { class: 'file' },
         h('a', { title: f.path, onclick: () => invoke('open_path', { path: f.path, reveal: false }) }, f.name),
         h('span', { class: 'muted' }, size(f.size))))),
-    s.to.some((r) => r.ok && r.via && r.via !== 'lan') && h('div', { class: 'muted' },
-      s.to.filter((r) => r.ok && r.via && r.via !== 'lan').map((r) => `${r.name}: ${r.via === 'stored' ? '릴레이 서버에 보관 (접속하면 전달)' : '릴레이로 전달'}`).join('\n')),
+    h('div', { class: 'routes' }, s.to.filter((r) => r.ok).map((r) =>
+      h('div', {}, viaTag(r.via || 'lan'), ` ${r.name}`, r.via === 'stored' ? h('span', { class: 'muted' }, ' — 릴레이 서버에 보관, 접속하면 전달') : ''))),
     failed.length && h('div', { class: 'err' }, failed.map((r) => `전송 실패 - ${r.name}: ${r.error}`).join('\n')),
     h('div', { class: 'bar' }, h('button', { onclick: close }, '닫기')),
   );
@@ -378,13 +397,13 @@ async function groups() {
     const sel = new Set(g ? g.members.map((x) => x.id) : []);
     const name = h('input', { value: g ? g.name : '', placeholder: '그룹 이름' });
     const reveal = h('input', { type: 'checkbox', checked: g ? g.reveal : true });
-    const q = h('input', { placeholder: '이름 / 호스트 / IP 검색', oninput: draw });
+    const q = h('input', { placeholder: '이름 / 사용자 이름 / 호스트 / IP 검색', oninput: draw });
     const box = h('div', { class: 'grow' });
     const count = h('span', { class: 'status muted' });
     // Members missing from the peer list stay selected and listed.
-    let extra = g ? g.members.filter((x) => !peers.some((p) => p.id === x.id)).map((x) => ({ id: x.id, display: x.display, host: '', ip: '', online: false, gone: true })) : [];
+    let extra = g ? g.members.filter((x) => !peers.some((p) => p.id === x.id)).map((x) => ({ id: x.id, display: x.display, host: '', ip: '', username: '', online: false, state: 'off', gone: true })) : [];
     // Offline, not on the LAN and not a relay contact: can be removed from the list.
-    const stale = (p) => !p.online && !p.relay && !p.reach;
+    const stale = (p) => p.state === 'off' && !p.account;
     async function forget(p, e) {
       e.preventDefault();
       e.stopPropagation();
@@ -400,12 +419,12 @@ async function groups() {
     }
     function draw() {
       const s = q.value.trim().toLowerCase();
-      const shown = [...peers, ...extra].filter((p) => !s || `${p.display} ${p.host} ${p.ip}`.toLowerCase().includes(s));
+      const shown = [...peers, ...extra].filter((p) => !s || `${p.display} ${p.username} ${p.host} ${p.ip}`.toLowerCase().includes(s));
       box.replaceChildren(...(shown.length ? shown.map((p) => {
         const cb = h('input', { type: 'checkbox', checked: sel.has(p.id), onchange: () => { cb.checked ? sel.add(p.id) : sel.delete(p.id); counted(); } });
-        return h('label', { class: 'check row' + (p.online ? '' : ' off') }, cb,
+        return h('label', { class: 'check row' + (p.state === 'off' ? ' off' : '') }, cb, dot(p.state),
           h('span', { class: 'name' }, p.display),
-          !p.online && h('span', { class: 'muted' }, p.reach ? '보관 전달' : '오프라인'),
+          handle(p),
           p.host && h('span', { class: 'muted' }, p.host),
           stale(p) && h('button', { type: 'button', class: 'mini', title: '목록에서 지우기', onclick: (e) => forget(p, e) }, '−'));
       }) : [h('div', { class: 'empty muted' }, '아는 사용자가 없습니다')]));
@@ -448,14 +467,13 @@ async function search() {
       ? `릴레이 서버${r.server ? ` "${r.server}"` : ''}와 LAN에서 찾습니다.${r.lookup ? ' 이 서버는 아직 주고받지 않은 사람을 사용자 이름이나 계정 ID를 정확히 입력해야 찾을 수 있습니다.' : ''}${r.online ? '' : ' (지금 릴레이에 연결되어 있지 않습니다)'}`
       : 'LAN과 주고받은 기록에서만 찾습니다. 릴레이 서버를 연결하면 다른 네트워크의 사용자도 찾을 수 있습니다.';
     list.replaceChildren(...(r.results.length ? r.results.map((p) => {
-      const can = p.online || p.reach;
-      const st = p.online ? (p.status === 'dnd' ? '방해금지' : '온라인') : p.reach ? '오프라인 · 보관 전달' : '오프라인';
-      return h('div', { class: 'row' + (p.online ? '' : ' off') },
+      const can = p.reach;
+      return h('div', { class: 'row' + (p.state === 'off' ? ' off' : '') }, dot(p.state),
         h('span', { class: 'name', title: can ? '클릭하면 쪽지 쓰기' : '', onclick: () => can && write(p) }, p.display),
-        p.username && h('span', { class: 'muted' }, `@${p.username}`),
-        h('span', { class: p.status === 'dnd' && p.online ? 'warn' : 'muted' }, st),
-        h('span', { class: 'tag' }, SRC[p.source] || p.source),
-        h('button', { class: 'mini', disabled: !can, title: can ? '쪽지 쓰기' : '오프라인이라 보낼 수 없습니다 (릴레이 미등록)', onclick: () => write(p) }, '쓰기'));
+        handle(p),
+        p.host && h('span', { class: 'muted' }, p.host),
+        p.source === 'history' && h('span', { class: 'tag' }, SRC.history),
+        h('button', { class: 'mini', disabled: !can, title: can ? '쪽지 쓰기 (LAN 우선, 안 되면 릴레이)' : '오프라인이라 보낼 수 없습니다', onclick: () => write(p) }, '쓰기'));
     }) : [h('div', { class: 'empty muted' }, q.value.trim() ? '찾는 사람이 없습니다' : '아는 사용자가 없습니다')]));
   }
   const write = (p) => invoke('open_compose', { to: [p.id], files: [], reply: null });
@@ -606,6 +624,7 @@ async function drawRelay(box) {
       p.encryption === 'e2ee' && ['내 보안 키', h('span', { class: 'mono' }, fp(r.my_key))],
       ['연락처', `${r.contacts}명`],
     ]),
+    holdControl(r),
     changed.length ? h('div', { class: 'warn' },
       `보안 키가 바뀐 기기가 있습니다: ${changed.map((c) => `${c.name} (${fp(c.fingerprint)})`).join(', ')}. 상대에게 직접 확인한 뒤 수락하세요. 수락 전에는 이 사람들에게 종단간 암호화 쪽지를 보내지 않습니다.`,
       ' ', h('a', { onclick: () => invoke('relay_accept_keys') }, '새 키 수락')) : '',
@@ -614,6 +633,29 @@ async function drawRelay(box) {
       h('button', { type: 'button', onclick: async () => {
         if (confirm('릴레이 서버 연결을 해제할까요?\n릴레이 연락처가 목록에서 사라집니다. 같은 서버에 다시 연결하면 이 기기로 다시 로그온합니다.')) await invoke('relay_disconnect');
       } }, '연결 해제')));
+}
+
+// "Relay receive": whether the server keeps messages for this device (or every device
+// of the account) while it is offline. Stored on the server, so all devices see it.
+const HOLD = [
+  ['allow', '릴레이 수신 허용', '꺼져 있어도 릴레이 서버에 보관했다가 접속하면 받습니다'],
+  ['device_off', '이 기기만 사용하지 않음', '이 기기가 오프라인이면 보관하지 않습니다 (다른 기기는 그대로)'],
+  ['all_off', '모든 기기에 사용하지 않음', '이 계정의 어느 기기든 오프라인이면 보관하지 않습니다'],
+];
+function holdControl(r) {
+  const err = h('span', { class: 'err' });
+  const wrap = h('div', { class: 'holdset' }, h('div', { class: 'muted' }, '오프라인일 때 릴레이 수신'));
+  if (r.hold == null) {
+    wrap.append(h('div', { class: 'muted' }, r.state === 'online' ? '이 릴레이 서버는 이 설정을 지원하지 않습니다 (서버 업데이트 필요)' : '릴레이 서버에 연결되면 설정할 수 있습니다'));
+    return wrap;
+  }
+  const seg = h('div', { class: 'seg', role: 'radiogroup' }, HOLD.map(([mode, label, tip]) =>
+    h('button', { type: 'button', class: mode === r.hold ? 'on' : '', title: tip, disabled: r.state !== 'online', onclick: async () => {
+      err.textContent = '';
+      try { await invoke('relay_hold', { mode }); } catch (x) { err.textContent = String(x); }
+    } }, label)));
+  wrap.append(seg, err);
+  return wrap;
 }
 
 // Setup window: server address -> confirm identity -> account -> done.

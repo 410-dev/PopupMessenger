@@ -157,6 +157,8 @@ async fn session(
         "t": "hello", "rid": rid, "proto": crate::PROTOCOL,
         "server": { "id": server.id, "name": s.server_name, "version": crate::version() },
         "transport": { "kind": transport, "ws_chunk": s.ws_chunk_kb as usize * 1024 },
+        // "device_target": send `to` may name "<account>/<device>"; "hold": relay receive setting.
+        "features": ["device_target", "hold"],
         "policy": s.policy,
     });
     frame::write(&mut io, &reply).await?;
@@ -672,6 +674,28 @@ fn control_req(server: &Server, me: &LoggedIn, t: &str, req: &Value) -> Result<V
             server.contact_changed(&me.account);
             Ok(json!({ "t": "ok" }))
         }
+        "hold" => {
+            let c = server.db();
+            if let Some(mode) = req["mode"].as_str() {
+                let (acc, dev) = match mode {
+                    "allow" => (1, Some(1)),
+                    "device_off" => (1, Some(0)),
+                    "all_off" => (0, None),
+                    _ => return Err(perr("bad_request", "알 수 없는 설정입니다")),
+                };
+                let _ = c.execute("UPDATE accounts SET hold = ?1 WHERE id = ?2", params![acc, me.account]);
+                if let Some(dev) = dev {
+                    let _ = c.execute("UPDATE devices SET hold = ?1 WHERE id = ?2", params![dev, me.device]);
+                }
+                store::audit_for(&c, &format!("device:{}", me.device), "relay_receive", mode, &me.account);
+            }
+            let mode = store::hold_mode(&c, &me.device);
+            drop(c);
+            if req["mode"].is_string() {
+                server.contact_changed(&me.account);
+            }
+            Ok(json!({ "t": "hold", "mode": mode }))
+        }
         "contacts" => Ok(contacts(
             server,
             &me.account,
@@ -851,6 +875,8 @@ async fn transfer(server: Arc<Server>, mut io: Box<dyn Io>, req: Value) -> Resul
 }
 
 struct Target {
+    /// As the sender named it: "<account>" or "<account>/<device>".
+    to: String,
     account: String,
     devices: Vec<String>,
 }
@@ -928,9 +954,17 @@ async fn send(
             .flatten()
             .filter_map(|v| v.as_str())
         {
-            if !seen.insert(to.to_string()) || to == account {
+            // "<account>/<device>" sends to that one device only.
+            let (to_acc, only) = match to.split_once('/') {
+                Some((a, d)) => (a, Some(d)),
+                None => (to, None),
+            };
+            // Not to yourself; your other devices only one at a time.
+            if !seen.insert(to.to_string()) || (to_acc == account && only.is_none_or(|d| d == device)) {
                 continue;
             }
+            let full = to;
+            let to = to_acc;
             let active: bool = c
                 .query_row(
                     "SELECT state = 'active' FROM accounts WHERE id = ?1",
@@ -941,11 +975,15 @@ async fn send(
                 .ok()
                 .flatten()
                 .unwrap_or(false);
-            let devs = if active {
+            let mut devs = if active {
                 store::devices_of(&c, to)
             } else {
                 vec![]
             };
+            if let Some(d) = only {
+                devs.retain(|x| x.0 == d);
+            }
+            let to = full;
             if devs.is_empty() {
                 let reason = if active {
                     "받는 사람이 아직 이 서버에 기기를 등록하지 않았습니다"
@@ -955,7 +993,13 @@ async fn send(
                 rejected.push(json!({ "to": to, "code": "unknown_user", "reason": reason }));
                 continue;
             }
-            let over = devs.iter().find_map(|(_, prof)| {
+            // Offline devices that turned "relay receive" off get nothing stored.
+            devs.retain(|(d, _, hold)| *hold || server.hub.is_online(d));
+            if devs.is_empty() {
+                rejected.push(json!({ "to": to, "code": "offline", "reason": "받는 사람이 오프라인이고 릴레이 수신을 꺼 두었습니다" }));
+                continue;
+            }
+            let over = devs.iter().find_map(|(_, prof, _)| {
                 let mf = prof["max_files"].as_u64().unwrap_or(0);
                 let ms = prof["max_file_size"].as_u64().unwrap_or(0);
                 if mf > 0 && sizes.len() as u64 > mf {
@@ -977,14 +1021,15 @@ async fn send(
                 let keys = &body["keys"];
                 if devs
                     .iter()
-                    .any(|(d, _)| keys[d].as_str().map_or(true, str::is_empty))
+                    .any(|(d, _, _)| keys[d].as_str().map_or(true, str::is_empty))
                 {
                     rejected.push(json!({ "to": to, "code": "keys", "reason": "받는 사람의 기기 키가 바뀌었습니다. 연락처를 새로 받은 뒤 다시 보내세요" }));
                     continue;
                 }
             }
             targets.push(Target {
-                account: to.to_string(),
+                to: to.to_string(),
+                account: to_acc.to_string(),
                 devices: devs.into_iter().map(|d| d.0).collect(),
             });
         }
@@ -1073,7 +1118,7 @@ async fn send(
         for t in &targets {
             for d in &t.devices {
                 tx.execute(
-                    "INSERT INTO deliveries (mid, device, account) VALUES (?1, ?2, ?3)",
+                    "INSERT OR IGNORE INTO deliveries (mid, device, account) VALUES (?1, ?2, ?3)",
                     params![mid, d, t.account],
                 )
                 .map_err(|e| e.to_string())?;
@@ -1115,7 +1160,7 @@ async fn send(
             }
         }
         let mut r = json!({
-            "to": t.account,
+            "to": t.to,
             "state": if online > 0 { "delivered" } else { "stored" },
             "devices": t.devices.len(),
             "online": online,

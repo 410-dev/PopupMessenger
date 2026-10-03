@@ -4,4 +4,4 @@ src-tauri/gen/
 relay/target/
 relay/data/
 relay/.env
-src-tauri/target-dist/
+target-dist/

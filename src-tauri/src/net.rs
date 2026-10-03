@@ -266,9 +266,6 @@ fn expire(app: &AppHandle) {
     let st = app.state::<AppState>();
     let mut changed = false;
     for p in st.data.lock().unwrap().peers.values_mut() {
-        if p.id.starts_with("r:") {
-            continue; // relay contacts follow the relay, not LAN announcements
-        }
         if p.online && p.seen.map_or(true, |t| t.elapsed() > RECENT) {
             p.online = false;
             changed = true;
@@ -471,6 +468,7 @@ async fn receive(app: AppHandle, mut s: TcpStream, addr: SocketAddr, hdr: Value)
             files: saved,
             ts: now_ms(),
             read: false,
+            via: "lan".into(),
             note,
             group: h.group.map(|mut g| {
                 g.members.truncate(MAX_GROUP_MEMBERS);
@@ -630,20 +628,29 @@ pub async fn send(
     let mut deferred: Vec<(usize, crate::relay::Target)> = Vec::new();
     for id in to {
         let peer = st.data.lock().unwrap().peers.get(&id).cloned();
-        let name = peer.as_ref().map(|p| p.name.clone()).unwrap_or_else(|| id.clone());
-        let mut relay_target = None;
+        let legacy = id.strip_prefix("r:").map(str::to_string);
+        let name = match (&peer, &legacy) {
+            (Some(p), _) => p.name.clone(),
+            (None, Some(acc)) => {
+                let d = st.data.lock().unwrap();
+                let n = crate::state::devices_of(&d, acc).map(|p| p.name.clone()).next();
+                n.unwrap_or_else(|| id.clone())
+            }
+            _ => id.clone(),
+        };
+        let mut relay_target: Option<crate::relay::Target> = None;
         let r: Result<String, String> = if !bad.is_empty() {
             Err(bad.clone())
-        } else if let Some(p) = peer {
-            let acc = Some(p.relay_account.clone()).filter(|a| relay_on && !a.is_empty());
-            if id.starts_with("r:") {
-                // A user: every device of theirs online on the LAN, else the relay.
-                let devs: Vec<Peer> = if force {
-                    Vec::new()
-                } else {
-                    let d = st.data.lock().unwrap();
-                    crate::state::devices_of(&d, &p.relay_account).filter(|x| x.online).cloned().collect()
-                };
+        } else if let Some(account) = legacy {
+            // A whole account (replies to messages from before 0.1.8): every device of
+            // theirs online on the LAN, else the relay.
+            let devs: Vec<Peer> = if force {
+                Vec::new()
+            } else {
+                let d = st.data.lock().unwrap();
+                crate::state::devices_of(&d, &account).filter(|x| x.online).cloned().collect()
+            };
+            {
                 let mut lan = Err(String::new());
                 for dev in &devs {
                     let info = info.as_ref().filter(|_| dev.ver >= 3);
@@ -654,15 +661,20 @@ pub async fn send(
                     }
                 }
                 if lan.is_err() {
-                    if acc.is_some() {
-                        relay_target = acc;
+                    if relay_on {
+                        relay_target = Some(crate::relay::Target { peer: id.clone(), account, device: None });
                     } else {
                         lan = Err("릴레이 서버가 설정되어 있지 않습니다".into());
                     }
                 }
                 lan
-            } else if acc.is_some() && (force || !p.online) {
-                relay_target = acc;
+            }
+        } else if let Some(p) = peer {
+            // One device: the LAN first, then the relay (server policy first).
+            let acc = Some(p.relay_account.clone()).filter(|a| relay_on && !a.is_empty());
+            let via_relay = |acc: String| crate::relay::Target { peer: id.clone(), account: acc, device: Some(id.clone()) };
+            if acc.is_some() && (force || !p.online) {
+                relay_target = acc.map(via_relay);
                 Err(String::new())
             } else if block && acc.is_none() {
                 Err("서버 정책상 릴레이 서버를 쓰지 않는 사용자에게는 보낼 수 없습니다".into())
@@ -672,7 +684,7 @@ pub async fn send(
                     Ok(()) => Ok("lan".into()),
                     // The LAN failed (not a refusal by the recipient): try the relay.
                     Err((true, e)) if acc.is_some() => {
-                        relay_target = acc;
+                        relay_target = acc.map(via_relay);
                         Err(e)
                     }
                     Err((_, e)) => Err(e),
@@ -681,8 +693,8 @@ pub async fn send(
         } else {
             Err("알 수 없는 사용자".into())
         };
-        if let Some(account) = relay_target {
-            deferred.push((out.len(), crate::relay::Target { peer: id.clone(), account }));
+        if let Some(t) = relay_target {
+            deferred.push((out.len(), t));
         }
         let (ok, via, error) = match r {
             Ok(v) => (true, v, String::new()),
@@ -691,7 +703,10 @@ pub async fn send(
         out.push(SendResult { to: id, name, ok, error, via });
     }
     if !deferred.is_empty() {
-        let targets: Vec<crate::relay::Target> = deferred.iter().map(|d| crate::relay::Target { peer: d.1.peer.clone(), account: d.1.account.clone() }).collect();
+        let targets: Vec<crate::relay::Target> = deferred
+            .iter()
+            .map(|d| crate::relay::Target { peer: d.1.peer.clone(), account: d.1.account.clone(), device: d.1.device.clone() })
+            .collect();
         let res = crate::relay::send(&app, &job, &targets, &text, &list, info.as_ref()).await;
         for (i, t) in &deferred {
             if let Some((_, r)) = res.iter().find(|r| r.0 == t.peer) {

@@ -917,3 +917,103 @@ async fn admin_lists_are_paged_on_the_server() {
     let v = get("/api/messages".into()).await;
     assert_eq!(v["total"], 0);
 }
+
+// ---------------------------------------------------------------- device targets & relay receive
+
+#[tokio::test]
+async fn device_targets_and_relay_receive_setting() {
+    let r = server(|s| {
+        s.policy.auth = Auth::Password;
+        s.policy.registration = Registration::Open;
+        s.policy.encryption = Encryption::Plain;
+    })
+    .await;
+    let mut c = Client::plain(&r).await;
+    assert!(c.hello().await["features"].as_array().unwrap().iter().any(|f| f == "device_target"));
+    let mut reg = login("m1", Some(("min", "password1")));
+    reg["t"] = json!("register");
+    let m1 = c.req(reg).await;
+    let min = m1["account"].as_str().unwrap().to_string();
+    drop(c);
+    let (m2c, _) = logon(&r, "m2", Some(("min", "password1"))).await;
+    drop(m2c);
+    let mut c = Client::plain(&r).await;
+    c.hello().await;
+    let mut reg = login("o1", Some(("oh", "password2")));
+    reg["t"] = json!("register");
+    let o1 = c.req(reg).await;
+    let o_session = o1["session"].as_str().unwrap().to_string();
+
+    // One device only.
+    let to = format!("{min}/m2");
+    let sent = send(&r, &o_session, &[&to], "just m2", &[]).await;
+    assert_eq!(sent["result"][0]["to"], json!(to), "{sent}");
+    assert_eq!(sent["result"][0]["devices"], 1);
+    let n: i64 = r.server.db().query_row("SELECT COUNT(*) FROM deliveries WHERE device = 'm1'", [], |r| r.get(0)).unwrap();
+    assert_eq!(n, 0);
+
+    // m2 turns relay receive off for itself: offline m2 gets nothing, m1 still does.
+    let (mut m2c, _) = logon(&r, "m2", Some(("min", "password1"))).await;
+    assert_eq!(m2c.req(json!({ "t": "hold" })).await["mode"], "allow");
+    assert_eq!(m2c.req(json!({ "t": "hold", "mode": "device_off" })).await["mode"], "device_off");
+    let contact = c.req(json!({ "t": "lookup", "query": "min" })).await["contact"].clone();
+    let hold: Vec<bool> = contact["devices"].as_array().unwrap().iter().map(|d| d["hold"].as_bool().unwrap()).collect();
+    assert_eq!(hold.iter().filter(|h| !**h).count(), 1, "{contact}");
+    // Online, it still receives directly.
+    let sent = send(&r, &o_session, &[&to], "m2 online", &[]).await;
+    assert_eq!(sent["result"][0]["state"], "delivered", "{sent}");
+    drop(m2c);
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let sent = send(&r, &o_session, &[&to], "m2 offline", &[]).await;
+    assert_eq!(sent["code"], "offline", "{sent}");
+    let sent = send(&r, &o_session, &[&min], "whole account", &[]).await;
+    assert_eq!(sent["result"][0]["devices"], 1, "only m1 stores: {sent}");
+
+    // All devices off from another device of the account.
+    let (mut m1c, _) = logon(&r, "m1", Some(("min", "password1"))).await;
+    assert_eq!(m1c.req(json!({ "t": "hold" })).await["mode"], "allow");
+    assert_eq!(m1c.req(json!({ "t": "hold", "mode": "all_off" })).await["mode"], "all_off");
+    drop(m1c);
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let sent = send(&r, &o_session, &[&min], "nobody stores", &[]).await;
+    assert_eq!(sent["code"], "offline", "{sent}");
+    let (mut m1c, _) = logon(&r, "m1", Some(("min", "password1"))).await;
+    assert_eq!(m1c.req(json!({ "t": "hold", "mode": "allow" })).await["mode"], "allow");
+    drop(m1c);
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let sent = send(&r, &o_session, &[&min], "m1 stores again", &[]).await;
+    assert_eq!(sent["result"][0]["devices"], 1, "m2 is still off: {sent}");
+}
+
+#[tokio::test]
+async fn own_devices_and_contact_freshness() {
+    let r = server(|s| {
+        s.policy.auth = Auth::Password;
+        s.policy.registration = Registration::Open;
+        s.policy.encryption = Encryption::Plain;
+    })
+    .await;
+    let mut c = Client::plain(&r).await;
+    c.hello().await;
+    let mut reg = login("p1", Some(("pia", "password1")));
+    reg["t"] = json!("register");
+    let p1 = c.req(reg).await;
+    let pia = p1["account"].as_str().unwrap().to_string();
+    let p1_session = p1["session"].as_str().unwrap().to_string();
+    let (_p2c, _) = logon(&r, "p2", Some(("pia", "password1"))).await;
+
+    // My other device, one at a time; never myself or my whole account.
+    let sent = send(&r, &p1_session, &[&format!("{pia}/p2")], "to my other PC", &[]).await;
+    assert_eq!(sent["result"][0]["devices"], 1, "{sent}");
+    let sent = send(&r, &p1_session, &[&format!("{pia}/p1")], "to myself", &[]).await;
+    assert_eq!(sent["t"], "err", "{sent}");
+    let sent = send(&r, &p1_session, &[&pia], "to my account", &[]).await;
+    assert_eq!(sent["t"], "err", "{sent}");
+
+    // Contact entries carry a revision that grows with every change.
+    let a = c.req(json!({ "t": "contacts" })).await["list"][0]["updated"].as_i64().unwrap();
+    tokio::time::sleep(Duration::from_millis(5)).await;
+    c.req(json!({ "t": "profile", "profile": { "name": "Pia", "status": "dnd" } })).await;
+    let b = c.req(json!({ "t": "contacts" })).await["list"][0]["updated"].as_i64().unwrap();
+    assert!(b > a, "{a} -> {b}");
+}

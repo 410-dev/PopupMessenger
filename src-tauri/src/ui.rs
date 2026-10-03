@@ -201,17 +201,17 @@ pub fn open_group_compose(app: &AppHandle, group: &str) {
 }
 
 pub fn open_search(app: &AppHandle) {
-    open(app, "search", json!({ "v": "search" }), "연락처 검색", (380.0, 520.0), false);
+    open(app, "search", json!({ "v": "search" }), "연락처 검색", (560.0, 540.0), false);
 }
 
 pub fn open_groups(app: &AppHandle) {
-    open(app, "groups", json!({ "v": "groups" }), "전송 그룹 관리", (380.0, 520.0), false);
+    open(app, "groups", json!({ "v": "groups" }), "전송 그룹 관리", (460.0, 540.0), false);
 }
 
 pub fn open_picker(app: &AppHandle, files: Vec<String>) {
     let label = format!("picker-{}", next(app));
     let title = if files.is_empty() { "받는 사람".to_string() } else { format!("받는 사람 - 파일 {}개", files.len()) };
-    open(app, &label, json!({ "v": "pick", "files": files }), &title, (300.0, 440.0), true);
+    open(app, &label, json!({ "v": "pick", "files": files }), &title, (360.0, 460.0), true);
 }
 
 pub fn open_inbox(app: &AppHandle) {

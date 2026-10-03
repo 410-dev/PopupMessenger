@@ -1,7 +1,7 @@
 use crate::state::{AppState, Status};
 use crate::{net, ui};
 use tauri::image::Image;
-use tauri::menu::{CheckMenuItem, Menu, MenuItem, PredefinedMenuItem, Submenu};
+use tauri::menu::{CheckMenuItem, IconMenuItem, Menu, MenuItem, PredefinedMenuItem, Submenu};
 use tauri::tray::TrayIconBuilder;
 use tauri::{AppHandle, Manager, Wry};
 
@@ -43,6 +43,31 @@ fn icon(status: Status, unread: bool) -> Image<'static> {
     Image::new_owned(px, S, S)
 }
 
+/// Reachability dot for a recipient (`PeerView::state`), the same colors as in the
+/// windows: blue = LAN, green = relay, red = do not disturb, gray = unreachable.
+/// Filled when connected through the relay; a ring otherwise.
+pub fn dot(state: &str) -> Image<'static> {
+    const S: u32 = 16;
+    let (rgb, filled) = match state {
+        "both" => ([59, 130, 246], true),
+        "lan" => ([59, 130, 246], false),
+        "relay" => ([34, 165, 90], true),
+        "hold" => ([34, 165, 90], false),
+        "dnd" => ([229, 72, 77], false),
+        _ => ([150, 150, 150], false),
+    };
+    let disc = |x: f32, y: f32, r: f32| (r - ((x - 8.0).powi(2) + (y - 8.0).powi(2)).sqrt()).clamp(0.0, 1.0);
+    let mut px = Vec::with_capacity((S * S * 4) as usize);
+    for y in 0..S {
+        for x in 0..S {
+            let (fx, fy) = (x as f32 + 0.5, y as f32 + 0.5);
+            let a = if filled { disc(fx, fy, 5.5) } else { disc(fx, fy, 5.5) - disc(fx, fy, 3.5) };
+            px.extend_from_slice(&[rgb[0], rgb[1], rgb[2], (a * 255.0) as u8]);
+        }
+    }
+    Image::new_owned(px, S, S)
+}
+
 fn label(s: &str) -> String {
     // '&' marks a mnemonic in Windows menus.
     if cfg!(windows) { s.replace('&', "&&") } else { s.to_string() }
@@ -50,10 +75,7 @@ fn label(s: &str) -> String {
 
 fn build_menu(app: &AppHandle) -> tauri::Result<Menu<Wry>> {
     let st = app.state::<AppState>();
-    let mut peers = st.peers(true);
-    // A user with a relay account is one entry; their devices are in the picker.
-    let users: std::collections::HashSet<String> = peers.iter().filter(|p| p.relay).map(|p| p.account.clone()).collect();
-    peers.retain(|p| p.relay || p.account.is_empty() || !users.contains(&p.account));
+    let peers = st.peers(true);
     // Groups with nobody online are left out to keep the menu short.
     let groups: Vec<_> = st.groups().into_iter().filter(|g| g.online > 0).collect();
     let unread = st.unread();
@@ -77,11 +99,14 @@ fn build_menu(app: &AppHandle) -> tauri::Result<Menu<Wry>> {
         m.append(&MenuItem::with_id(app, "none", "(접속 중인 사용자 없음)", false, None::<&str>)?)?;
     }
     for p in peers.iter().take(TOP_N) {
-        let mut text = if p.host.is_empty() { p.display.clone() } else { format!("{}  ({})", p.display, p.host) };
-        if p.status == Status::Dnd {
-            text.push_str("  — 방해금지");
+        let mut text = p.display.clone();
+        if !p.username.is_empty() {
+            text.push_str(&format!("  @{}", p.username));
         }
-        m.append(&MenuItem::with_id(app, format!("p:{}", p.id), label(&text), true, None::<&str>)?)?;
+        if !p.host.is_empty() {
+            text.push_str(&format!("  ({})", p.host));
+        }
+        m.append(&IconMenuItem::with_id(app, format!("p:{}", p.id), label(&text), true, Some(dot(p.state)), None::<&str>)?)?;
     }
     if peers.len() > TOP_N {
         m.append(&MenuItem::with_id(app, "more", format!("더보기… (전체 {}명)", peers.len()), true, None::<&str>)?)?;

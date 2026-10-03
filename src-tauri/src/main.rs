@@ -183,23 +183,21 @@ async fn search_contacts(app: AppHandle, query: String) -> Value {
     if relay && lookup_scope && st.relay.online() && q.chars().count() >= 2 {
         looked_up = relay::lookup(&app, query.trim()).await;
     }
-    let users = relay::usernames(&app);
     let me = st.my_id();
     let mut out: Vec<Value> = Vec::new();
     let mut seen = std::collections::HashSet::new();
     for p in st.peers(false) {
-        let acc = p.id.strip_prefix("r:").unwrap_or("");
-        let user = users.get(acc).cloned().unwrap_or_default();
+        let user = p.username.clone();
         let hay = format!("{} {} {} {} {}", p.display, p.name, p.host, p.ip, user).to_lowercase();
-        let exact = looked_up.as_deref().is_some_and(|a| a == acc);
+        let exact = looked_up.as_deref().is_some_and(|a| a == p.account);
         if !q.is_empty() && !hay.contains(&q) && !exact {
             continue;
         }
         seen.insert(p.id.clone());
         out.push(json!({
-            "id": p.id, "display": p.display, "host": p.host, "username": user, "online": p.online,
-            "status": p.status, "reach": p.reach, "source": if p.relay { "relay" } else { "lan" },
-            "forgettable": !p.online && !p.relay && !p.reach,
+            "id": p.id, "display": p.display, "host": p.host, "ip": p.ip, "username": user, "online": p.online,
+            "status": p.status, "reach": p.reach, "state": p.state,
+            "source": if p.account.is_empty() { "lan" } else { "relay" },
         }));
     }
     if !relay {
@@ -221,8 +219,8 @@ async fn search_contacts(app: AppHandle, query: String) -> Value {
             }
             seen.insert(id.clone());
             out.push(json!({
-                "id": id, "display": name, "host": "", "username": "", "online": false, "status": "offline",
-                "reach": false, "source": "history", "last": ts, "forgettable": false,
+                "id": id, "display": name, "host": "", "ip": "", "username": "", "online": false, "status": "offline",
+                "reach": false, "state": "off", "source": "history", "last": ts,
             }));
         }
     }
@@ -393,6 +391,12 @@ fn relay_info(app: AppHandle) -> Value {
     relay::info(&app)
 }
 
+/// This device's "relay receive" setting on the server; `mode` sets it.
+#[tauri::command]
+async fn relay_hold(app: AppHandle, mode: Option<String>) -> Result<String, String> {
+    relay::hold(&app, mode.as_deref()).await
+}
+
 /// Contacts the server at `url` and returns its identity and policy for the user to confirm.
 #[tauri::command]
 async fn relay_probe(url: String) -> Result<Value, String> {
@@ -499,6 +503,7 @@ fn main() {
             pick_dir,
             rescan,
             relay_info,
+            relay_hold,
             relay_probe,
             relay_join,
             relay_disconnect,

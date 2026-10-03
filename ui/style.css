@@ -37,7 +37,21 @@ a:hover { text-decoration: underline; }
 .row:hover { background: var(--hi); }
 .row .name { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; cursor: pointer; }
 .row.off { opacity: .5; }
-.row.dev { padding-left: 28px; font-size: 12px; }
+.dot { display: inline-block; flex: none; width: 10px; height: 10px; border-radius: 50%; box-sizing: border-box; border: 2.5px solid var(--dot); }
+.dot.s-both, .dot.s-relay { background: var(--dot); }
+.dot.s-both, .dot.s-lan { --dot: #3b82f6; }
+.dot.s-relay, .dot.s-hold { --dot: #22a55a; }
+.dot.s-dnd { --dot: #e5484d; }
+.dot.s-off { --dot: #9a9a9a; }
+.handle { color: #22a55a; font-size: 12px; white-space: nowrap; }
+.tag.via-lan { color: #3b82f6; border-color: #3b82f6; }
+.tag.via-relay, .tag.via-stored { color: #22a55a; border-color: #22a55a; }
+.routes { display: flex; flex-direction: column; gap: 2px; font-size: 12px; }
+.holdset { display: flex; flex-direction: column; gap: 4px; margin-top: 6px; }
+.seg { display: flex; border: 1px solid var(--bd); border-radius: 6px; overflow: hidden; }
+.seg button { flex: 1; border: 0; border-radius: 0; margin: 0; padding: 5px 4px; font-size: 12px; background: transparent; }
+.seg button + button { border-left: 1px solid var(--bd); }
+.seg button.on { background: var(--ac); color: #fff; }
 .row input[type=checkbox] { width: auto; }
 .msg { cursor: pointer; }
 .msg .name { flex: 0 0 90px; }

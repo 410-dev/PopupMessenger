@@ -1,8 +1,9 @@
 //! Relay client (docs/relay-protocol.md): one control connection kept open while
 //! a relay is configured, plus a short-lived transfer connection per message.
 //!
-//! Relay contacts become peers with id "r:<account>"; LAN peers that are one of
-//! a relay account's devices get `relay_account` so they can fall back to the relay.
+//! Every device of a relay contact becomes a peer under its device id, the same id it
+//! has on the LAN, so a device seen both ways is one peer with `relay_account` set and
+//! the relay as its fallback.
 
 use crate::e2ee;
 use crate::net::{self, human};
@@ -67,6 +68,10 @@ pub struct RelayConfig {
     pub key_changed: Vec<String>,
     /// Recently fetched server message ids, to drop redeliveries.
     pub seen: Vec<String>,
+    /// Server features from its hello ("device_target", "hold").
+    pub features: Vec<String>,
+    /// This device's "relay receive" setting: "allow", "device_off" or "all_off".
+    pub hold: String,
 }
 
 /// Per-server device credentials. Kept after unlinking so the same device can log on again.
@@ -602,7 +607,32 @@ pub fn info(app: &AppHandle) -> Value {
         "url": c.url, "tls": c.tls, "fingerprint": c.fingerprint, "server_id": c.server_id, "server_name": c.server_name, "server_version": c.server_version,
         "username": c.username, "account": c.account, "device": st.my_id(), "policy": c.policy,
         "contacts": c.contacts.len().saturating_sub(1), "my_key": my_key, "key_changed": changed,
+        "hold": if c.features.iter().any(|f| f == "hold") { json!(c.hold) } else { Value::Null },
     })
+}
+
+/// Reads, or with `mode` sets, this device's "relay receive" setting on the server:
+/// whether the relay keeps messages for it while it is offline.
+pub async fn hold(app: &AppHandle, mode: Option<&str>) -> Result<String, String> {
+    let st = app.state::<AppState>();
+    if !st.relay.cfg.lock().unwrap().as_ref().is_some_and(|c| c.features.iter().any(|f| f == "hold")) {
+        return Err("이 릴레이 서버는 이 설정을 지원하지 않습니다. 서버를 업데이트하세요".into());
+    }
+    let mut req = json!({ "t": "hold" });
+    if let Some(m) = mode {
+        req["mode"] = json!(m);
+    }
+    let r = request(app, req).await?;
+    if r["t"] != "hold" {
+        return Err(err_text(&r));
+    }
+    let mode = r["mode"].as_str().unwrap_or("allow").to_string();
+    if let Some(c) = st.relay.cfg.lock().unwrap().as_mut() {
+        c.hold = mode.clone();
+    }
+    st.relay.save(&st.dir);
+    changed(app);
+    Ok(mode)
 }
 
 fn changed(app: &AppHandle) {
@@ -724,6 +754,7 @@ async fn session(app: &AppHandle, cfg: &RelayConfig) -> Stop {
             c.policy = h["policy"].clone();
             c.server_name = h["server"]["name"].as_str().unwrap_or(&c.server_name).to_string();
             c.server_version = h["server"]["version"].as_str().unwrap_or(&c.server_version).to_string();
+            c.features = h["features"].as_array().into_iter().flatten().filter_map(|f| f.as_str().map(str::to_string)).collect();
             c.account = r["account"].as_str().unwrap_or(&c.account).to_string();
             if r["username"].is_string() {
                 c.username = r["username"].as_str().map(str::to_string);
@@ -752,6 +783,7 @@ async fn session(app: &AppHandle, cfg: &RelayConfig) -> Stop {
         let a = app.clone();
         tauri::async_runtime::spawn(async move {
             sync_contacts(&a).await;
+            let _ = hold(&a, None).await;
             process_inbox(&a).await;
         });
     }
@@ -853,20 +885,6 @@ pub async fn lookup(app: &AppHandle, query: &str) -> Option<String> {
     Some(acc)
 }
 
-/// Relay account id -> username, for searching contacts by username.
-pub fn usernames(app: &AppHandle) -> HashMap<String, String> {
-    let st = app.state::<AppState>();
-    let cfg = st.relay.cfg.lock().unwrap();
-    cfg.as_ref()
-        .map(|c| {
-            c.contacts
-                .iter()
-                .filter_map(|(a, e)| e["username"].as_str().map(|u| (a.clone(), u.to_string())))
-                .collect()
-        })
-        .unwrap_or_default()
-}
-
 async fn sync_contacts(app: &AppHandle) {
     let st = app.state::<AppState>();
     let since = st.relay.cfg.lock().unwrap().as_ref().map(|c| c.contacts_since).unwrap_or(0);
@@ -885,11 +903,15 @@ fn apply_contacts(app: &AppHandle, list: &[Value], full: bool) {
     {
         let mut g = st.relay.cfg.lock().unwrap();
         let Some(c) = g.as_mut() else { return };
-        if full {
-            c.contacts.clear();
-        }
+        let old = if full { std::mem::take(&mut c.contacts) } else { c.contacts.clone() };
         for e in list {
             let Some(acc) = e["account"].as_str() else { continue };
+            // A reply computed before a "contact" event we already applied is older.
+            let newer = |o: &Value| o["updated"].as_i64().zip(e["updated"].as_i64()).is_some_and(|(a, b)| a > b);
+            if let Some(o) = old.get(acc).filter(|o| newer(o)) {
+                c.contacts.insert(acc.to_string(), o.clone());
+                continue;
+            }
             if e["removed"] == true {
                 c.contacts.remove(acc);
                 continue;
@@ -922,49 +944,74 @@ fn status_of(s: &Value) -> Status {
     }
 }
 
-/// Mirrors relay contacts into the peer list.
+/// Mirrors the relay contacts' devices into the peer list, one peer per device.
 pub fn rebuild_peers(app: &AppHandle) {
     let st = app.state::<AppState>();
     let online = st.relay.online();
     let cfg = st.relay.cfg.lock().unwrap().clone();
+    let my_dev = st.my_id();
     {
         let mut d = st.data.lock().unwrap();
         let contacts = cfg.as_ref().map(|c| c.contacts.clone()).unwrap_or_default();
-        let me = cfg.as_ref().map(|c| c.account.clone()).unwrap_or_default();
-        d.peers.retain(|id, _| !id.starts_with("r:") || contacts.contains_key(&id[2..]) && id[2..] != me);
-        let mut owner: HashMap<String, String> = HashMap::new();
+        let relay = cfg.is_some();
+        // Before 0.1.8 a relay contact was one "r:<account>" peer; groups now get its devices.
+        d.peers.retain(|id, _| !id.starts_with("r:"));
+        let mut legacy: HashMap<String, Vec<String>> = HashMap::new();
+        let mut owned: HashSet<String> = HashSet::new();
+        // My own account is listed too: my other devices can be reached through the relay.
         for (acc, e) in &contacts {
-            if *acc == me {
+            if e["removed"] == true {
                 continue;
             }
-            let devs = e["devices"].as_array().cloned().unwrap_or_default();
-            for dv in &devs {
-                if let Some(id) = dv["id"].as_str() {
-                    owner.insert(id.to_string(), acc.clone());
+            let username = e["username"].as_str().unwrap_or("").to_string();
+            for dv in e["devices"].as_array().into_iter().flatten() {
+                let Some(id) = dv["id"].as_str().filter(|id| *id != my_dev) else { continue };
+                owned.insert(id.to_string());
+                legacy.entry(format!("r:{acc}")).or_default().push(id.to_string());
+                let p = d.peers.entry(id.to_string()).or_insert_with(|| Peer { id: id.to_string(), ..Default::default() });
+                if !p.online {
+                    // While it is on the LAN, its own announcements are fresher.
+                    let name = dv["name"].as_str().filter(|n| !n.is_empty()).or(e["name"].as_str()).unwrap_or("");
+                    if !name.is_empty() {
+                        p.name = name.to_string();
+                    }
+                    if let Some(h) = dv["host"].as_str().filter(|h| !h.is_empty()) {
+                        p.host = h.to_string();
+                    }
+                    p.notify = dv["notify"] != false;
+                    p.max_files = dv["max_files"].as_u64().unwrap_or(0) as u32;
+                    p.max_file_size = dv["max_file_size"].as_u64().unwrap_or(0);
+                    if p.ver == 0 {
+                        p.ver = PROTO_VER;
+                    }
                 }
+                p.relay_account = acc.clone();
+                p.username = username.clone();
+                p.relay_hold = dv["hold"] != false;
+                p.relay_online = online && dv["online"] == true;
+                p.relay_status = if p.relay_online { status_of(&dv["status"]) } else { Status::Offline };
             }
-            let min = |k: &str| devs.iter().filter_map(|x| x[k].as_u64()).filter(|&n| n > 0).min().unwrap_or(0);
-            let live = online && e["online"] == true;
-            let p = d.peers.entry(format!("r:{acc}")).or_default();
-            p.id = format!("r:{acc}");
-            p.name = e["name"].as_str().unwrap_or("").to_string();
-            p.notify = devs.iter().any(|x| x["notify"] != false);
-            p.max_files = min("max_files") as u32;
-            p.max_file_size = min("max_file_size");
-            p.status = if live { status_of(&e["status"]) } else { Status::Offline };
-            p.ver = PROTO_VER;
-            p.relay_account = acc.clone();
-            p.online = live;
         }
-        let relay = cfg.is_some();
+        // Devices the relay no longer lists: LAN ones stay, relay-only ones go.
+        d.peers.retain(|id, p| owned.contains(id) || !p.ip.is_empty());
         for (id, p) in d.peers.iter_mut() {
-            if !id.starts_with("r:") {
-                p.relay_account = match owner.get(id) {
-                    Some(a) => a.clone(),
-                    // Announced on the LAN: the relay can still be tried for it.
-                    None if relay && p.relay_self != me => p.relay_self.clone(),
-                    None => String::new(),
-                };
+            if owned.contains(id) {
+                continue;
+            }
+            p.relay_online = false;
+            p.relay_hold = false;
+            p.username.clear();
+            // Announced on the LAN: the relay can still be tried for it.
+            p.relay_account = if relay { p.relay_self.clone() } else { String::new() };
+        }
+        for g in d.groups.iter_mut() {
+            if g.members.iter().any(|m| m.starts_with("r:")) {
+                let mut seen = HashSet::new();
+                let old = std::mem::take(&mut g.members);
+                for m in old {
+                    let ids = legacy.get(&m).cloned().unwrap_or_else(|| vec![m]);
+                    g.members.extend(ids.into_iter().filter(|x| seen.insert(x.clone())));
+                }
             }
         }
     }
@@ -1021,6 +1068,8 @@ async fn transfer_conn(app: &AppHandle) -> Result<Stream, String> {
 pub struct Target {
     pub peer: String,
     pub account: String,
+    /// Only this device of the account (when the server supports it).
+    pub device: Option<String>,
 }
 
 /// Per target peer: Ok("relay" | "stored") or Err(reason).
@@ -1055,16 +1104,25 @@ pub async fn send(
     }
 
     let mut out: Vec<(String, Result<String, String>)> = Vec::new();
-    let mut accounts: Vec<String> = Vec::new();
+    let mut accounts: Vec<String> = Vec::new(); // "to" entries
     let mut recipients: Vec<(String, String)> = Vec::new();
+    let cfg = st.relay.cfg.lock().unwrap().clone().unwrap_or_default();
+    let by_device = cfg.features.iter().any(|f| f == "device_target");
+    let to_of = |t: &Target| match &t.device {
+        Some(d) if by_device => format!("{}/{d}", t.account),
+        _ => t.account.clone(),
+    };
     {
-        let cfg = st.relay.cfg.lock().unwrap().clone().unwrap_or_default();
         for t in targets {
-            if accounts.contains(&t.account) {
+            let to = to_of(t);
+            if accounts.contains(&to) {
                 continue;
             }
             if e2ee {
-                let devs = cfg.contacts.get(&t.account).and_then(|e| e["devices"].as_array().cloned()).unwrap_or_default();
+                let mut devs = cfg.contacts.get(&t.account).and_then(|e| e["devices"].as_array().cloned()).unwrap_or_default();
+                if let (Some(d), true) = (&t.device, by_device) {
+                    devs.retain(|x| x["id"] == json!(d));
+                }
                 if devs.iter().any(|d| cfg.key_changed.iter().any(|x| d["id"] == json!(x))) {
                     out.push((t.peer.clone(), Err("받는 사람의 보안 키가 바뀌었습니다. 설정 > 릴레이 서버에서 확인하세요".into())));
                     continue;
@@ -1081,7 +1139,7 @@ pub async fn send(
                     }
                 }
             }
-            accounts.push(t.account.clone());
+            accounts.push(to);
         }
     }
     let blocked: Vec<String> = out.iter().map(|o| o.0.clone()).collect();
@@ -1131,7 +1189,7 @@ pub async fn send(
         if blocked.contains(&t.peer) {
             continue;
         }
-        let res = results.iter().find(|x| x["to"] == json!(t.account));
+        let res = results.iter().find(|x| x["to"] == json!(to_of(t)));
         let v = match res {
             Some(x) if x["state"] == "delivered" => Ok("relay".to_string()),
             Some(x) if x["state"] == "stored" => Ok("stored".to_string()),
@@ -1206,6 +1264,7 @@ async fn process_inbox(app: &AppHandle) {
                     files: vec![],
                     ts: x["last"].as_u64().unwrap_or_else(now_ms),
                     read: false,
+                    via: "relay".into(),
                     note: format!("{name} 님이 보낸 쪽지 {n}개가 릴레이 서버 보관 기간이 지나 삭제되었습니다"),
                     group: None,
                 },
@@ -1370,13 +1429,15 @@ async fn receive(app: &AppHandle, io: &mut Stream, h: &Value) -> Result<(), Stri
         app,
         Message {
             id: new_id(),
-            from_id: format!("r:{from}"),
+            // Replies go to the device it came from (LAN first, then the relay).
+            from_id: if from_device.is_empty() { format!("r:{from}") } else { from_device.to_string() },
             from_name,
             from_ip: "릴레이".into(),
             text: plain["text"].as_str().unwrap_or("").to_string(),
             files: saved,
             ts: h["ts"].as_u64().unwrap_or_else(now_ms),
             read: false,
+            via: "relay".into(),
             note,
             group,
         },

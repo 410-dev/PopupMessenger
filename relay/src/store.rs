@@ -80,6 +80,16 @@ pub fn open(path: &Path) -> rusqlite::Result<Connection> {
         ))?;
     }
     c.execute_batch("CREATE INDEX IF NOT EXISTS audit_account ON audit(account, id);")?;
+    // Added in 1.261004.03: whether messages are stored for a device while it is offline
+    // ("relay receive"), per device and for the whole account.
+    for table in ["devices", "accounts"] {
+        let has: bool = c
+            .prepare(&format!("SELECT 1 FROM pragma_table_info('{table}') WHERE name = 'hold'"))?
+            .exists([])?;
+        if !has {
+            c.execute_batch(&format!("ALTER TABLE {table} ADD COLUMN hold INTEGER NOT NULL DEFAULT 1;"))?;
+        }
+    }
     Ok(c)
 }
 
@@ -233,27 +243,27 @@ pub fn contact(
     account: &str,
     show_host: bool,
 ) -> Option<Value> {
-    let row: Option<(Option<String>, String, String, Option<i64>)> = c
+    let row: Option<(Option<String>, String, String, Option<i64>, bool, i64)> = c
         .query_row(
-            "SELECT username, name, state, last_seen FROM accounts WHERE id = ?1",
+            "SELECT username, name, state, last_seen, hold != 0, updated FROM accounts WHERE id = ?1",
             [account],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?)),
         )
         .optional()
         .ok()
         .flatten();
-    let Some((username, name, state, last_seen)) = row else {
+    let Some((username, name, state, last_seen, acc_hold, updated)) = row else {
         return Some(json!({ "account": account, "removed": true }));
     };
     if state != "active" {
         return Some(json!({ "account": account, "removed": true }));
     }
     let mut st = c
-        .prepare_cached("SELECT id, profile, pubkey, last_seen FROM devices WHERE account = ?1 AND disabled = 0")
+        .prepare_cached("SELECT id, profile, pubkey, last_seen, hold != 0 FROM devices WHERE account = ?1 AND disabled = 0")
         .ok()?;
-    let devs: Vec<(String, String, String, Option<i64>)> = st
+    let devs: Vec<(String, String, String, Option<i64>, bool)> = st
         .query_map([account], |r| {
-            Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
         })
         .ok()?
         .filter_map(Result::ok)
@@ -261,7 +271,7 @@ pub fn contact(
     let mut best = "offline";
     let devices: Vec<Value> = devs
         .into_iter()
-        .map(|(id, profile, pubkey, seen)| {
+        .map(|(id, profile, pubkey, seen, hold)| {
             let p: Value = serde_json::from_str(&profile).unwrap_or(json!({}));
             let wanted = p["status"].as_str().unwrap_or("online");
             let status = if online.contains(&id) {
@@ -283,6 +293,8 @@ pub fn contact(
                 "max_file_size": p["max_file_size"],
                 "pubkey": pubkey,
                 "last_seen": seen,
+                // Messages are stored for it while it is offline.
+                "hold": hold && acc_hold,
             })
         })
         .collect();
@@ -293,27 +305,49 @@ pub fn contact(
         "status": best,
         "online": best != "offline",
         "last_seen": last_seen,
+        // Bumped on every change: a client keeps the newest entry when a contacts
+        // reply and a "contact" event cross.
+        "updated": updated,
         "removed": false,
         "devices": devices,
     }))
 }
 
-/// Active, non-disabled device ids of an account.
-pub fn devices_of(c: &Connection, account: &str) -> Vec<(String, Value)> {
-    let Ok(mut st) =
-        c.prepare_cached("SELECT id, profile FROM devices WHERE account = ?1 AND disabled = 0")
-    else {
+/// Active, non-disabled devices of an account: (id, profile, stores while offline).
+pub fn devices_of(c: &Connection, account: &str) -> Vec<(String, Value, bool)> {
+    let Ok(mut st) = c.prepare_cached(
+        "SELECT d.id, d.profile, d.hold != 0 AND a.hold != 0 FROM devices d JOIN accounts a ON a.id = d.account
+         WHERE d.account = ?1 AND d.disabled = 0",
+    ) else {
         return vec![];
     };
     st.query_map([account], |r| {
-        Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+        Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, bool>(2)?))
     })
     .map(|it| {
         it.filter_map(Result::ok)
-            .map(|(id, p)| (id, serde_json::from_str(&p).unwrap_or(json!({}))))
+            .map(|(id, p, hold)| (id, serde_json::from_str(&p).unwrap_or(json!({})), hold))
             .collect()
     })
     .unwrap_or_default()
+}
+
+/// "Relay receive" of a device: "allow", "device_off" (this device only) or "all_off".
+pub fn hold_mode(c: &Connection, device: &str) -> &'static str {
+    let (dev, acc): (bool, bool) = c
+        .query_row(
+            "SELECT d.hold != 0, a.hold != 0 FROM devices d JOIN accounts a ON a.id = d.account WHERE d.id = ?1",
+            [device],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap_or((true, true));
+    if !acc {
+        "all_off"
+    } else if !dev {
+        "device_off"
+    } else {
+        "allow"
+    }
 }
 
 pub fn pending_count(c: &Connection, device: &str) -> i64 {
