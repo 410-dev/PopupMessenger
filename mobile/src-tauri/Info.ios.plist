@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<!-- Received attachments (Documents/PopupMessenger) show up in the Files app. -->
+	<key>UIFileSharingEnabled</key>
+	<true/>
+	<key>LSSupportsOpeningDocumentsInPlace</key>
+	<true/>
+	<!-- The attachment picker offers the camera and the photo library. -->
+	<key>NSCameraUsageDescription</key>
+	<string>쪽지에 사진이나 동영상을 찍어 첨부합니다.</string>
+	<key>NSPhotoLibraryUsageDescription</key>
+	<string>쪽지에 사진이나 동영상을 첨부합니다.</string>
+	<key>NSMicrophoneUsageDescription</key>
+	<string>쪽지에 첨부할 동영상의 소리를 녹음합니다.</string>
+</dict>
+</plist>

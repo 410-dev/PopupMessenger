@@ -53,6 +53,10 @@ npm run build    # 설치 파일 (Windows: MSI/NSIS, macOS: .app/.dmg)
 
 개발용: `POPUPMESSENGER_PROFILE=<이름>`으로 실행하면 별도 데이터 폴더(`…\com.popupmessenger.app.profile-<이름>`)와 포트 47000부터를 쓰는 테스트 인스턴스가 뜹니다 (단일 인스턴스·자동 실행·우클릭 메뉴 등록 없음). `POPUPMESSENGER_CDP_PORT=<포트>`를 함께 주면 WebView2 원격 디버깅 포트를 엽니다.
 
+## 모바일 앱 (Android · iOS)
+
+[`mobile/`](mobile)에 Tauri 2 네이티브 앱이 있습니다. LAN을 쓰지 않고 **릴레이 서버만** 쓰며, 처음 열 때 릴레이 서버에 연결해야 쓸 수 있습니다. 배터리를 아끼려고 화면에 있을 때만 연결하고, 꺼져 있는 동안의 쪽지는 릴레이가 보관했다가 앱을 열면 전달합니다. 자세한 내용과 빌드: [mobile/README.md](mobile/README.md).
+
 ## 참고
 
 - 처음 실행 시 Windows 방화벽 허용 창이 뜨면 "개인 네트워크"를 허용해야 다른 PC에서 보입니다.

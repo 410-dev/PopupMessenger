@@ -1,0 +1,19 @@
+{
+  "name": "popup-messenger-mobile",
+  "private": true,
+  "version": "0.1.8",
+  "scripts": {
+    "tauri": "tauri",
+    "icons": "tauri icon src-tauri/icons/icon.svg",
+    "dev": "tauri dev",
+    "android:init": "tauri android init",
+    "android:dev": "tauri android dev",
+    "android:build": "tauri android build",
+    "ios:init": "tauri ios init",
+    "ios:dev": "tauri ios dev",
+    "ios:build": "tauri ios build"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "^2"
+  }
+}

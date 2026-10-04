@@ -3,6 +3,7 @@
 mod e2ee;
 mod net;
 mod relay;
+mod relay_io;
 mod shell;
 mod state;
 mod tray;

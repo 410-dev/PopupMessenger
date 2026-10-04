@@ -1,0 +1,36 @@
+[package]
+name = "popup-messenger-mobile"
+version = "0.1.8"
+description = "PopupMessenger for Android and iOS (relay only)"
+edition = "2021"
+
+[lib]
+name = "popup_messenger_mobile_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+tauri-plugin-pm-native = { path = "../plugin" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["net", "io-util", "fs", "time", "sync", "rt", "macros"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "logging", "tls12"] }
+webpki-roots = "1"
+crypto_box = "0.9"
+chacha20poly1305 = { version = "0.10", features = ["stream"] }
+hkdf = "0.12"
+sha2 = "0.10"
+base64 = "0.22"
+rand = "0.8"
+tokio-tungstenite = { version = "0.28", default-features = false, features = ["handshake"] }
+futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
+
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true

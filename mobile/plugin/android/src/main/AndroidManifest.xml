@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+    <application>
+        <!-- Hands received files to other apps (open with, share) without storage permissions. -->
+        <provider
+            android:name="com.popupmessenger.pmnative.PmFileProvider"
+            android:authorities="${applicationId}.pmfiles"
+            android:exported="false"
+            android:grantUriPermissions="true">
+            <meta-data
+                android:name="android.support.FILE_PROVIDER_PATHS"
+                android:resource="@xml/pm_file_paths" />
+        </provider>
+    </application>
+</manifest>
