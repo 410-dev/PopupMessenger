@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Adaptive icon glyph, kept inside the 66dp safe zone so no launcher mask cuts it.
+     Same geometry as mobile/src-tauri/icons/icon.svg. -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+    <path
+        android:fillColor="#FFFFFFFF"
+        android:pathData="M37,39H67A8,8 0 0 1 75,47V61A8,8 0 0 1 67,69H50L40,78V69H37A8,8 0 0 1 29,61V47A8,8 0 0 1 37,39Z" />
+    <path
+        android:fillColor="#FF1D4ED8"
+        android:pathData="M39,48h22a2,2 0 0 1 0,4h-22a2,2 0 0 1 0,-4z" />
+    <path
+        android:fillColor="#8C1D4ED8"
+        android:pathData="M39,56h13a2,2 0 0 1 0,4h-13a2,2 0 0 1 0,-4z" />
+    <path
+        android:fillColor="#FF22C55E"
+        android:strokeColor="#FFFFFFFF"
+        android:strokeWidth="3"
+        android:pathData="M73,32.5a7.5,7.5 0 1 1 0,15a7.5,7.5 0 1 1 0,-15z" />
+</vector>

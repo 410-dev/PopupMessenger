@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Themed icon (Android 13+): one colour, the system tints it. Lines and dot are cut out. -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+    <path
+        android:fillColor="#FF000000"
+        android:fillType="evenOdd"
+        android:pathData="M37,39H67A8,8 0 0 1 75,47V61A8,8 0 0 1 67,69H50L40,78V69H37A8,8 0 0 1 29,61V47A8,8 0 0 1 37,39ZM39,48h22a2,2 0 0 1 0,4h-22a2,2 0 0 1 0,-4zM39,56h13a2,2 0 0 1 0,4h-13a2,2 0 0 1 0,-4z" />
+    <path
+        android:fillColor="#FF000000"
+        android:pathData="M73,34a6,6 0 1 1 0,12a6,6 0 1 1 0,-12z" />
+</vector>

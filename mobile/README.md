@@ -82,6 +82,10 @@ npm run ios:build
 
 `ios:init`이 만드는 `src-tauri/gen/apple`은 커밋되어 있지 않습니다. 처음 만든 뒤 Xcode에서 서명 팀(Signing & Capabilities)을 정하세요.
 
+### 아이콘
+
+원본은 `src-tauri/icons/icon.svg`(108×108, 배경을 꽉 채우고 그림은 가운데 66 안쪽)입니다. `npm run icons`로 각 플랫폼 아이콘을 다시 만듭니다. 다만 Android 적응형 아이콘은 직접 만든 벡터(`gen/android/app/src/main/res/drawable/ic_pm_background.xml`, `ic_pm_foreground.xml`, `ic_pm_monochrome.xml`)를 쓰는데, `tauri icon`이 `mipmap-anydpi-v26/ic_launcher*.xml`을 덮어쓰므로 실행한 뒤 이 두 파일을 git에서 되돌리세요.
+
 ### 데스크톱에서 UI 확인
 
 `npm run dev`로 같은 앱을 PC 창으로 띄울 수 있습니다. `POPUPMESSENGER_PROFILE=<이름>`이면 별도 데이터로 한 PC에서 여러 개를 띄우고, Windows에서 `POPUPMESSENGER_CDP_PORT=<포트>`를 함께 주면 WebView2 원격 디버깅 포트를 엽니다.
