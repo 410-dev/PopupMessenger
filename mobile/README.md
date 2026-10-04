@@ -26,10 +26,11 @@ mobile/
     src/relay.rs       릴레이 클라이언트 (화면에 있을 때만 연결)
     src/store.rs       설정·쪽지 저장
     gen/android/       Android 프로젝트 (tauri android init으로 생성, 커밋함)
+    gen/apple/         Xcode 프로젝트 (tauri ios init으로 생성, 커밋함)
     Info.ios.plist     iOS Info.plist에 합쳐지는 항목 (파일 앱 공유, 카메라·사진 권한 문구)
   plugin/              네이티브 플러그인 tauri-plugin-pm-native
     android/           Kotlin: FileProvider로 열기·공유, MediaStore로 저장, 시스템 바·키보드 크기 전달
-    ios/               Swift: Quick Look, 공유 시트, 문서 선택기, 햅틱
+    ios/               Swift: Quick Look, 공유 시트, 문서 선택기, 햅틱, 로그오프할 동안의 백그라운드 실행 시간
 ```
 
 ## 빌드
@@ -66,21 +67,25 @@ set JAVA_TOOL_OPTIONS=-Djdk.net.unixdomain.tmpdir=C:\Users\Public\jtmp
 
 ### iOS (macOS에서)
 
-필요: Xcode, Rust 타깃 `aarch64-apple-ios aarch64-apple-ios-sim`.
-
-```bash
-npm run ios:init
-```
+필요: Xcode, Rust 타깃 `aarch64-apple-ios aarch64-apple-ios-sim`. Xcode 프로젝트(`src-tauri/gen/apple`)는 커밋되어 있어 `ios:init`은 다시 하지 않아도 됩니다.
 
 ```bash
 npm run ios:dev
 ```
 
+시뮬레이터용 빌드 (서명 필요 없음, 결과물: `src-tauri/gen/apple/build/arm64-sim/PopupMessenger.app`):
+
+```bash
+npx tauri ios build --debug --target aarch64-sim
+```
+
+기기용 빌드:
+
 ```bash
 npm run ios:build
 ```
 
-`ios:init`이 만드는 `src-tauri/gen/apple`은 커밋되어 있지 않습니다. 처음 만든 뒤 Xcode에서 서명 팀(Signing & Capabilities)을 정하세요.
+기기용은 서명이 필요합니다. Xcode > Settings > Accounts에 Apple ID를 추가하고, 프로젝트에 들어 있는 팀(`DEVELOPMENT_TEAM`)이 내 팀이 아니면 `APPLE_DEVELOPMENT_TEAM=<팀 ID>`를 붙여 빌드하거나 Xcode의 Signing & Capabilities에서 바꾸세요.
 
 ### 아이콘
 

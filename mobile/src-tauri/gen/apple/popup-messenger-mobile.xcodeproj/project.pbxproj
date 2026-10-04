@@ -1,0 +1,466 @@
+// !$*UTF8*$!
+{
+	archiveVersion = 1;
+	classes = {
+	};
+	objectVersion = 77;
+	objects = {
+
+/* Begin PBXBuildFile section */
+		004197A4DABE8895511960F0 /* assets in Resources */ = {isa = PBXBuildFile; fileRef = BB7F9E6D314FEE52EC924DA8 /* assets */; };
+		05550AF6C7B727C89FDF104A /* UIKit.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = F0F84929D69A4A2A08621EDB /* UIKit.framework */; };
+		0964CBC0C5D1AD9AA90D66B0 /* MetalKit.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 5223103CFD67F967A85B18DE /* MetalKit.framework */; };
+		3F0143AF207EC274885FA0DB /* Metal.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 8667DCC9A1AAAC17DF775A9E /* Metal.framework */; };
+		5D29BD9CE40F4F2896DE07F4 /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = 379AFF84875FEB93D8995AF9 /* Assets.xcassets */; };
+		619248A03B5D4B519F227D2A /* WebKit.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 6229A9D7863EF6948697AA33 /* WebKit.framework */; };
+		65A3040F524B8454C152966A /* Security.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 73BBE848614C0DA07DE4BE77 /* Security.framework */; };
+		7DD2A59C5DE7ED784B9EC45E /* libapp.a in Frameworks */ = {isa = PBXBuildFile; fileRef = 08433620D74AB025C1CFE40D /* libapp.a */; };
+		8B33E4C8796FC09D43D8455A /* LaunchScreen.storyboard in Resources */ = {isa = PBXBuildFile; fileRef = A2FB9308ED2F9E7CF26F20A5 /* LaunchScreen.storyboard */; };
+		96E127F92CDCBA2E3567A2B1 /* main.mm in Sources */ = {isa = PBXBuildFile; fileRef = E9BF0604FDD26EF823AC9002 /* main.mm */; };
+		D107DC3CEFE55CB19E67EB12 /* QuartzCore.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 7A24AE4E7B23B00BD8F72881 /* QuartzCore.framework */; };
+		D6607B57DEFEF49109E53D38 /* CoreGraphics.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 72803256D717C67C1ABCE9C7 /* CoreGraphics.framework */; };
+/* End PBXBuildFile section */
+
+/* Begin PBXFileReference section */
+		08433620D74AB025C1CFE40D /* libapp.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; path = libapp.a; sourceTree = "<group>"; };
+		08B6048146021C1734630E52 /* main.rs */ = {isa = PBXFileReference; path = main.rs; sourceTree = "<group>"; };
+		16889145BC23190489BBA8C1 /* store.rs */ = {isa = PBXFileReference; path = store.rs; sourceTree = "<group>"; };
+		1BCEB9B51B2A314C8CCCF25E /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist; path = Info.plist; sourceTree = "<group>"; };
+		379AFF84875FEB93D8995AF9 /* Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Assets.xcassets; sourceTree = "<group>"; };
+		519C7FDA8EADE31CBF3CB5F4 /* popup-messenger-mobile_iOS.entitlements */ = {isa = PBXFileReference; lastKnownFileType = text.plist.entitlements; path = "popup-messenger-mobile_iOS.entitlements"; sourceTree = "<group>"; };
+		5223103CFD67F967A85B18DE /* MetalKit.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = MetalKit.framework; path = System/Library/Frameworks/MetalKit.framework; sourceTree = SDKROOT; };
+		6229A9D7863EF6948697AA33 /* WebKit.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = WebKit.framework; path = System/Library/Frameworks/WebKit.framework; sourceTree = SDKROOT; };
+		72803256D717C67C1ABCE9C7 /* CoreGraphics.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = CoreGraphics.framework; path = System/Library/Frameworks/CoreGraphics.framework; sourceTree = SDKROOT; };
+		73BBE848614C0DA07DE4BE77 /* Security.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = Security.framework; path = System/Library/Frameworks/Security.framework; sourceTree = SDKROOT; };
+		7A24AE4E7B23B00BD8F72881 /* QuartzCore.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = QuartzCore.framework; path = System/Library/Frameworks/QuartzCore.framework; sourceTree = SDKROOT; };
+		8667DCC9A1AAAC17DF775A9E /* Metal.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = Metal.framework; path = System/Library/Frameworks/Metal.framework; sourceTree = SDKROOT; };
+		95729E01D4334B9ADEE2557C /* bindings.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = bindings.h; sourceTree = "<group>"; };
+		9D670E5A976529B9101FAC8D /* popup-messenger-mobile_iOS.app */ = {isa = PBXFileReference; includeInIndex = 0; lastKnownFileType = wrapper.application; path = "popup-messenger-mobile_iOS.app"; sourceTree = BUILT_PRODUCTS_DIR; };
+		A2FB9308ED2F9E7CF26F20A5 /* LaunchScreen.storyboard */ = {isa = PBXFileReference; lastKnownFileType = file.storyboard; path = LaunchScreen.storyboard; sourceTree = "<group>"; };
+		B41E113A8BB961753E974C99 /* lib.rs */ = {isa = PBXFileReference; path = lib.rs; sourceTree = "<group>"; };
+		BB7F9E6D314FEE52EC924DA8 /* assets */ = {isa = PBXFileReference; lastKnownFileType = folder; path = assets; sourceTree = SOURCE_ROOT; };
+		E4F062994829772153E3FAC8 /* relay.rs */ = {isa = PBXFileReference; path = relay.rs; sourceTree = "<group>"; };
+		E9BF0604FDD26EF823AC9002 /* main.mm */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.cpp.objcpp; path = main.mm; sourceTree = "<group>"; };
+		F0F84929D69A4A2A08621EDB /* UIKit.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = UIKit.framework; path = System/Library/Frameworks/UIKit.framework; sourceTree = SDKROOT; };
+/* End PBXFileReference section */
+
+/* Begin PBXFrameworksBuildPhase section */
+		137EC6A5605766A08B9D726D /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				7DD2A59C5DE7ED784B9EC45E /* libapp.a in Frameworks */,
+				D6607B57DEFEF49109E53D38 /* CoreGraphics.framework in Frameworks */,
+				3F0143AF207EC274885FA0DB /* Metal.framework in Frameworks */,
+				0964CBC0C5D1AD9AA90D66B0 /* MetalKit.framework in Frameworks */,
+				D107DC3CEFE55CB19E67EB12 /* QuartzCore.framework in Frameworks */,
+				65A3040F524B8454C152966A /* Security.framework in Frameworks */,
+				05550AF6C7B727C89FDF104A /* UIKit.framework in Frameworks */,
+				619248A03B5D4B519F227D2A /* WebKit.framework in Frameworks */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXFrameworksBuildPhase section */
+
+/* Begin PBXGroup section */
+		0A5AABBFB5AEA7A20E642FCD /* Externals */ = {
+			isa = PBXGroup;
+			children = (
+			);
+			path = Externals;
+			sourceTree = "<group>";
+		};
+		25E85EDF5F8F1C289B29F91E /* bindings */ = {
+			isa = PBXGroup;
+			children = (
+				95729E01D4334B9ADEE2557C /* bindings.h */,
+			);
+			path = bindings;
+			sourceTree = "<group>";
+		};
+		7E7CFA1ADA3DEE2E854FDACB /* popup-messenger-mobile_iOS */ = {
+			isa = PBXGroup;
+			children = (
+				1BCEB9B51B2A314C8CCCF25E /* Info.plist */,
+				519C7FDA8EADE31CBF3CB5F4 /* popup-messenger-mobile_iOS.entitlements */,
+			);
+			path = "popup-messenger-mobile_iOS";
+			sourceTree = "<group>";
+		};
+		94C7396F4C194CE49AA24623 /* Frameworks */ = {
+			isa = PBXGroup;
+			children = (
+				72803256D717C67C1ABCE9C7 /* CoreGraphics.framework */,
+				08433620D74AB025C1CFE40D /* libapp.a */,
+				8667DCC9A1AAAC17DF775A9E /* Metal.framework */,
+				5223103CFD67F967A85B18DE /* MetalKit.framework */,
+				7A24AE4E7B23B00BD8F72881 /* QuartzCore.framework */,
+				73BBE848614C0DA07DE4BE77 /* Security.framework */,
+				F0F84929D69A4A2A08621EDB /* UIKit.framework */,
+				6229A9D7863EF6948697AA33 /* WebKit.framework */,
+			);
+			name = Frameworks;
+			sourceTree = "<group>";
+		};
+		C7AB1E3877991C2EAD47A0D8 /* popup-messenger-mobile */ = {
+			isa = PBXGroup;
+			children = (
+				E9BF0604FDD26EF823AC9002 /* main.mm */,
+				25E85EDF5F8F1C289B29F91E /* bindings */,
+			);
+			path = "popup-messenger-mobile";
+			sourceTree = "<group>";
+		};
+		D5399818517B24AF161DBB49 /* src */ = {
+			isa = PBXGroup;
+			children = (
+				B41E113A8BB961753E974C99 /* lib.rs */,
+				08B6048146021C1734630E52 /* main.rs */,
+				E4F062994829772153E3FAC8 /* relay.rs */,
+				16889145BC23190489BBA8C1 /* store.rs */,
+			);
+			name = src;
+			path = ../../src;
+			sourceTree = "<group>";
+		};
+		DBFBBA461FEB435E07F7D397 /* Products */ = {
+			isa = PBXGroup;
+			children = (
+				9D670E5A976529B9101FAC8D /* popup-messenger-mobile_iOS.app */,
+			);
+			name = Products;
+			sourceTree = "<group>";
+		};
+		E3113DEBBA1C83B2C43FA169 = {
+			isa = PBXGroup;
+			children = (
+				BB7F9E6D314FEE52EC924DA8 /* assets */,
+				379AFF84875FEB93D8995AF9 /* Assets.xcassets */,
+				A2FB9308ED2F9E7CF26F20A5 /* LaunchScreen.storyboard */,
+				0A5AABBFB5AEA7A20E642FCD /* Externals */,
+				7E7CFA1ADA3DEE2E854FDACB /* popup-messenger-mobile_iOS */,
+				F9AD2095BD6451AE6F9CABA3 /* Sources */,
+				D5399818517B24AF161DBB49 /* src */,
+				94C7396F4C194CE49AA24623 /* Frameworks */,
+				DBFBBA461FEB435E07F7D397 /* Products */,
+			);
+			sourceTree = "<group>";
+		};
+		F9AD2095BD6451AE6F9CABA3 /* Sources */ = {
+			isa = PBXGroup;
+			children = (
+				C7AB1E3877991C2EAD47A0D8 /* popup-messenger-mobile */,
+			);
+			path = Sources;
+			sourceTree = "<group>";
+		};
+/* End PBXGroup section */
+
+/* Begin PBXNativeTarget section */
+		14B9D39B7C2DD6DF2F0C086E /* popup-messenger-mobile_iOS */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = 958A0D051EBAAF3206E15558 /* Build configuration list for PBXNativeTarget "popup-messenger-mobile_iOS" */;
+			buildPhases = (
+				5F8AD8ADC08C5F8ECFA10E55 /* Build Rust Code */,
+				CB5A6DE66E932E465B410418 /* Sources */,
+				17B6930BFC781E962241F119 /* Resources */,
+				137EC6A5605766A08B9D726D /* Frameworks */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+			);
+			name = "popup-messenger-mobile_iOS";
+			packageProductDependencies = (
+			);
+			productName = "popup-messenger-mobile_iOS";
+			productReference = 9D670E5A976529B9101FAC8D /* popup-messenger-mobile_iOS.app */;
+			productType = "com.apple.product-type.application";
+		};
+/* End PBXNativeTarget section */
+
+/* Begin PBXProject section */
+		1559AC14EC763C22BFFABDD5 /* Project object */ = {
+			isa = PBXProject;
+			attributes = {
+				BuildIndependentTargetsInParallel = YES;
+				LastUpgradeCheck = 1430;
+				TargetAttributes = {
+				};
+			};
+			buildConfigurationList = 20859BC2875C4571772BD3AD /* Build configuration list for PBXProject "popup-messenger-mobile" */;
+			developmentRegion = en;
+			hasScannedForEncodings = 0;
+			knownRegions = (
+				Base,
+				en,
+			);
+			mainGroup = E3113DEBBA1C83B2C43FA169;
+			minimizedProjectReferenceProxies = 1;
+			preferredProjectObjectVersion = 77;
+			productRefGroup = DBFBBA461FEB435E07F7D397 /* Products */;
+			projectDirPath = "";
+			projectRoot = "";
+			targets = (
+				14B9D39B7C2DD6DF2F0C086E /* popup-messenger-mobile_iOS */,
+			);
+		};
+/* End PBXProject section */
+
+/* Begin PBXResourcesBuildPhase section */
+		17B6930BFC781E962241F119 /* Resources */ = {
+			isa = PBXResourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				5D29BD9CE40F4F2896DE07F4 /* Assets.xcassets in Resources */,
+				8B33E4C8796FC09D43D8455A /* LaunchScreen.storyboard in Resources */,
+				004197A4DABE8895511960F0 /* assets in Resources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXResourcesBuildPhase section */
+
+/* Begin PBXShellScriptBuildPhase section */
+		5F8AD8ADC08C5F8ECFA10E55 /* Build Rust Code */ = {
+			isa = PBXShellScriptBuildPhase;
+			alwaysOutOfDate = 1;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			inputFileListPaths = (
+			);
+			inputPaths = (
+			);
+			name = "Build Rust Code";
+			outputFileListPaths = (
+			);
+			outputPaths = (
+				"$(SRCROOT)/Externals/x86_64/${CONFIGURATION}/libapp.a",
+				"$(SRCROOT)/Externals/arm64/${CONFIGURATION}/libapp.a",
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+			shellPath = /bin/sh;
+			shellScript = "npm run -- tauri ios xcode-script -v --platform \"${PLATFORM_DISPLAY_NAME:?}\" --sdk-root \"${SDKROOT:?}\" --framework-search-paths \"${FRAMEWORK_SEARCH_PATHS:?}\" --header-search-paths \"${HEADER_SEARCH_PATHS:?}\" --gcc-preprocessor-definitions \"${GCC_PREPROCESSOR_DEFINITIONS:-}\" --configuration \"${CONFIGURATION:?}\" ${FORCE_COLOR} ${ARCHS:?}\n";
+		};
+/* End PBXShellScriptBuildPhase section */
+
+/* Begin PBXSourcesBuildPhase section */
+		CB5A6DE66E932E465B410418 /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				96E127F92CDCBA2E3567A2B1 /* main.mm in Sources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXSourcesBuildPhase section */
+
+/* Begin XCBuildConfiguration section */
+		90A39E84C3E7562E21434481 /* debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ALWAYS_SEARCH_USER_PATHS = NO;
+				CLANG_ANALYZER_NONNULL = YES;
+				CLANG_ANALYZER_NUMBER_OBJECT_CONVERSION = YES_AGGRESSIVE;
+				CLANG_CXX_LANGUAGE_STANDARD = "gnu++14";
+				CLANG_CXX_LIBRARY = "libc++";
+				CLANG_ENABLE_MODULES = YES;
+				CLANG_ENABLE_OBJC_ARC = YES;
+				CLANG_ENABLE_OBJC_WEAK = YES;
+				CLANG_WARN_BLOCK_CAPTURE_AUTORELEASING = YES;
+				CLANG_WARN_BOOL_CONVERSION = YES;
+				CLANG_WARN_COMMA = YES;
+				CLANG_WARN_CONSTANT_CONVERSION = YES;
+				CLANG_WARN_DEPRECATED_OBJC_IMPLEMENTATIONS = YES;
+				CLANG_WARN_DIRECT_OBJC_ISA_USAGE = YES_ERROR;
+				CLANG_WARN_DOCUMENTATION_COMMENTS = YES;
+				CLANG_WARN_EMPTY_BODY = YES;
+				CLANG_WARN_ENUM_CONVERSION = YES;
+				CLANG_WARN_INFINITE_RECURSION = YES;
+				CLANG_WARN_INT_CONVERSION = YES;
+				CLANG_WARN_NON_LITERAL_NULL_CONVERSION = YES;
+				CLANG_WARN_OBJC_IMPLICIT_RETAIN_SELF = YES;
+				CLANG_WARN_OBJC_LITERAL_CONVERSION = YES;
+				CLANG_WARN_OBJC_ROOT_CLASS = YES_ERROR;
+				CLANG_WARN_QUOTED_INCLUDE_IN_FRAMEWORK_HEADER = YES;
+				CLANG_WARN_RANGE_LOOP_ANALYSIS = YES;
+				CLANG_WARN_STRICT_PROTOTYPES = YES;
+				CLANG_WARN_SUSPICIOUS_MOVE = YES;
+				CLANG_WARN_UNGUARDED_AVAILABILITY = YES_AGGRESSIVE;
+				CLANG_WARN_UNREACHABLE_CODE = YES;
+				CLANG_WARN__DUPLICATE_METHOD_MATCH = YES;
+				COPY_PHASE_STRIP = NO;
+				DEBUG_INFORMATION_FORMAT = dwarf;
+				ENABLE_STRICT_OBJC_MSGSEND = YES;
+				ENABLE_TESTABILITY = YES;
+				GCC_C_LANGUAGE_STANDARD = gnu11;
+				GCC_DYNAMIC_NO_PIC = NO;
+				GCC_NO_COMMON_BLOCKS = YES;
+				GCC_OPTIMIZATION_LEVEL = 0;
+				GCC_PREPROCESSOR_DEFINITIONS = (
+					"$(inherited)",
+					"DEBUG=1",
+				);
+				GCC_WARN_64_TO_32_BIT_CONVERSION = YES;
+				GCC_WARN_ABOUT_RETURN_TYPE = YES_ERROR;
+				GCC_WARN_UNDECLARED_SELECTOR = YES;
+				GCC_WARN_UNINITIALIZED_AUTOS = YES_AGGRESSIVE;
+				GCC_WARN_UNUSED_FUNCTION = YES;
+				GCC_WARN_UNUSED_VARIABLE = YES;
+				IPHONEOS_DEPLOYMENT_TARGET = 15.0;
+				MTL_ENABLE_DEBUG_INFO = INCLUDE_SOURCE;
+				MTL_FAST_MATH = YES;
+				ONLY_ACTIVE_ARCH = YES;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SDKROOT = iphoneos;
+				SWIFT_ACTIVE_COMPILATION_CONDITIONS = DEBUG;
+				SWIFT_OPTIMIZATION_LEVEL = "-Onone";
+				SWIFT_VERSION = 5.0;
+			};
+			name = debug;
+		};
+		92AFF24D999193718F754C7B /* release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ALWAYS_SEARCH_USER_PATHS = NO;
+				CLANG_ANALYZER_NONNULL = YES;
+				CLANG_ANALYZER_NUMBER_OBJECT_CONVERSION = YES_AGGRESSIVE;
+				CLANG_CXX_LANGUAGE_STANDARD = "gnu++14";
+				CLANG_CXX_LIBRARY = "libc++";
+				CLANG_ENABLE_MODULES = YES;
+				CLANG_ENABLE_OBJC_ARC = YES;
+				CLANG_ENABLE_OBJC_WEAK = YES;
+				CLANG_WARN_BLOCK_CAPTURE_AUTORELEASING = YES;
+				CLANG_WARN_BOOL_CONVERSION = YES;
+				CLANG_WARN_COMMA = YES;
+				CLANG_WARN_CONSTANT_CONVERSION = YES;
+				CLANG_WARN_DEPRECATED_OBJC_IMPLEMENTATIONS = YES;
+				CLANG_WARN_DIRECT_OBJC_ISA_USAGE = YES_ERROR;
+				CLANG_WARN_DOCUMENTATION_COMMENTS = YES;
+				CLANG_WARN_EMPTY_BODY = YES;
+				CLANG_WARN_ENUM_CONVERSION = YES;
+				CLANG_WARN_INFINITE_RECURSION = YES;
+				CLANG_WARN_INT_CONVERSION = YES;
+				CLANG_WARN_NON_LITERAL_NULL_CONVERSION = YES;
+				CLANG_WARN_OBJC_IMPLICIT_RETAIN_SELF = YES;
+				CLANG_WARN_OBJC_LITERAL_CONVERSION = YES;
+				CLANG_WARN_OBJC_ROOT_CLASS = YES_ERROR;
+				CLANG_WARN_QUOTED_INCLUDE_IN_FRAMEWORK_HEADER = YES;
+				CLANG_WARN_RANGE_LOOP_ANALYSIS = YES;
+				CLANG_WARN_STRICT_PROTOTYPES = YES;
+				CLANG_WARN_SUSPICIOUS_MOVE = YES;
+				CLANG_WARN_UNGUARDED_AVAILABILITY = YES_AGGRESSIVE;
+				CLANG_WARN_UNREACHABLE_CODE = YES;
+				CLANG_WARN__DUPLICATE_METHOD_MATCH = YES;
+				COPY_PHASE_STRIP = NO;
+				DEBUG_INFORMATION_FORMAT = "dwarf-with-dsym";
+				ENABLE_NS_ASSERTIONS = NO;
+				ENABLE_STRICT_OBJC_MSGSEND = YES;
+				GCC_C_LANGUAGE_STANDARD = gnu11;
+				GCC_NO_COMMON_BLOCKS = YES;
+				GCC_WARN_64_TO_32_BIT_CONVERSION = YES;
+				GCC_WARN_ABOUT_RETURN_TYPE = YES_ERROR;
+				GCC_WARN_UNDECLARED_SELECTOR = YES;
+				GCC_WARN_UNINITIALIZED_AUTOS = YES_AGGRESSIVE;
+				GCC_WARN_UNUSED_FUNCTION = YES;
+				GCC_WARN_UNUSED_VARIABLE = YES;
+				IPHONEOS_DEPLOYMENT_TARGET = 15.0;
+				MTL_ENABLE_DEBUG_INFO = NO;
+				MTL_FAST_MATH = YES;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SDKROOT = iphoneos;
+				SWIFT_COMPILATION_MODE = wholemodule;
+				SWIFT_OPTIMIZATION_LEVEL = "-O";
+				SWIFT_VERSION = 5.0;
+			};
+			name = release;
+		};
+		BB9E3CC7B72784BE47C4AC85 /* release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ALWAYS_EMBED_SWIFT_STANDARD_LIBRARIES = YES;
+				ARCHS = (
+					arm64,
+				);
+				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
+				CODE_SIGN_ENTITLEMENTS = "popup-messenger-mobile_iOS/popup-messenger-mobile_iOS.entitlements";
+				CODE_SIGN_IDENTITY = "iPhone Developer";
+				ENABLE_BITCODE = NO;
+				"EXCLUDED_ARCHS[sdk=iphoneos*]" = x86_64;
+				FRAMEWORK_SEARCH_PATHS = (
+					"$(inherited)",
+					"\".\"",
+				);
+				INFOPLIST_FILE = "popup-messenger-mobile_iOS/Info.plist";
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+				);
+				"LIBRARY_SEARCH_PATHS[arch=arm64]" = "$(inherited) $(PROJECT_DIR)/Externals/arm64/$(CONFIGURATION) $(SDKROOT)/usr/lib/swift $(DEVELOPER_DIR)/Toolchains/XcodeDefault.xctoolchain/usr/lib/swift/$(PLATFORM_NAME) $(DEVELOPER_DIR)/Toolchains/XcodeDefault.xctoolchain/usr/lib/swift-5.0/$(PLATFORM_NAME)";
+				"LIBRARY_SEARCH_PATHS[arch=x86_64]" = "$(inherited) $(PROJECT_DIR)/Externals/x86_64/$(CONFIGURATION) $(SDKROOT)/usr/lib/swift $(DEVELOPER_DIR)/Toolchains/XcodeDefault.xctoolchain/usr/lib/swift/$(PLATFORM_NAME) $(DEVELOPER_DIR)/Toolchains/XcodeDefault.xctoolchain/usr/lib/swift-5.0/$(PLATFORM_NAME)";
+				PRODUCT_BUNDLE_IDENTIFIER = com.popupmessenger.mobile;
+				PRODUCT_NAME = "PopupMessenger";
+				SDKROOT = iphoneos;
+				TARGETED_DEVICE_FAMILY = "1,2";
+				VALID_ARCHS = arm64;
+				DEVELOPMENT_TEAM = "79KAJRXRUR";
+			};
+			name = release;
+		};
+		DD267ECB47D92D3E94E94EE8 /* debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ALWAYS_EMBED_SWIFT_STANDARD_LIBRARIES = YES;
+				ARCHS = (
+					arm64,
+				);
+				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
+				CODE_SIGN_ENTITLEMENTS = "popup-messenger-mobile_iOS/popup-messenger-mobile_iOS.entitlements";
+				CODE_SIGN_IDENTITY = "iPhone Developer";
+				ENABLE_BITCODE = NO;
+				"EXCLUDED_ARCHS[sdk=iphoneos*]" = x86_64;
+				FRAMEWORK_SEARCH_PATHS = (
+					"$(inherited)",
+					"\".\"",
+				);
+				INFOPLIST_FILE = "popup-messenger-mobile_iOS/Info.plist";
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+				);
+				"LIBRARY_SEARCH_PATHS[arch=arm64]" = "$(inherited) $(PROJECT_DIR)/Externals/arm64/$(CONFIGURATION) $(SDKROOT)/usr/lib/swift $(DEVELOPER_DIR)/Toolchains/XcodeDefault.xctoolchain/usr/lib/swift/$(PLATFORM_NAME) $(DEVELOPER_DIR)/Toolchains/XcodeDefault.xctoolchain/usr/lib/swift-5.0/$(PLATFORM_NAME)";
+				"LIBRARY_SEARCH_PATHS[arch=x86_64]" = "$(inherited) $(PROJECT_DIR)/Externals/x86_64/$(CONFIGURATION) $(SDKROOT)/usr/lib/swift $(DEVELOPER_DIR)/Toolchains/XcodeDefault.xctoolchain/usr/lib/swift/$(PLATFORM_NAME) $(DEVELOPER_DIR)/Toolchains/XcodeDefault.xctoolchain/usr/lib/swift-5.0/$(PLATFORM_NAME)";
+				PRODUCT_BUNDLE_IDENTIFIER = com.popupmessenger.mobile;
+				PRODUCT_NAME = "PopupMessenger";
+				SDKROOT = iphoneos;
+				TARGETED_DEVICE_FAMILY = "1,2";
+				VALID_ARCHS = arm64;
+				DEVELOPMENT_TEAM = "79KAJRXRUR";
+			};
+			name = debug;
+		};
+/* End XCBuildConfiguration section */
+
+/* Begin XCConfigurationList section */
+		20859BC2875C4571772BD3AD /* Build configuration list for PBXProject "popup-messenger-mobile" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				90A39E84C3E7562E21434481 /* debug */,
+				92AFF24D999193718F754C7B /* release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = debug;
+		};
+		958A0D051EBAAF3206E15558 /* Build configuration list for PBXNativeTarget "popup-messenger-mobile_iOS" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				DD267ECB47D92D3E94E94EE8 /* debug */,
+				BB9E3CC7B72784BE47C4AC85 /* release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = debug;
+		};
+/* End XCConfigurationList section */
+	};
+	rootObject = 1559AC14EC763C22BFFABDD5 /* Project object */;
+}

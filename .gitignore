@@ -10,6 +10,9 @@ mobile/src-tauri/gen/schemas/
 mobile/plugin/target/
 mobile/plugin/android/.tauri/
 mobile/plugin/ios/.tauri/
+mobile/plugin/.tauri/
+mobile/plugin/ios/Package.resolved
+mobile/plugin/ios/.build/
 mobile/plugin/permissions/
 mobile/plugin/android/build/
 mobile/plugin/android/.gradle/

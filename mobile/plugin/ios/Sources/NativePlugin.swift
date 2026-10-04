@@ -8,9 +8,20 @@ struct PathArgs: Decodable {
   let path: String
 }
 
+struct KeepRunningArgs: Decodable {
+  let on: Bool
+}
+
 class NativePlugin: Plugin, UIDocumentInteractionControllerDelegate {
   // Kept alive while its preview is on screen.
   private var doc: UIDocumentInteractionController?
+
+  // The page lays itself out edge to edge with CSS env(safe-area-inset-*). Left on
+  // .automatic, the scroll view also insets by the safe area, so the page ended
+  // above the home indicator and the strip below it showed the white native view.
+  override func load(webview: WKWebView) {
+    webview.scrollView.contentInsetAdjustmentBehavior = .never
+  }
 
   private func fileURL(_ invoke: Invoke) -> URL? {
     guard let args = try? invoke.parseArgs(PathArgs.self) else {
@@ -89,6 +100,33 @@ class NativePlugin: Plugin, UIDocumentInteractionControllerDelegate {
       self.anchor(picker, in: host)
       host.present(picker, animated: true)
       invoke.resolve(["saved": ""])
+    }
+  }
+
+  // Background time held while the relay connection signs off (see keepRunning).
+  private var task: UIBackgroundTaskIdentifier = .invalid
+
+  /// iOS freezes an app as soon as it leaves the screen, which would leave the relay
+  /// connection open and the device looking online. The app asks for a few seconds
+  /// of background time while connected and gives it back once it has logged off.
+  @objc public func keepRunning(_ invoke: Invoke) throws {
+    let args = try invoke.parseArgs(KeepRunningArgs.self)
+    DispatchQueue.main.async {
+      if args.on {
+        if self.task == .invalid {
+          self.task = UIApplication.shared.beginBackgroundTask(withName: "relay-logout") { self.endTask() }
+        }
+      } else {
+        self.endTask()
+      }
+      invoke.resolve()
+    }
+  }
+
+  private func endTask() {
+    if task != .invalid {
+      UIApplication.shared.endBackgroundTask(task)
+      task = .invalid
     }
   }
 

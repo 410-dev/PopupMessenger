@@ -68,6 +68,16 @@ impl<R: Runtime> Native<R> {
         #[cfg(mobile)]
         let _ = self.call::<serde_json::Value>("haptic", "");
     }
+
+    /// iOS: asks for (`true`) or gives back (`false`) a little time to keep running
+    /// after the app leaves the screen, so the relay connection can sign off instead
+    /// of being frozen open. Android keeps running on its own for that long.
+    pub fn keep_running(&self, on: bool) {
+        #[cfg(target_os = "ios")]
+        let _ = self.handle.run_mobile_plugin::<serde_json::Value>("keepRunning", serde_json::json!({ "on": on }));
+        #[cfg(not(target_os = "ios"))]
+        let _ = on;
+    }
 }
 
 #[cfg(not(mobile))]

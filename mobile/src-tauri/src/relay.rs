@@ -114,6 +114,8 @@ pub struct Relay {
     fg: Notify,
     /// Transfers in flight; the connection stays up for them.
     busy: AtomicUsize,
+    /// Whether the app should keep running off screen until it has logged off.
+    keep_running: AtomicBool,
 }
 
 impl Relay {
@@ -199,12 +201,31 @@ pub fn set_foreground(app: &AppHandle, on: bool) {
             None
         }
     };
+    keep_running(app, !on && st.relay.online());
     st.relay.fg.notify_one();
     // Back after the grace period: the OS may have frozen the app with the
     // connection still open, so start over and fetch what arrived meanwhile.
     if on && st.relay.online() && away.is_some_and(|d| d > GRACE + Duration::from_secs(2)) {
         st.relay.wake.notify_one();
     }
+}
+
+/// iOS freezes the app as soon as it leaves the screen; without some background
+/// time the logoff below never runs and the device stays online with a dead
+/// connection. Only the latest wish is applied, from a worker thread: `foreground`
+/// runs on the main thread, where a blocking plugin call would deadlock.
+fn keep_running(app: &AppHandle, on: bool) {
+    let st = app.state::<App>();
+    if st.relay.keep_running.swap(on, Ordering::SeqCst) == on {
+        return;
+    }
+    let app = app.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        use tauri_plugin_pm_native::NativeExt;
+        static ONE_AT_A_TIME: Mutex<()> = Mutex::new(());
+        let _g = ONE_AT_A_TIME.lock().unwrap();
+        app.native().keep_running(app.state::<App>().relay.keep_running.load(Ordering::SeqCst));
+    });
 }
 
 // ---------------------------------------------------------------- setup
@@ -396,6 +417,7 @@ async fn manager(app: AppHandle) {
         }
         set_conn(&app, "connecting", "");
         let r = session(&app, &cfg).await;
+        keep_running(&app, false);
         *st.relay.session.lock().unwrap() = None;
         *st.relay.out.lock().unwrap() = None;
         st.relay.waiting.lock().unwrap().clear();
