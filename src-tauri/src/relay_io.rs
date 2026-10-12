@@ -299,10 +299,25 @@ pub async fn read_frame<R: AsyncRead + Unpin + ?Sized>(r: &mut R, wait: Duration
     .map_err(|_| "서버 응답 시간 초과".to_string())?
 }
 
+/// Start of the error for a tenancy the server does not have (protocol 8).
+pub const UNKNOWN_TENANCY: &str = "이 서버에 없는 Tenancy ID입니다";
+
 pub async fn hello(io: &mut Stream) -> Result<Value, String> {
+    hello_in(io, None).await
+}
+
+/// `hello` naming the tenancy to log on to (none: the unmigrated tenancy).
+pub async fn hello_in(io: &mut Stream, tenancy: Option<&str>) -> Result<Value, String> {
     let app = env!("CARGO_PKG_VERSION");
-    write_frame(io, &json!({ "t": "hello", "rid": "h", "proto": PROTO, "app": app })).await?;
+    let mut req = json!({ "t": "hello", "rid": "h", "proto": PROTO, "app": app });
+    if let Some(t) = tenancy.filter(|t| !t.is_empty()) {
+        req["tenancy"] = json!(t);
+    }
+    write_frame(io, &req).await?;
     let h = read_frame(io, IO_TIMEOUT).await?;
+    if h["code"] == "unknown_tenancy" {
+        return Err(format!("{UNKNOWN_TENANCY} ({}). 관리자에게 받은 Tenancy ID를 확인하세요", tenancy.unwrap_or("")));
+    }
     if h["t"] != "hello" {
         return Err(h["reason"].as_str().unwrap_or("릴레이 서버가 아닙니다").to_string());
     }
@@ -317,7 +332,8 @@ pub fn err_text(v: &Value) -> String {
 }
 
 /// Connects without trusting anything yet and returns what the user must confirm.
-pub async fn probe(addr: &str) -> Result<Value, String> {
+/// `tenancy`: the one to ask for (none: the unmigrated tenancy).
+pub async fn probe_in(addr: &str, tenancy: Option<&str>) -> Result<Value, String> {
     let ep = parse_endpoint(addr)?;
     let url = ep.to_url();
     let (tls, mut io, seen) = match ep.tls {
@@ -334,7 +350,7 @@ pub async fn probe(addr: &str) -> Result<Value, String> {
             },
         },
     };
-    let h = hello(&mut io).await?;
+    let h = hello_in(&mut io, tenancy).await?;
     // A plain connection to a TLS-only server gets tls_required right after hello.
     if !tls {
         if let Ok(e) = read_frame(&mut io, Duration::from_millis(500)).await {
@@ -349,7 +365,7 @@ pub async fn probe(addr: &str) -> Result<Value, String> {
     }
     Ok(json!({
         "url": url, "tls": tls, "ws": ep.ws, "fingerprint": seen.fingerprint, "trusted": seen.trusted,
-        "server": h["server"], "policy": h["policy"],
+        "server": h["server"], "policy": h["policy"], "tenancy": h["tenancy"], "features": h["features"],
     }))
 }
 

@@ -2,7 +2,8 @@
 // PopupMessenger mobile. One page: the setup screen until the phone has joined a
 // relay server, then tabs (received, sent, people, settings) with sheets stacked on
 // top (reading, writing, picking recipients). Sheets are history entries, so the
-// Android back button closes them.
+// Android back button closes them. The phone may have several relay connections
+// (a server and a tenancy each); contacts and recipients carry their connection.
 
 const T = window.__TAURI__;
 const invoke = T.core.invoke;
@@ -24,10 +25,12 @@ window.__pmInsets = (top, bottom, left, right, ime) => {
 
 const S = {
   version: '', platform: '',
-  settings: {}, relay: { linked: false },
-  contacts: [], inbox: [], sent: [],
+  settings: {}, relay: { linked: false, connections: [] },
+  contacts: [], departments: [], inbox: [], sent: [],
   screen: '', tab: 'inbox',
-  setup: { step: 1, addr: '', probe: null, mode: 'login', err: '', busy: false },
+  setup: { step: 1, addr: '', tenancy: '', probe: null, mode: 'login', err: '', busy: false },
+  // Adding another connection from settings (the setup screen with a way back).
+  adding: false,
   search: '',
   popups: [],
 };
@@ -123,7 +126,21 @@ const STATE = {
 const dot = (state) => h('span', { class: `dot s-${state || 'off'}`, title: STATE[state] || STATE.off });
 const avatar = (name, state) => h('div', { class: 'avatar' }, initial(name), state && dot(state));
 const handle = (u) => u && h('span', { class: 'handle' }, `@${u}`);
-const contactOf = (acc) => S.contacts.find((c) => c.account === acc);
+
+// Connections. Messages and recipients saved before there were several name none:
+// they belong to the first.
+const conns = () => S.relay.connections || [];
+const connId = (id) => id || conns()[0]?.id || '';
+const connOf = (id) => conns().find((c) => c.id === connId(id));
+const multi = () => conns().length > 1;
+/** Which connection something belongs to, shown only when there are several. */
+const connTag = (id) => multi() && connOf(id) && h('span', { class: 'tag' }, connOf(id).label);
+const contactOf = (conn, acc) => S.contacts.find((c) => c.conn === connId(conn) && c.account === acc);
+/** The address of a sender who is not in the contacts (another tenancy). */
+const strangerAddr = (m) => (m.from_address && !contactOf(m.conn, m.from) ? m.from_address : '');
+/** Recipients are {conn, to, name}; this tells them apart. */
+const rkey = (t) => `${connId(t.conn)}|${t.to}`;
+const TENANCY_RE = /^[a-z0-9](?:[a-z0-9-]{0,30}[a-z0-9])$/;
 
 // ---------------------------------------------------------------- sheets & history
 
@@ -193,7 +210,9 @@ function sheet(title, { left, right, sub } = {}) {
 // ---------------------------------------------------------------- data
 
 async function loadRelay() { S.relay = await invoke('relay_info'); }
-async function loadContacts() { S.contacts = S.relay.linked ? await invoke('contacts') : []; }
+async function loadContacts() {
+  [S.contacts, S.departments] = S.relay.linked ? await Promise.all([invoke('contacts'), invoke('departments')]) : [[], []];
+}
 async function loadMessages() {
   const m = await invoke('messages');
   S.inbox = m.inbox;
@@ -204,7 +223,7 @@ async function loadMessages() {
 
 function route() {
   const r = S.relay;
-  const want = !r.linked ? 'setup' : (r.state === 'pending' || r.state === 'fatal') ? 'blocked' : 'main';
+  const want = !r.linked || S.adding ? 'setup' : (r.state === 'pending' || r.state === 'fatal') ? 'blocked' : 'main';
   if (want !== S.screen) {
     S.screen = want;
     if (want !== 'main') closeAllLayers();
@@ -225,12 +244,20 @@ function drawSetup() {
     const addr = h('input', { type: 'url', inputmode: 'url', autocapitalize: 'off', autocorrect: 'off', spellcheck: false,
       placeholder: 'https://relay.example.com', value: st.addr, enterkeyhint: 'next',
       oninput: (e) => { st.addr = e.target.value; },
+      onkeydown: (e) => { if (e.key === 'Enter') tenancy.focus(); } });
+    const tenancy = h('input', { autocapitalize: 'off', autocorrect: 'off', spellcheck: false, autocomplete: 'off',
+      placeholder: 'example', value: st.tenancy, enterkeyhint: 'next', maxlength: 32,
+      oninput: (e) => { st.tenancy = e.target.value; },
       onkeydown: (e) => { if (e.key === 'Enter') next(); } });
     const next = async () => {
+      const tn = st.tenancy.trim().toLowerCase();
       if (!st.addr.trim()) { st.err = '서버 주소를 입력하세요'; return drawSetup(); }
+      if (!tn) { st.err = 'Tenancy ID를 입력하세요'; return drawSetup(); }
+      if (!TENANCY_RE.test(tn)) { st.err = "Tenancy ID는 영문 소문자, 숫자, '-'로 된 2~32자입니다"; return drawSetup(); }
+      st.tenancy = tn;
       st.busy = true; st.err = ''; drawSetup();
       try {
-        st.probe = await invoke('probe', { url: st.addr.trim() });
+        st.probe = await invoke('probe', { url: st.addr.trim(), tenancy: tn });
         st.step = 2;
         const p = st.probe.policy || {};
         st.mode = p.auth === 'password' ? 'login' : 'device';
@@ -238,18 +265,33 @@ function drawSetup() {
       st.busy = false;
       drawSetup();
     };
+    const cancel = async () => {
+      S.adding = false;
+      S.setup = { step: 1, addr: '', tenancy: '', probe: null, mode: 'login', err: '', busy: false };
+      route();
+    };
     body = [
-      h('div', { class: 'hero' },
-        h('img', { src: 'icon.png', alt: '' }),
-        h('h1', {}, 'PopupMessenger'),
-        h('div', { class: 'muted' }, '모바일 앱은 릴레이 서버를 통해서만 쪽지를 주고받습니다. 먼저 사용할 릴레이 서버에 연결하세요.')),
+      S.adding
+        ? h('div', { class: 'hero' }, h('h1', {}, '릴레이 연결 추가'),
+          h('div', { class: 'muted' }, '다른 서버나 같은 서버의 다른 Tenancy(조직)에 이 휴대폰을 함께 연결합니다.'))
+        : h('div', { class: 'hero' },
+          h('img', { src: 'icon.png', alt: '' }),
+          h('h1', {}, 'PopupMessenger'),
+          h('div', { class: 'muted' }, '모바일 앱은 릴레이 서버를 통해서만 쪽지를 주고받습니다. 먼저 사용할 릴레이 서버에 연결하세요.')),
       h('div', { class: 'card' },
         h('label', { class: 'f' }, '릴레이 서버 주소', addr),
         h('div', { class: 'muted' }, '예: https://relay.example.com, relay.example.com:45443'),
+        h('label', { class: 'f' }, 'Tenancy ID', tenancy),
+        h('div', { class: 'muted' }, '관리자에게 받은 조직 ID입니다 (영문 소문자, 숫자, -).'),
         errEl,
         h('button', { class: 'btn primary', disabled: st.busy, onclick: next }, st.busy ? '확인하는 중…' : '다음')),
+      S.adding && h('button', { class: 'btn', onclick: cancel }, '취소'),
     ];
-    requestAnimationFrame(() => { if (!st.busy && !st.addr) addr.focus(); });
+    requestAnimationFrame(() => {
+      if (st.busy) return;
+      if (!st.addr) addr.focus();
+      else if (!st.tenancy) tenancy.focus();
+    });
   } else if (st.step === 2) {
     const p = st.probe;
     const pol = p.policy || {};
@@ -261,15 +303,18 @@ function drawSetup() {
     const enc = { plain: '없음', tls: '통신 구간 (TLS)', e2ee: '종단간 암호화' }[pol.encryption] || pol.encryption || '-';
     const reg = { closed: '관리자가 만든 계정만', approval: '가입 신청 후 관리자 승인', open: '누구나 가입' }[pol.registration] || '-';
     body = [
-      h('div', { class: 'hero' }, h('h1', {}, p.server?.name || '릴레이 서버'), h('div', { class: 'muted' }, p.url)),
+      h('div', { class: 'hero' }, h('h1', {}, p.tenancy?.name || p.server?.name || '릴레이 서버'), h('div', { class: 'muted' }, p.url)),
       h('div', { class: 'card' },
         h('div', { class: 'kv' },
+          h('span', {}, '조직'), h('span', {}, p.tenancy ? `${p.tenancy.name || p.tenancy.id} (${p.tenancy.id})` : '-'),
+          h('span', {}, '서버'), h('span', {}, p.server?.name || '-'),
           h('span', {}, '버전'), h('span', {}, p.server?.version || '-'),
           h('span', {}, '연결'), h('span', {}, `${p.ws ? 'WebSocket' : 'TCP'}${p.tls ? ' + TLS' : ''}`),
           h('span', {}, '로그인'), h('span', {}, pol.auth === 'password' ? '사용자 이름과 비밀번호' : '기기 등록만'),
           h('span', {}, '가입'), h('span', {}, reg),
           h('span', {}, '암호화'), h('span', {}, enc),
           p.fingerprint && h('span', {}, '인증서 지문'), p.fingerprint && h('span', { class: 'mono sel' }, fp(p.fingerprint))),
+        !p.tenancy && h('div', { class: 'warn' }, 'Tenancy를 지원하지 않는 이전 버전 서버입니다. Tenancy ID 없이 연결합니다.'),
         trust),
       h('div', { class: 'btns' },
         h('button', { class: 'btn', onclick: () => { st.step = 1; st.err = ''; drawSetup(); } }, '뒤로'),
@@ -286,7 +331,7 @@ function drawSetupAccount(st, errEl) {
   const pol = p.policy || {};
   const password = pol.auth === 'password';
   const canRegister = password && pol.registration && pol.registration !== 'closed';
-  const f = st.form || (st.form = { user: '', pass: '', pass2: '', name: '' });
+  const f = st.form || (st.form = { user: '', pass: '', pass2: '', name: S.adding ? S.settings.name || '' : '' });
   const field = (label, key, attrs = {}) => h('label', { class: 'f' }, label,
     h('input', { value: f[key], autocapitalize: 'off', autocorrect: 'off', spellcheck: false, ...attrs, oninput: (e) => { f[key] = e.target.value; } }));
   const go = async () => {
@@ -297,9 +342,11 @@ function drawSetupAccount(st, errEl) {
     if (!name) { st.err = '이름을 입력하세요'; return drawSetup(); }
     st.busy = true; st.err = ''; drawSetup();
     try {
-      await invoke('join', { url: p.url, tls: p.tls, fingerprint: p.fingerprint || '', mode, user: f.user, pass: f.pass, name });
+      await invoke('join', { url: p.url, tls: p.tls, fingerprint: p.fingerprint || '', tenancy: st.tenancy, mode, user: f.user, pass: f.pass, name });
       f.pass = f.pass2 = '';
-      S.setup = { step: 1, addr: '', probe: null, mode: 'login', err: '', busy: false };
+      if (S.adding) toast(`${p.tenancy?.name || p.server?.name || '릴레이 서버'}에 연결했습니다`);
+      S.adding = false;
+      S.setup = { step: 1, addr: '', tenancy: '', probe: null, mode: 'login', err: '', busy: false };
       await boot();
       return;
     } catch (e) { st.err = err(e); }
@@ -311,7 +358,7 @@ function drawSetupAccount(st, errEl) {
     h('button', { class: st.mode === 'register' ? 'on' : '', onclick: () => { st.mode = 'register'; st.err = ''; drawSetup(); } }, pol.registration === 'open' ? '가입' : '가입 신청'));
   const action = { login: '로그인', register: pol.registration === 'open' ? '가입하고 시작' : '가입 신청', device: '이 기기 등록' }[st.mode];
   return [
-    h('div', { class: 'hero' }, h('h1', {}, p.server?.name || '릴레이 서버'), h('div', { class: 'muted' }, password ? '계정으로 로그인하면 이 휴대폰이 계정의 기기로 등록됩니다. 비밀번호는 저장하지 않습니다.' : '이 휴대폰을 서버에 기기로 등록합니다.')),
+    h('div', { class: 'hero' }, h('h1', {}, p.tenancy?.name || p.server?.name || '릴레이 서버'), h('div', { class: 'muted' }, password ? '계정으로 로그인하면 이 휴대폰이 계정의 기기로 등록됩니다. 비밀번호는 저장하지 않습니다.' : '이 휴대폰을 서버에 기기로 등록합니다.')),
     tabs,
     h('div', { class: 'card' },
       password && field('사용자 이름', 'user', { enterkeyhint: 'next', autocomplete: 'username' }),
@@ -327,24 +374,27 @@ function drawSetupAccount(st, errEl) {
 
 // ---------------------------------------------------------------- blocked (pending approval, rejected)
 
+/** Every connection waits for an admin or was refused. */
 function drawBlocked() {
   const r = S.relay;
   const pending = r.state === 'pending';
-  const leave = async () => {
-    if (!await ask('이 서버와의 연결을 끊고 다른 서버를 연결할까요?', '다른 서버 연결')) return;
-    await invoke('unlink');
+  const remove = async (c) => {
+    if (!await ask(`'${c.label}' 연결을 지울까요?`, '지우기', true)) return;
+    await invoke('unlink', { conn: c.id });
     await boot();
   };
+  const add = () => { S.adding = true; route(); };
   put($app, h('div', { class: 'scroll' }, h('div', { class: 'pad', style: 'padding-top:calc(var(--top) + 48px)' },
     h('div', { class: 'hero' },
       h('div', { style: 'font-size:48px' }, pending ? '⏳' : '⚠️'),
-      h('h1', {}, pending ? '관리자 승인을 기다리는 중' : '릴레이 서버에 로그온할 수 없습니다'),
-      h('div', { class: 'muted' }, r.server_name || r.url)),
-    h('div', { class: 'card' },
-      h('div', {}, r.message || (pending ? '승인되면 자동으로 시작합니다.' : '')),
-      h('div', { class: 'muted' }, pending ? '승인되면 앱을 쓸 수 있습니다. 앱을 열어 두면 자동으로 다시 확인합니다.' : '관리자에게 계정과 기기 상태를 확인하세요.')),
-    h('button', { class: 'btn primary', onclick: () => { invoke('reconnect'); toast('다시 확인하는 중…'); } }, pending ? '지금 다시 확인' : '다시 시도'),
-    h('button', { class: 'btn', onclick: leave }, '다른 서버 연결'))));
+      h('h1', {}, pending ? '관리자 승인을 기다리는 중' : '릴레이 서버에 로그온할 수 없습니다')),
+    conns().map((c) => h('div', { class: 'card' },
+      h('b', {}, c.label), h('div', { class: 'muted' }, c.server_name && c.server_name !== c.label ? `${c.server_name} · ${c.url}` : c.url),
+      h('div', {}, c.message || (c.state === 'pending' ? '승인되면 자동으로 시작합니다.' : '')),
+      h('div', { class: 'muted' }, c.state === 'pending' ? '승인되면 앱을 쓸 수 있습니다. 앱을 열어 두면 자동으로 다시 확인합니다.' : '관리자에게 계정과 기기 상태를 확인하세요.'),
+      h('div', { class: 'btns' }, h('button', { class: 'btn small danger', onclick: () => remove(c) }, '연결 지우기')))),
+    h('button', { class: 'btn primary', onclick: () => { invoke('reconnect', {}); toast('다시 확인하는 중…'); } }, pending ? '지금 다시 확인' : '다시 시도'),
+    h('button', { class: 'btn', onclick: add }, '다른 서버 연결'))));
 }
 
 // ---------------------------------------------------------------- main (tabs)
@@ -356,15 +406,20 @@ const TABS = [
   { id: 'settings', label: '설정', icon: 'gear' },
 ];
 
+/** One line for the connection that most needs attention. */
 function connBanner() {
-  const r = S.relay;
-  if (r.state === 'online') return r.message ? h('div', { class: 'banner' }, h('span', {}, r.message)) : null;
-  if (r.state === 'connecting' || r.state === 'paused' || r.state === 'off') return h('div', { class: 'banner' }, h('span', {}, '릴레이 서버에 연결하는 중…'));
-  if (r.state === 'error') {
-    return h('div', { class: 'banner err' }, h('span', {}, `연결 안 됨${r.message ? ': ' + r.message : ''}`),
-      h('button', { onclick: () => invoke('reconnect') }, '다시 시도'));
+  const name = (c) => (multi() ? `${c.label}: ` : '');
+  const bad = conns().find((c) => c.state === 'error');
+  if (bad) {
+    return h('div', { class: 'banner err' }, h('span', {}, `${name(bad)}연결 안 됨${bad.message ? ': ' + bad.message : ''}`),
+      h('button', { onclick: () => invoke('reconnect', { conn: bad.id }) }, '다시 시도'));
   }
-  return null;
+  const waiting = conns().find((c) => c.state === 'connecting' || c.state === 'paused' || c.state === 'off');
+  if (waiting) return h('div', { class: 'banner' }, h('span', {}, `${name(waiting)}릴레이 서버에 연결하는 중…`));
+  const refused = conns().find((c) => c.state === 'pending' || c.state === 'fatal');
+  if (refused) return h('div', { class: 'banner err' }, h('span', {}, `${name(refused)}${refused.message || CONN[refused.state]}`));
+  const note = conns().find((c) => c.state === 'online' && c.message);
+  return note ? h('div', { class: 'banner' }, h('span', {}, `${name(note)}${note.message}`)) : null;
 }
 
 function drawMain() {
@@ -391,7 +446,7 @@ function drawMain() {
     actions = [];
     content = settingsView();
   }
-  const sub = S.relay.server_name || '';
+  const sub = multi() ? `릴레이 ${conns().length}개` : conns()[0]?.label || '';
   const scroll = h('div', { class: 'scroll', 'data-tab': S.tab }, content);
   put($app,
     h('div', { class: 'bar' }, h('h1', {}, title, sub && S.tab === 'inbox' && h('span', { class: 'sub' }, sub)), actions),
@@ -413,7 +468,7 @@ function drawMain() {
 
 function searchBox() {
   return h('div', { class: 'search' },
-    h('input', { id: 'search', type: 'search', placeholder: '이름 또는 @사용자 이름', value: S.search, autocapitalize: 'off', autocorrect: 'off', spellcheck: false,
+    h('input', { id: 'search', type: 'search', placeholder: '이름, 부서, @사용자 이름 또는 주소', value: S.search, autocapitalize: 'off', autocorrect: 'off', spellcheck: false,
       oninput: (e) => { S.search = e.target.value; drawMain(); } }));
 }
 
@@ -421,13 +476,15 @@ function inboxList() {
   if (!S.inbox.length) return h('div', { class: 'empty' }, h('div', { class: 'g' }, ic('inbox', 44)), '받은 쪽지가 없습니다',
     h('div', { class: 'muted' }, '앱이 꺼져 있는 동안 온 쪽지는 릴레이 서버가 보관했다가, 앱을 열면 받아 옵니다.'));
   return h('div', { class: 'list' }, S.inbox.map((m) => {
-    const c = contactOf(m.from);
+    const c = contactOf(m.conn, m.from);
     const preview = m.text || m.note || (m.files.length ? m.files.map((f) => f.name).join(', ') : '');
+    const addr = strangerAddr(m);
     return h('div', { class: `row${m.read ? '' : ' unread'}`, onclick: () => openMessage(m.id) },
       h('span', { class: `unread-dot${m.read ? ' no' : ''}` }),
       avatar(m.from_name, c?.state),
       h('div', { class: 'main' },
-        h('div', { class: 't1' }, h('b', {}, m.from_name || '알 수 없음'), m.group && h('span', { class: 'tag' }, m.group.name || `${m.group.members.length}명`),
+        h('div', { class: 't1' }, h('b', {}, m.from_name || '알 수 없음'), addr && h('span', { class: 'handle' }, addr),
+          m.group && h('span', { class: 'tag' }, m.group.name || `${m.group.members.length}명`),
           h('span', { class: 'when' }, time(m.ts))),
         h('div', { class: 't2' }, m.files.length ? h('span', { class: 'clip' }, '📎 ') : null, preview)));
   }));
@@ -458,13 +515,52 @@ function matches(c, q) {
     || c.devices.some((d) => (d.name || '').toLowerCase().includes(q));
 }
 
-/** Looks up an exact username on the server (needed on "lookup" servers). */
+const deptMatches = (d, q) => !q || (d.name || '').toLowerCase().includes(q.toLowerCase()) || d.id.includes(q.toLowerCase());
+
+/** Looks up an exact username on the servers (needed on "lookup" servers). */
 async function lookupUser(q, after) {
   try {
     const c = await invoke('lookup', { query: q });
     await loadContacts();
     after?.(c);
   } catch (e) { toast(err(e)); }
+}
+
+/** Checks a typed address with its server; `after` gets a recipient. Rejections show as they come. */
+async function resolveAddress(q, after) {
+  toast('주소를 확인하는 중…');
+  try {
+    const r = await invoke('resolve', { address: q });
+    after({ conn: r.conn, to: r.to, name: r.name });
+  } catch (e) { toast(err(e)); }
+}
+
+/** Everyone in a department, as recipients. */
+async function deptMembers(d) {
+  try {
+    const list = await invoke('dept_members', { conn: d.conn, id: d.id });
+    await loadContacts();
+    return list;
+  } catch (e) {
+    toast(err(e));
+    return [];
+  }
+}
+
+const isAddress = (q) => /^[^@\s]+.*@[^@\s]+:[^@\s]+$/.test(q);
+
+function addressRow(q, onclick) {
+  return h('div', { class: 'row', onclick },
+    h('div', { class: 'avatar' }, '@'),
+    h('div', { class: 'main' }, h('div', { class: 't1' }, h('b', {}, '주소로 보내기')),
+      h('div', { class: 't2 sel' }, q)));
+}
+
+function deptRow(d, lead, onclick) {
+  return h('div', { class: 'row', onclick }, lead,
+    h('div', { class: 'avatar' }, '#'),
+    h('div', { class: 'main' }, h('div', { class: 't1' }, h('b', {}, d.name || d.id), connTag(d.conn)),
+      h('div', { class: 't2' }, `부서${d.members ? ` · ${d.members}명` : ''} · 모두에게 보내기`)));
 }
 
 function deviceRows(c, onPick) {
@@ -481,32 +577,42 @@ function peopleList() {
   const list = S.contacts.filter((c) => matches(c, q));
   const out = [];
   const exact = q && S.contacts.some((c) => c.username && c.username.toLowerCase() === q.toLowerCase().replace(/^@/, ''));
-  if (q && !exact) {
-    out.push(h('div', { class: 'list' }, h('div', { class: 'row', onclick: () => lookupUser(q, (c) => openCompose({ to: [{ to: c.account, name: c.name }] })) },
+  if (q && isAddress(q)) {
+    out.push(h('div', { class: 'list' }, addressRow(q, () => resolveAddress(q, (t) => openCompose({ to: [t] })))));
+  } else if (q && !exact) {
+    out.push(h('div', { class: 'list' }, h('div', { class: 'row', onclick: () => lookupUser(q, (c) => openCompose({ to: [{ conn: c.conn, to: c.account, name: c.name }] })) },
       h('div', { class: 'avatar' }, '@'),
       h('div', { class: 'main' }, h('div', { class: 't1' }, h('b', {}, `'${q.replace(/^@/, '')}' 사용자 찾기`)),
-        h('div', { class: 't2' }, '사용자 이름 또는 계정 ID가 정확히 같아야 합니다')))));
+        h('div', { class: 't2' }, '사용자 이름 또는 계정 ID가 정확히 같아야 합니다. 다른 조직은 주소(사용자@Tenancy:서버)로 찾습니다')))));
+  }
+  const depts = q ? S.departments.filter((d) => deptMatches(d, q)) : [];
+  if (depts.length) {
+    out.push(h('div', { class: 'list' }, depts.map((d) => deptRow(d, null, async () => {
+      const to = await deptMembers(d);
+      if (to.length) openCompose({ to });
+    }))));
   }
   if (!list.length) {
     out.push(h('div', { class: 'empty' }, h('div', { class: 'g' }, ic('users', 44)),
       q ? '일치하는 사람이 없습니다' : '연락처가 없습니다',
-      !q && S.relay.policy?.contacts === 'lookup' && h('div', { class: 'muted' }, '이 서버는 주고받은 적이 있거나 찾은 사람만 보여 줍니다. 위에서 @사용자 이름으로 찾으세요.')));
+      !q && conns().some((c) => c.policy?.contacts === 'lookup') && h('div', { class: 'muted' }, '이 서버는 주고받은 적이 있거나 찾은 사람만 보여 줍니다. 위에서 @사용자 이름으로 찾으세요.')));
     return out;
   }
   out.push(h('div', { class: 'list' }, list.flatMap((c) => {
     const many = c.devices.length > 1 || c.me;
-    const open = expanded.has(c.account) || c.me;
-    const row = h('div', { class: 'row', onclick: () => c.me ? null : openCompose({ to: [{ to: c.account, name: c.name }] }) },
+    const key = `${c.conn}|${c.account}`;
+    const open = expanded.has(key) || c.me;
+    const row = h('div', { class: 'row', onclick: () => c.me ? null : openCompose({ to: [{ conn: c.conn, to: c.account, name: c.name }] }) },
       avatar(c.name, c.state),
       h('div', { class: 'main' },
-        h('div', { class: 't1' }, h('b', {}, c.name || c.username || '이름 없음'), handle(c.username)),
+        h('div', { class: 't1' }, h('b', {}, c.name || c.username || '이름 없음'), handle(c.username), connTag(c.conn)),
         h('div', { class: 't2' }, c.me ? '기기를 골라 보낼 수 있습니다' : `${STATE[c.state]}${c.devices.length > 1 ? ` · 기기 ${c.devices.length}대` : ''}`)),
       many && !c.me && h('button', { class: 'icon', 'aria-label': '기기 보기', onclick: (e) => {
         e.stopPropagation();
-        expanded.has(c.account) ? expanded.delete(c.account) : expanded.add(c.account);
+        expanded.has(key) ? expanded.delete(key) : expanded.add(key);
         drawMain();
       } }, ic(open ? 'down' : 'right', 20)));
-    return [row, open ? deviceRows(c, (to, name) => openCompose({ to: [{ to, name }] })) : []];
+    return [row, open ? deviceRows(c, (to, name) => openCompose({ to: [{ conn: c.conn, to, name }] })) : []];
   })));
   return out;
 }
@@ -552,7 +658,8 @@ function openMessage(id) {
   const m = S.inbox.find((x) => x.id === id);
   if (!m) return;
   if (!m.read) invoke('mark_read', { id });
-  const c = contactOf(m.from);
+  const c = contactOf(m.conn, m.from);
+  const addr = strangerAddr(m);
   const del = async () => {
     if (!await ask(m.files.length ? '쪽지와 받은 첨부파일을 지울까요?' : '쪽지를 지울까요?', '지우기', true)) return;
     await invoke('delete_message', { kind: 'inbox', id });
@@ -562,7 +669,8 @@ function openMessage(id) {
   el.append(
     h('div', { class: 'scroll' }, h('div', { class: 'pad' },
       h('div', { class: 'msg-head' }, avatar(m.from_name, c?.state),
-        h('div', { class: 'main' }, h('div', {}, h('b', {}, m.from_name || '알 수 없음'), ' ', handle(c?.username)),
+        h('div', { class: 'main' }, h('div', {}, h('b', {}, m.from_name || '알 수 없음'), ' ', handle(c?.username), connTag(m.conn)),
+          addr && h('div', { class: 'muted sel' }, addr),
           h('div', { class: 'muted' }, fullTime(m.ts)))),
       groupInfo(m.group),
       m.note && h('div', { class: 'note' }, m.note),
@@ -587,12 +695,12 @@ function openSent(id) {
     h('div', { class: 'scroll' }, h('div', { class: 'pad' },
       h('div', { class: 'muted' }, fullTime(s.ts)),
       h('div', { class: 'card' }, h('div', { class: 'results' }, s.to.map((r) => h('div', {},
-        viaTag(r), h('b', {}, r.name),
-        h('span', { class: 'muted' }, r.ok ? (r.via === 'stored' ? '앱이 꺼져 있어 서버에 보관, 접속하면 전달' : '전달됨') : r.error))))),
+        viaTag(r), h('b', {}, r.name), connTag(r.conn),
+        h('span', { class: 'muted' }, r.ok ? (r.via === 'stored' ? '앱이 꺼져 있어 서버에 보관, 접속하면 전달' : '전달됨') + (r.error ? ` · ${r.error}` : '') : r.error))))),
       s.text && h('div', { class: 'body sel' }, s.text),
       s.files.length > 0 && h('div', { class: 'files' }, s.files.map(fileCard)))),
     h('div', { class: 'actions' },
-      h('button', { class: 'btn', onclick: () => openCompose({ to: s.to.map((r) => ({ to: r.to, name: r.name })), text: s.text }) }, '다시 쓰기')));
+      h('button', { class: 'btn', onclick: () => openCompose({ to: s.to.map((r) => ({ conn: r.conn, to: r.to, name: r.name })), text: s.text }) }, '다시 쓰기')));
   pushLayer(el);
 }
 
@@ -609,7 +717,8 @@ function showPopup(m) {
   const card = h('div', { class: 'popup' });
   const draw = () => {
     const cur = S.popups[0];
-    const c = contactOf(cur.from);
+    const c = contactOf(cur.conn, cur.from);
+    const addr = strangerAddr(cur);
     const next = async (fn) => {
       S.popups.shift();
       if (S.popups.length) return draw();
@@ -619,6 +728,7 @@ function showPopup(m) {
     put(card,
       h('div', { class: 'head' }, h('div', { class: 'msg-head' }, avatar(cur.from_name, c?.state),
         h('div', { class: 'main' }, h('b', {}, cur.from_name || '알 수 없음'), ' ', handle(c?.username),
+          addr && h('div', { class: 'muted' }, addr),
           h('div', { class: 'muted' }, fullTime(cur.ts), S.popups.length > 1 ? h('span', { class: 'more' }, ` · 쪽지 ${S.popups.length - 1}개 더`) : null)))),
       h('div', { class: 'content' },
         groupInfo(cur.group),
@@ -637,7 +747,16 @@ function showPopup(m) {
 
 // ---------------------------------------------------------------- writing
 
-const policy = () => S.relay.policy || {};
+/** Attachment limits for recipients: the tightest of the connections they go through. */
+function fileLimits(to) {
+  const ids = [...new Set(to.map((t) => connId(t.conn)))];
+  const list = (ids.length ? ids.map(connOf) : conns().slice(0, 1)).filter(Boolean);
+  if (!list.length) return { maxFiles: 0, maxSize: 0 };
+  return {
+    maxFiles: Math.min(...list.map((c) => c.policy?.relay_max_files ?? 0)),
+    maxSize: Math.min(...list.map((c) => c.policy?.relay_max_file_size ?? 0)),
+  };
+}
 
 /** Copies a picked file into the app (the webview only has it as a Blob). */
 function blobB64(blob) {
@@ -681,9 +800,6 @@ function openCompose(init = {}) {
   const toRow = h('div', { class: 'to' });
   const filesEl = h('div', { class: 'files', style: 'padding:0 12px' });
   const extra = h('div', {});
-  const pol = policy();
-  const maxFiles = pol.relay_max_files ?? 0;
-  const maxSize = pol.relay_max_file_size ?? 0;
 
   const drawBar = () => {
     const staging = c.files.some((f) => !f.ready && !f.error);
@@ -691,7 +807,8 @@ function openCompose(init = {}) {
   };
   const drawTo = () => {
     put(toRow, h('span', { class: 'lbl' }, '받는 사람'),
-      c.to.map((t, i) => h('span', { class: 'chip' }, h('span', {}, t.name), h('button', { 'aria-label': '빼기', onclick: () => { c.to.splice(i, 1); drawTo(); drawExtra(); drawBar(); } }, '✕'))),
+      c.to.map((t, i) => h('span', { class: 'chip' }, h('span', {}, multi() && connOf(t.conn) ? `${t.name} · ${connOf(t.conn).label}` : t.name),
+        h('button', { 'aria-label': '빼기', onclick: () => { c.to.splice(i, 1); drawTo(); drawExtra(); drawBar(); } }, '✕'))),
       h('button', { class: 'chip add', onclick: () => openPicker(c.to, (sel) => { c.to = sel; drawTo(); drawExtra(); drawBar(); }) }, '+ 추가'));
   };
   const drawFiles = () => {
@@ -709,6 +826,7 @@ function openCompose(init = {}) {
       } }, ic('x', 18)))));
   };
   const drawExtra = () => {
+    const { maxFiles, maxSize } = fileLimits(c.to);
     put(extra,
       c.to.length > 1 && h('label', { class: 'switch', style: 'padding:10px 16px' }, h('span', {}, '받는 사람끼리 서로 보이기 (전체 답장 가능)'),
         h('input', { type: 'checkbox', checked: c.reveal, onchange: (e) => { c.reveal = e.target.checked; } })),
@@ -716,9 +834,10 @@ function openCompose(init = {}) {
       c.progress && h('div', { class: 'progress' }, c.progress.label, c.progress.total ? h('progress', { max: c.progress.total, value: c.progress.done }) : h('progress', {})),
       c.results && h('div', { class: 'pad', style: 'padding-top:0;padding-bottom:0' }, h('div', { class: 'card' },
         h('b', {}, c.results.ok ? '일부 받는 사람에게 보내지 못했습니다' : '보내지 못했습니다'),
-        h('div', { class: 'results' }, c.results.to.map((r) => h('div', {}, viaTag(r), h('b', {}, r.name), h('span', { class: 'muted' }, r.ok ? '' : r.error)))))));
+        h('div', { class: 'results' }, c.results.to.map((r) => h('div', {}, viaTag(r), h('b', {}, r.name), h('span', { class: 'muted' }, r.error)))))));
   };
   const addFiles = (list) => {
+    const { maxFiles, maxSize } = fileLimits(c.to);
     if (!maxFiles) return toast('이 서버는 첨부파일을 중계하지 않습니다');
     if (c.files.length + list.length > maxFiles) return toast(`첨부파일은 ${maxFiles}개까지 보낼 수 있습니다`);
     for (const file of list) {
@@ -733,15 +852,16 @@ function openCompose(init = {}) {
     drawBar();
   };
   const send = async () => {
-    if (S.relay.state !== 'online') return toast('릴레이 서버에 연결되어 있지 않습니다');
+    if (!c.to.some((t) => connOf(t.conn)?.state === 'online')) return toast('릴레이 서버에 연결되어 있지 않습니다');
     c.sending = true;
     c.results = null;
     c.progress = { label: '보내는 중…', done: 0, total: 0 };
     drawBar(); drawExtra();
     try {
-      const r = await invoke('send', { msg: { job: c.job, to: c.to.map((t) => t.to), text: c.text, files: c.files.map((f) => f.token), reveal: c.reveal } });
+      const to = c.to.map((t) => ({ conn: t.conn || '', to: t.to, name: t.name || '' }));
+      const r = await invoke('send', { msg: { job: c.job, to, text: c.text, files: c.files.map((f) => f.token), reveal: c.reveal } });
       c.progress = null;
-      if (r.to.every((x) => x.ok)) {
+      if (r.to.every((x) => x.ok && !x.error)) {
         c.files = []; // sent and cleaned up: nothing to drop
         await popLayer();
         const stored = r.to.filter((x) => x.via === 'stored').length;
@@ -750,7 +870,7 @@ function openCompose(init = {}) {
       }
       c.results = r;
       // Successful recipients are done; the failed ones stay for another try.
-      c.to = c.to.filter((t) => !r.to.find((x) => x.to === t.to && x.ok));
+      c.to = c.to.filter((t) => !r.to.find((x) => rkey(x) === rkey(t) && x.ok));
     } catch (e) {
       c.progress = null;
       toast(err(e));
@@ -780,23 +900,43 @@ function openCompose(init = {}) {
   }
 }
 
-/** Multi-select of people (whole accounts) or single devices. */
+/**
+ * Multi-select of people (whole accounts), single devices, departments (all of
+ * their members) and typed addresses. The mobile app has no groups of its own.
+ */
 function openPicker(current, done) {
   const sel = current.slice();
   let q = '';
   const listEl = h('div', { class: 'scroll' });
-  const has = (to) => sel.some((t) => t.to === to);
-  const toggle = (to, name) => {
-    const i = sel.findIndex((t) => t.to === to);
+  const has = (conn, to) => sel.some((t) => rkey(t) === rkey({ conn, to }));
+  const add = (t) => {
+    // A whole account and one of its devices would be the same person twice.
+    const acc = t.to.includes('@') ? null : t.to.split('/')[0];
+    for (let j = sel.length - 1; j >= 0 && acc; j--) {
+      const s = sel[j];
+      if (connId(s.conn) !== connId(t.conn) || s.to.includes('@')) continue;
+      const a = s.to.split('/')[0];
+      if (a === acc && (t.to === acc || s.to === acc)) sel.splice(j, 1);
+    }
+    if (!sel.some((s) => rkey(s) === rkey(t))) sel.push(t);
+  };
+  const toggle = (conn, to, name) => {
+    const i = sel.findIndex((t) => rkey(t) === rkey({ conn, to }));
     if (i >= 0) sel.splice(i, 1);
-    else {
-      // A whole account and one of its devices would be the same person twice.
-      const acc = to.split('/')[0];
-      for (let j = sel.length - 1; j >= 0; j--) {
-        const a = sel[j].to.split('/')[0];
-        if (a === acc && (to === acc || sel[j].to === acc)) sel.splice(j, 1);
-      }
-      sel.push({ to, name });
+    else add({ conn, to, name });
+    draw();
+  };
+  /** A department adds everyone in it; tapped again with all of them in, it takes them out. */
+  const toggleDept = async (d) => {
+    const list = await deptMembers(d);
+    if (!list.length) return;
+    const all = list.every((t) => has(t.conn, t.to));
+    if (all) {
+      for (const t of list) sel.splice(sel.findIndex((s) => rkey(s) === rkey(t)), 1);
+      toast(`${d.name || d.id}: ${list.length}명을 뺐습니다`);
+    } else {
+      list.forEach(add);
+      toast(`${d.name || d.id}: ${list.length}명을 넣었습니다`);
     }
     draw();
   };
@@ -805,31 +945,49 @@ function openPicker(current, done) {
     doneBtn.textContent = sel.length ? `완료 (${sel.length})` : '완료';
     const list = S.contacts.filter((c) => matches(c, q));
     const rows = [];
+    // Addresses picked earlier are not in the contacts; keep them in view.
+    for (const t of sel.filter((t) => t.to.includes('@'))) {
+      rows.push(h('div', { class: 'row', onclick: () => toggle(t.conn, t.to, t.name) },
+        check(true), h('div', { class: 'avatar' }, '@'),
+        h('div', { class: 'main' }, h('div', { class: 't1' }, h('b', {}, t.name), connTag(t.conn)), h('div', { class: 't2' }, t.to))));
+    }
     const exact = q && S.contacts.some((c) => c.username && c.username.toLowerCase() === q.toLowerCase().replace(/^@/, ''));
-    if (q && !exact) {
-      rows.push(h('div', { class: 'row', onclick: () => lookupUser(q, (c) => { toggle(c.account, c.name); }) },
+    if (q && isAddress(q)) {
+      if (!sel.some((t) => t.to === q)) rows.push(addressRow(q, () => resolveAddress(q, (t) => { add(t); draw(); })));
+    } else if (q && !exact) {
+      rows.push(h('div', { class: 'row', onclick: () => lookupUser(q, (c) => { toggle(c.conn, c.account, c.name); }) },
         h('div', { class: 'avatar' }, '@'), h('div', { class: 'main' }, h('b', {}, `'${q.replace(/^@/, '')}' 사용자 찾기`))));
     }
+    const depts = S.departments.filter((d) => deptMatches(d, q));
+    if (depts.length) {
+      rows.push(h('div', { class: 'section' }, '부서'));
+      for (const d of depts) {
+        const members = S.contacts.filter((c) => !c.me && c.conn === d.conn && (c.departments || []).includes(d.id));
+        rows.push(deptRow(d, check(members.length > 0 && members.every((c) => has(c.conn, c.account))), () => toggleDept(d)));
+      }
+      if (list.length) rows.push(h('div', { class: 'section' }, '사람'));
+    }
     for (const c of list) {
+      const key = `${c.conn}|${c.account}`;
       if (!c.me) {
-        const open = expanded.has(c.account);
-        rows.push(h('div', { class: 'row', onclick: () => toggle(c.account, c.name) },
-          check(has(c.account)), avatar(c.name, c.state),
-          h('div', { class: 'main' }, h('div', { class: 't1' }, h('b', {}, c.name), handle(c.username)),
+        const open = expanded.has(key);
+        rows.push(h('div', { class: 'row', onclick: () => toggle(c.conn, c.account, c.name) },
+          check(has(c.conn, c.account)), avatar(c.name, c.state),
+          h('div', { class: 'main' }, h('div', { class: 't1' }, h('b', {}, c.name), handle(c.username), connTag(c.conn)),
             h('div', { class: 't2' }, STATE[c.state] + (c.devices.length > 1 ? ` · 모든 기기 ${c.devices.length}대` : ''))),
           c.devices.length > 1 && h('button', { class: 'icon', 'aria-label': '기기 고르기', onclick: (e) => {
             e.stopPropagation();
-            open ? expanded.delete(c.account) : expanded.add(c.account);
+            open ? expanded.delete(key) : expanded.add(key);
             draw();
           } }, ic(open ? 'down' : 'right', 20))));
         if (!open) continue;
       } else {
-        rows.push(h('div', { class: 'section' }, '내 다른 기기'));
+        rows.push(h('div', { class: 'section' }, multi() ? `내 다른 기기 · ${connOf(c.conn)?.label || ''}` : '내 다른 기기'));
       }
       for (const d of c.devices) {
         const to = `${c.account}/${d.id}`;
-        rows.push(h('div', { class: 'row sub', onclick: () => toggle(to, c.me ? d.name || '내 기기' : `${c.name} (${d.name || d.host || '기기'})`) },
-          check(has(to)), dot(d.state),
+        rows.push(h('div', { class: 'row sub', onclick: () => toggle(c.conn, to, c.me ? d.name || '내 기기' : `${c.name} (${d.name || d.host || '기기'})`) },
+          check(has(c.conn, to)), dot(d.state),
           h('div', { class: 'main' }, h('div', { class: 't1' }, h('b', {}, d.name || '기기'), d.host && h('span', { class: 'tag' }, d.host)),
             h('div', { class: 't2' }, STATE[d.state]))));
       }
@@ -840,7 +998,7 @@ function openPicker(current, done) {
   const doneBtn = h('button', { class: 'icon text', onclick: async () => { await popLayer(); done(sel); } }, '완료');
   const el = sheet('받는 사람', { right: doneBtn });
   el.append(
-    h('div', { class: 'search' }, h('input', { type: 'search', placeholder: '이름 또는 @사용자 이름', autocapitalize: 'off', autocorrect: 'off', spellcheck: false,
+    h('div', { class: 'search' }, h('input', { type: 'search', placeholder: '이름, 부서, @사용자 이름 또는 주소', autocapitalize: 'off', autocorrect: 'off', spellcheck: false,
       oninput: (e) => { q = e.target.value.trim(); draw(); } })),
     listEl);
   pushLayer(el, { refresh: draw });
@@ -862,27 +1020,61 @@ function seg(options, value, onpick) {
 
 const CONN = { online: '연결됨', connecting: '연결 중', paused: '대기', error: '연결 안 됨', off: '꺼짐', pending: '승인 대기', fatal: '로그온 실패' };
 
+const HOLD_NOTE = {
+  allow: '앱이 꺼져 있는 동안 온 쪽지는 서버가 보관했다가 앱을 열면 전달합니다.',
+  device_off: '앱이 꺼져 있으면 이 휴대폰으로는 쪽지를 받을 수 없습니다 (내 다른 기기는 그대로).',
+  all_off: '앱이 꺼져 있으면 쪽지를 받을 수 없습니다. 내 모든 기기에 적용됩니다.',
+};
+
+/** One relay connection: where it is, how it is doing, and its own settings. */
+function connCard(r) {
+  const pol = r.policy || {};
+  const setHold = async (mode) => {
+    try { await invoke('hold', { conn: r.id, mode }); } catch (e) { toast(err(e)); }
+  };
+  const remove = async () => {
+    const last = conns().length === 1;
+    const text = last
+      ? '마지막 릴레이 연결입니다. 지우면 다시 연결하기 전까지 앱을 쓸 수 없습니다. 받은 쪽지는 이 휴대폰에 남습니다.'
+      : `'${r.label}' 연결을 지울까요? 이 연결의 연락처로는 더 보낼 수 없습니다. 받은 쪽지는 이 휴대폰에 남습니다.`;
+    if (!await ask(text, last ? '나가기' : '지우기', true)) return;
+    await invoke('unlink', { conn: r.id });
+    await boot();
+  };
+  return h('div', { class: 'card' },
+    h('h2', {}, dot({ online: 'online', pending: 'dnd', fatal: 'off', error: 'off' }[r.state] || 'hold'), ' ', r.label),
+    h('div', { class: 'kv' },
+      h('span', {}, '조직'), h('span', {}, r.tenancy ? `${r.tenancy_name || r.tenancy} (${r.tenancy})` : '확인 전'),
+      h('span', {}, '서버'), h('span', {}, r.server_name || '-'),
+      h('span', {}, '주소'), h('span', { class: 'sel' }, r.url),
+      h('span', {}, '연결'), h('span', {}, CONN[r.state] || r.state, r.message ? ` · ${r.message}` : ''),
+      r.username && h('span', {}, '계정'), r.username && h('span', {}, `@${r.username}`),
+      r.address && h('span', {}, '내 주소'), r.address && h('span', { class: 'mono sel' }, r.address),
+      h('span', {}, '암호화'), h('span', {}, { plain: '없음', tls: 'TLS', e2ee: '종단간 암호화' }[pol.encryption] || '-'),
+      r.my_key && h('span', {}, '내 키 지문'), r.my_key && h('span', { class: 'mono sel' }, fp(r.my_key)),
+      r.fingerprint && h('span', {}, '서버 인증서'), r.fingerprint && h('span', { class: 'mono sel' }, fp(r.fingerprint).slice(0, 39) + '…'),
+      h('span', {}, '서버 버전'), h('span', {}, r.server_version || '-')),
+    h('div', { class: 'muted' }, '앱이 꺼져 있을 때 받기'),
+    r.hold == null
+      ? h('div', { class: 'muted' }, '이 서버는 이 설정을 지원하지 않습니다. 앱이 꺼져 있는 동안의 쪽지는 서버가 보관합니다.')
+      : [seg([['allow', '서버에 보관'], ['device_off', '이 기기 끄기'], ['all_off', '모든 기기 끄기']], r.hold, setHold),
+        h('div', { class: r.hold === 'allow' ? 'muted' : 'warn' }, HOLD_NOTE[r.hold] || '')],
+    h('div', { class: 'muted' }, `보관 기간: 본문 ${pol.retention_hours?.text ?? '-'}시간, 첨부파일 ${pol.retention_hours?.files ?? '-'}시간.`),
+    h('div', { class: 'btns' },
+      h('button', { class: 'btn small', onclick: () => { invoke('reconnect', { conn: r.id }); toast('다시 연결하는 중…'); } }, '다시 연결'),
+      h('button', { class: 'btn small danger', onclick: remove }, conns().length === 1 ? '서버에서 나가기' : '연결 지우기')));
+}
+
 function settingsView() {
   const s = S.settings;
   const r = S.relay;
-  const pol = r.policy || {};
-  const holdNote = {
-    allow: '앱이 꺼져 있는 동안 온 쪽지는 서버가 보관했다가 앱을 열면 전달합니다.',
-    device_off: '앱이 꺼져 있으면 이 휴대폰으로는 쪽지를 받을 수 없습니다 (내 다른 기기는 그대로).',
-    all_off: '앱이 꺼져 있으면 쪽지를 받을 수 없습니다. 내 모든 기기에 적용됩니다.',
-  };
-  const setHold = async (mode) => {
-    try { await invoke('hold', { mode }); } catch (e) { toast(err(e)); }
-  };
-  const leave = async () => {
-    if (!await ask('이 릴레이 서버에서 나가면 다시 연결하기 전까지 앱을 쓸 수 없습니다. 받은 쪽지는 이 휴대폰에 남습니다.', '나가기', true)) return;
-    await invoke('unlink');
-    await boot();
-  };
+  const changed = conns().flatMap((c) => (c.key_changed || []).map((k) => ({ ...k, conn: c.id })));
+  const add = () => { S.adding = true; route(); };
+  const me = conns().find((c) => c.username)?.username;
   return h('div', { class: 'pad' },
     h('div', { class: 'card', onclick: openProfile, style: 'flex-direction:row;align-items:center;gap:12px' },
       avatar(s.name, { online: 'online', dnd: 'dnd', offline: 'off' }[s.status]),
-      h('div', { class: 'main', style: 'flex:1;min-width:0' }, h('b', {}, s.name), ' ', handle(r.username),
+      h('div', { class: 'main', style: 'flex:1;min-width:0' }, h('b', {}, s.name), ' ', handle(me),
         h('div', { class: 'muted' }, '이름, 서명, 받기 한도')),
       h('span', { class: 'chev' }, ic('right', 20))),
     h('div', { class: 'card' },
@@ -891,33 +1083,17 @@ function settingsView() {
       h('div', { class: 'muted' }, { online: '쪽지가 오면 바로 보여 줍니다.', dnd: '보내는 사람에게 방해금지로 보이고, 쪽지는 알림 없이 쪽지함에 쌓입니다.', offline: '다른 사람 목록에 접속 중으로 보이지 않습니다. 쪽지는 받습니다.' }[s.status]),
       h('label', { class: 'switch' }, h('span', {}, '받으면 바로 화면에 띄우기'),
         h('input', { type: 'checkbox', checked: s.popup, onchange: (e) => saveSettings({ popup: e.target.checked }) }))),
-    h('div', { class: 'card' },
-      h('h2', {}, '앱이 꺼져 있을 때 받기'),
-      r.hold == null
-        ? h('div', { class: 'muted' }, '이 서버는 이 설정을 지원하지 않습니다. 앱이 꺼져 있는 동안의 쪽지는 서버가 보관합니다.')
-        : [seg([['allow', '서버에 보관'], ['device_off', '이 기기 끄기'], ['all_off', '모든 기기 끄기']], r.hold, setHold),
-          h('div', { class: r.hold === 'allow' ? 'muted' : 'warn' }, holdNote[r.hold] || '')],
-      h('div', { class: 'muted' }, `이 앱은 배터리를 아끼려고 화면에 없을 때 연결을 끊습니다. 보관 기간: 본문 ${pol.retention_hours?.text ?? '-'}시간, 첨부파일 ${pol.retention_hours?.files ?? '-'}시간.`)),
-    r.key_changed?.length > 0 && h('div', { class: 'card' },
+    changed.length > 0 && h('div', { class: 'card' },
       h('h2', {}, '⚠ 보안 키가 바뀐 기기'),
       h('div', { class: 'muted' }, '상대가 앱을 다시 설치했거나 기기를 바꾼 경우입니다. 상대에게 키 지문을 확인한 뒤 확인을 누르세요. 그 전까지 이 기기로는 보내지 않습니다.'),
-      r.key_changed.map((k) => h('div', { class: 'kv' }, h('span', {}, k.name), h('span', { class: 'mono sel' }, fp(k.fingerprint)))),
+      changed.map((k) => h('div', { class: 'kv' }, h('span', {}, k.name, connTag(k.conn)), h('span', { class: 'mono sel' }, fp(k.fingerprint)))),
       h('button', { class: 'btn', onclick: () => invoke('accept_keys') }, '확인했습니다')),
+    h('div', { class: 'section' }, multi() ? `릴레이 연결 ${conns().length}개` : '릴레이 서버'),
+    conns().map(connCard),
     h('div', { class: 'card' },
-      h('h2', {}, '릴레이 서버'),
-      h('div', { class: 'kv' },
-        h('span', {}, '서버'), h('span', {}, r.server_name || '-'),
-        h('span', {}, '주소'), h('span', { class: 'sel' }, r.url),
-        h('span', {}, '연결'), h('span', {}, CONN[r.state] || r.state, r.message ? ` · ${r.message}` : ''),
-        r.username && h('span', {}, '계정'), r.username && h('span', {}, `@${r.username}`),
-        h('span', {}, '암호화'), h('span', {}, { plain: '없음', tls: 'TLS', e2ee: '종단간 암호화' }[pol.encryption] || '-'),
-        r.my_key && h('span', {}, '내 키 지문'), r.my_key && h('span', { class: 'mono sel' }, fp(r.my_key)),
-        r.fingerprint && h('span', {}, '서버 인증서'), r.fingerprint && h('span', { class: 'mono sel' }, fp(r.fingerprint).slice(0, 39) + '…'),
-        h('span', {}, '기기 ID'), h('span', { class: 'mono sel' }, r.device),
-        h('span', {}, '서버 버전'), h('span', {}, r.server_version || '-')),
-      h('div', { class: 'btns' },
-        h('button', { class: 'btn small', onclick: () => { invoke('reconnect'); toast('다시 연결하는 중…'); } }, '다시 연결'),
-        h('button', { class: 'btn small danger', onclick: leave }, '서버에서 나가기'))),
+      h('div', { class: 'muted' }, '이 앱은 배터리를 아끼려고 화면에 없을 때 연결을 끊습니다. 여러 서버나 같은 서버의 여러 조직(Tenancy)에 함께 연결할 수 있습니다.'),
+      h('div', { class: 'kv' }, h('span', {}, '기기 ID'), h('span', { class: 'mono sel' }, r.device)),
+      h('button', { class: 'btn', onclick: add }, '+ 릴레이 연결 추가')),
     h('div', { class: 'version' }, `PopupMessenger ${S.version} · ${S.platform}`));
 }
 
@@ -974,7 +1150,7 @@ document.addEventListener('visibilitychange', () => invoke('foreground', { on: v
 listen('relay', async () => {
   const was = S.relay.state;
   await loadRelay();
-  if (S.screen === 'setup' && !S.relay.linked) return; // do not disturb typing
+  if (S.screen === 'setup' && (!S.relay.linked || S.adding)) return; // do not disturb typing
   if (S.relay.state === 'online' && was !== 'online') await loadContacts();
   route();
   refreshLayers();

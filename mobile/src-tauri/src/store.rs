@@ -78,9 +78,14 @@ pub struct Message {
     pub id: String,
     /// Server message id.
     pub mid: String,
+    /// The relay connection it came through (empty: before there were several).
+    pub conn: String,
     pub from: String,
     pub from_device: String,
     pub from_name: String,
+    /// The sending device's address (protocol 9); how people of other tenancies,
+    /// who are not in the contacts, are shown and answered.
+    pub from_address: String,
     pub text: String,
     pub files: Vec<FileEntry>,
     pub ts: u64,
@@ -94,9 +99,11 @@ impl Default for Message {
         Self {
             id: new_id(),
             mid: String::new(),
+            conn: String::new(),
             from: String::new(),
             from_device: String::new(),
             from_name: String::new(),
+            from_address: String::new(),
             text: String::new(),
             files: vec![],
             ts: now_ms(),
@@ -109,7 +116,10 @@ impl Default for Message {
 
 #[derive(Clone, Serialize, Deserialize)]
 pub struct Recipient {
-    /// "<account>" or "<account>/<device>".
+    /// The relay connection it was sent through (empty: before there were several).
+    #[serde(default)]
+    pub conn: String,
+    /// "<account>", "<account>/<device>" or an address.
     pub to: String,
     pub name: String,
     pub ok: bool,

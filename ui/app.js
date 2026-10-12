@@ -112,8 +112,10 @@ async function popup() {
   const others = m.group ? m.group.members.filter((x) => x.id !== myId) : [];
   const replyAll = () => { invoke('open_compose', { to: [m.from_id, ...others.map((x) => x.id)], files: [], reply: m.id }); close(); };
   render(
-    h('div', { class: 'head' }, h('b', {}, m.from_name), viaTag(m.via || (m.from_ip === '릴레이' ? 'relay' : 'lan')),
+    h('div', { class: 'head' }, h('b', { title: m.from_address || '' }, m.from_name), viaTag(m.via || (m.from_ip === '릴레이' ? 'relay' : 'lan')),
       h('span', { class: 'muted' }, `${m.from_ip === '릴레이' ? '' : `${m.from_ip} · `}${time(m.ts)}`)),
+    // From another tenancy: not a contact, so the address says who it is (and replies go there).
+    m.from_id === m.from_address && h('div', { class: 'muted mono addr', title: '보낸 사람 주소 (답장은 이 주소로 갑니다)' }, m.from_address),
     m.group && groupInfo(m.group, others),
     h('div', { class: 'body grow' }, linkify(m.text)),
     m.files.length && h('div', { class: 'files' }, m.files.map((f) =>
@@ -142,7 +144,12 @@ async function compose() {
   const peers = await invoke('peers');
   let to = V.to.slice();
   let files = V.files.slice();
-  const nameOf = (id) => (peers.find((p) => p.id === id) || { display: id }).display;
+  // Addresses (people in other tenancies) show the sender's name when replying.
+  const nameOf = (id) => {
+    const p = peers.find((x) => x.id === id);
+    if (p) return p.display;
+    return orig && orig.from_id === id && isAddr(id) ? `${orig.from_name} <${id}>` : id;
+  };
   // Group mode: recipients are the group's online members (offline ones are listed as skipped).
   let group = V.group ? (await invoke('groups')).find((g) => g.id === V.group) : null;
   if (V.group && !group) return close();
@@ -249,11 +256,76 @@ function quote(m) {
   return [...head, ...m.text.split('\n').map((l) => `> ${l}`)].join('\n');
 }
 
+// ---------------------------------------------------------------- recipient sets
+// Relay address (docs/relay-protocol.md 9.1): <id>[:<device>]@[<departments>:]<tenancy>:<server>.
+// Usernames may contain '@', so the part after the last one decides.
+function isAddr(s) {
+  const i = s.lastIndexOf('@');
+  return i > 0 && !/\s/.test(s) && /^[^@]*:[^@:]/.test(s.slice(i + 1));
+}
+
+// My groups and the relay departments, for the recipient views: picking one selects
+// every member that can be sent to.
+async function recipientSets() {
+  const [gs, ds] = await Promise.all([invoke('groups'), invoke('departments')]);
+  return [
+    ...gs.map((g) => ({ kind: '그룹', name: g.name, ids: g.members.map((x) => x.id), total: g.members.length,
+      title: g.members.map((x) => x.display).join(', ') })),
+    ...ds.map((d) => ({ kind: '부서', name: d.name, sub: d.label, ids: d.members, total: d.people, title: `${d.id} · ${d.address}` })),
+  ];
+}
+function setRows(sets, s, peers, sel, changed) {
+  const reach = (id) => (peers.find((p) => p.id === id) || {}).reach;
+  return sets.filter((x) => !s || `${x.kind} ${x.name} ${x.sub || ''}`.toLowerCase().includes(s)).map((x) => {
+    const ids = x.ids.filter(reach);
+    const cb = h('input', { type: 'checkbox', checked: ids.length > 0 && ids.every((id) => sel.has(id)), disabled: !ids.length, onchange: () => {
+      ids.forEach((id) => (cb.checked ? sel.add(id) : sel.delete(id)));
+      changed();
+    } });
+    return h('label', { class: 'check row' + (ids.length ? '' : ' off') }, cb, h('span', { class: 'tag' }, x.kind),
+      h('span', { class: 'name', title: x.title }, x.name),
+      h('span', { class: 'muted' }, `${x.sub ? `${x.sub} · ` : ''}${ids.length}/${x.total}${x.kind === '부서' ? '명' : ''}`));
+  });
+}
+
+// An address typed into a search box: checked by the relay server that would send to it
+// (which also tells whether its policy allows it), then selectable.
+const resolved = new Map(); // address -> reply or { error }
+function addressRow(addr, sel, changed) {
+  const info = h('div', { class: 'muted' });
+  const cb = h('input', { type: 'checkbox', checked: sel.has(addr), onchange: () => { cb.checked ? sel.add(addr) : sel.delete(addr); changed(); } });
+  const btn = h('button', { type: 'button', class: 'mini', onclick: check }, '확인');
+  const show = (r) => {
+    cb.disabled = !!r.error;
+    btn.hidden = !r.error;
+    if (r.error) { info.className = 'err'; info.textContent = r.error; return; }
+    const names = r.people.map((p) => p.name || p.username).filter(Boolean);
+    info.className = 'muted';
+    info.textContent = `${r.people.length}명: ${names.slice(0, 5).join(', ')}${names.length > 5 ? ' …' : ''} · ${r.label}`;
+  };
+  async function check() {
+    btn.disabled = true;
+    info.className = 'muted';
+    info.textContent = '확인 중…';
+    let r;
+    try { r = await invoke('relay_resolve', { address: addr }); } catch (x) { r = { error: String(x) }; }
+    resolved.set(addr, r);
+    btn.disabled = false;
+    show(r);
+    if (!r.error) { cb.checked = true; sel.add(addr); }
+    changed(); // views redraw: the row may have been replaced meanwhile
+  }
+  if (resolved.has(addr)) show(resolved.get(addr));
+  else { cb.disabled = !sel.has(addr); info.textContent = '다른 Tenancy나 부서의 주소입니다. 확인을 누르면 받을 사람을 서버에서 확인합니다.'; }
+  return h('div', { class: 'addr' }, h('label', { class: 'check row' }, cb, h('span', { class: 'tag' }, '주소'), h('span', { class: 'name mono', title: addr }, addr), btn), info);
+}
+
 // ---------------------------------------------------------------- recipient picker
 async function pick() {
   let peers = await invoke('peers');
+  let sets = await recipientSets();
   const sel = new Set();
-  const q = h('input', { placeholder: '이름 / 사용자 이름 / 호스트 / IP 검색', oninput: draw });
+  const q = h('input', { placeholder: '이름 / 사용자 이름 / 그룹 / 부서 / 주소 검색', oninput: draw });
   const list = h('div', { class: 'grow' });
   const go = h('button', { class: 'primary', disabled: true, onclick: () => open([...sel]) }, '쓰기');
   function open(ids) {
@@ -261,26 +333,38 @@ async function pick() {
     invoke('open_compose', { to: ids, files: V.files });
     close();
   }
+  const changed = () => {
+    go.disabled = !sel.size;
+    go.textContent = sel.size ? `${sel.size}명에게 쓰기` : '쓰기';
+  };
   function draw() {
-    const s = q.value.trim().toLowerCase();
+    const raw = q.value.trim();
+    const s = raw.toLowerCase();
     const shown = peers.filter((p) => p.reach && (!s || `${p.display} ${p.username} ${p.host} ${p.ip}`.toLowerCase().includes(s)));
-    list.replaceChildren(...(shown.length ? shown.map((p) => {
-      const cb = h('input', { type: 'checkbox', checked: sel.has(p.id), onchange: () => {
-        cb.checked ? sel.add(p.id) : sel.delete(p.id);
-        go.disabled = !sel.size;
-        go.textContent = sel.size ? `${sel.size}명에게 쓰기` : '쓰기';
-      } });
-      return h('div', { class: 'row' + (p.state === 'off' ? ' off' : '') }, cb, dot(p.state),
-        h('span', { class: 'name', title: '클릭하면 바로 쓰기', onclick: () => open([p.id]) }, p.display),
-        handle(p),
-        p.host && h('span', { class: 'muted' }, p.host));
-    }) : [h('div', { class: 'empty muted' }, '보낼 수 있는 사용자가 없습니다')]));
+    const rows = [
+      isAddr(raw) && addressRow(raw, sel, () => { changed(); draw(); }),
+      ...setRows(sets, s, peers, sel, () => { changed(); draw(); }),
+      ...shown.map((p) => {
+        const cb = h('input', { type: 'checkbox', checked: sel.has(p.id), onchange: () => {
+          cb.checked ? sel.add(p.id) : sel.delete(p.id);
+          changed();
+        } });
+        return h('div', { class: 'row' + (p.state === 'off' ? ' off' : '') }, cb, dot(p.state),
+          h('span', { class: 'name', title: '클릭하면 바로 쓰기', onclick: () => open([p.id]) }, p.display),
+          handle(p),
+          p.host && h('span', { class: 'muted' }, p.host));
+      }),
+    ].filter(Boolean);
+    list.replaceChildren(...(rows.length ? rows : [h('div', { class: 'empty muted' }, '보낼 수 있는 사용자가 없습니다')]));
   }
   listen('peers', async () => { peers = await invoke('peers'); draw(); });
+  listen('groups', async () => { sets = await recipientSets(); draw(); });
+  listen('relay', async () => { sets = await recipientSets(); draw(); });
   q.addEventListener('keydown', (e) => {
     if (e.key !== 'Enter') return;
-    const first = list.querySelector('.name');
-    if (sel.size) open([...sel]); else if (first) first.click();
+    const check = list.querySelector('.addr button:not([hidden])');
+    const first = list.querySelector('div.row .name');
+    if (check && !sel.size) check.click(); else if (sel.size) open([...sel]); else if (first) first.click();
   });
   draw();
   render(
@@ -315,7 +399,7 @@ async function inbox() {
     const shown = ms.filter((m) => hit(m.from_name, m.text, m.note, m.files.map((f) => f.name), m.group ? m.group.name : ''));
     list.replaceChildren(...(shown.length ? shown.map((m) =>
       h('div', { class: 'row msg' + (m.read ? '' : ' unread'), onclick: () => invoke('open_message', { id: m.id }) },
-        h('span', { class: 'name' }, m.from_name),
+        h('span', { class: 'name', title: m.from_address || '' }, m.from_name),
         h('span', { class: 'preview' }, (m.group ? `[${m.group.name}] ` : '') + preview(m.text, m.files)),
         viaTag(viaOf(m)),
         h('span', { class: 'muted' }, time(m.ts)),
@@ -453,33 +537,68 @@ async function groups() {
 
 // ---------------------------------------------------------------- contact search
 async function search() {
-  const q = h('input', { placeholder: '이름 / 사용자 이름 / 호스트 / IP', oninput: () => { clearTimeout(timer); timer = setTimeout(run, 250); } });
+  const q = h('input', { placeholder: '이름 / 사용자 이름 / 호스트 / IP / 그룹 / 부서 / 주소', oninput: () => { clearTimeout(timer); timer = setTimeout(run, 250); } });
   const scope = h('div', { class: 'muted' });
   const list = h('div', { class: 'grow' });
+  const sel = new Set();
+  const go = h('button', { class: 'primary', disabled: true, onclick: () => write([...sel]) }, '선택한 사람에게 쓰기');
   let timer = null;
   let seq = 0;
+  let last = null; // the latest search reply
+  let peers = await invoke('peers');
+  let sets = await recipientSets();
   const SRC = { lan: 'LAN', relay: '릴레이', history: '주고받은 기록' };
+  const changed = () => {
+    go.disabled = !sel.size;
+    go.textContent = sel.size ? `${sel.size}명에게 쓰기` : '선택한 사람에게 쓰기';
+    draw();
+  };
   async function run() {
     const my = ++seq;
     const r = await invoke('search_contacts', { query: q.value });
     if (my !== seq) return; // a newer search is running
+    last = r;
+    const servers = r.servers || [];
+    const off = servers.filter((x) => !x.online).map((x) => x.label);
+    const lookup = servers.filter((x) => x.lookup).map((x) => x.label);
     scope.textContent = r.relay
-      ? `릴레이 서버${r.server ? ` "${r.server}"` : ''}와 LAN에서 찾습니다.${r.lookup ? ' 이 서버는 아직 주고받지 않은 사람을 사용자 이름이나 계정 ID를 정확히 입력해야 찾을 수 있습니다.' : ''}${r.online ? '' : ' (지금 릴레이에 연결되어 있지 않습니다)'}`
+      ? `릴레이 서버 ${servers.map((x) => `"${x.label}"`).join(', ')}와 LAN에서 찾습니다.`
+        + (lookup.length ? ` ${lookup.join(', ')}에서는 아직 주고받지 않은 사람을 사용자 이름이나 계정 ID를 정확히 입력해야 찾을 수 있습니다.` : '')
+        + ' 다른 Tenancy의 사람에게는 주소(예: kim@example:relay.example.com)를 입력해 보낼 수 있습니다.'
+        + (off.length ? ` (지금 연결되어 있지 않음: ${off.join(', ')})` : '')
       : 'LAN과 주고받은 기록에서만 찾습니다. 릴레이 서버를 연결하면 다른 네트워크의 사용자도 찾을 수 있습니다.';
-    list.replaceChildren(...(r.results.length ? r.results.map((p) => {
-      const can = p.reach;
-      return h('div', { class: 'row' + (p.state === 'off' ? ' off' : '') }, dot(p.state),
-        h('span', { class: 'name', title: can ? '클릭하면 쪽지 쓰기' : '', onclick: () => can && write(p) }, p.display),
-        handle(p),
-        p.host && h('span', { class: 'muted' }, p.host),
-        p.source === 'history' && h('span', { class: 'tag' }, SRC.history),
-        h('button', { class: 'mini', disabled: !can, title: can ? '쪽지 쓰기 (LAN 우선, 안 되면 릴레이)' : '오프라인이라 보낼 수 없습니다', onclick: () => write(p) }, '쓰기'));
-    }) : [h('div', { class: 'empty muted' }, q.value.trim() ? '찾는 사람이 없습니다' : '아는 사용자가 없습니다')]));
+    draw();
   }
-  const write = (p) => invoke('open_compose', { to: [p.id], files: [], reply: null });
-  q.addEventListener('keydown', (e) => { if (e.key === 'Enter') { clearTimeout(timer); run(); } });
-  listen('peers', () => { clearTimeout(timer); timer = setTimeout(run, 400); });
-  render(q, scope, list);
+  function draw() {
+    if (!last) return;
+    const raw = q.value.trim();
+    const rows = [
+      isAddr(raw) && addressRow(raw, sel, changed),
+      ...setRows(sets, raw.toLowerCase(), peers, sel, changed),
+      ...last.results.map((p) => {
+        const can = p.reach;
+        const cb = h('input', { type: 'checkbox', checked: sel.has(p.id), disabled: !can, onchange: () => { cb.checked ? sel.add(p.id) : sel.delete(p.id); changed(); } });
+        return h('div', { class: 'row' + (p.state === 'off' ? ' off' : '') }, cb, dot(p.state),
+          h('span', { class: 'name', title: (can ? '클릭하면 쪽지 쓰기' : '') + (p.conn ? ` · ${p.conn}` : ''), onclick: () => can && write([p.id]) }, p.display),
+          handle(p),
+          p.host && h('span', { class: 'muted' }, p.host),
+          p.source === 'history' && h('span', { class: 'tag' }, SRC.history),
+          h('button', { class: 'mini', disabled: !can, title: can ? '쪽지 쓰기 (LAN 우선, 안 되면 릴레이)' : '오프라인이라 보낼 수 없습니다', onclick: () => write([p.id]) }, '쓰기'));
+      }),
+    ].filter(Boolean);
+    list.replaceChildren(...(rows.length ? rows : [h('div', { class: 'empty muted' }, raw ? '찾는 사람이 없습니다' : '아는 사용자가 없습니다')]));
+  }
+  const write = (ids) => ids.length && invoke('open_compose', { to: ids, files: [], reply: null });
+  q.addEventListener('keydown', (e) => {
+    if (e.key !== 'Enter') return;
+    clearTimeout(timer);
+    const check = list.querySelector('.addr button:not([hidden])');
+    if (check) check.click(); else run();
+  });
+  listen('peers', async () => { peers = await invoke('peers'); clearTimeout(timer); timer = setTimeout(run, 400); });
+  listen('groups', async () => { sets = await recipientSets(); draw(); });
+  listen('relay', async () => { sets = await recipientSets(); draw(); });
+  render(q, scope, list, h('div', { class: 'bar' }, go));
   q.focus();
   await run();
 }
@@ -596,43 +715,63 @@ function policyRows(p) {
   ];
 }
 
-// Settings panel section: account info, or how to link one.
+// Settings panel section: every relay connection (server + tenancy), and adding one.
+const opened = new Set(); // connections whose details are open, kept across redraws
 async function drawRelay(box) {
   const r = await invoke('relay_info');
-  const legend = h('legend', { class: 'muted' }, '릴레이 서버 계정');
-  if (!r.configured) {
+  const legend = h('legend', { class: 'muted' }, '릴레이 서버 연결');
+  const add = h('button', { type: 'button', class: r.conns.length ? '' : 'primary', onclick: () => invoke('open_relay_setup') }, r.conns.length ? '연결 추가…' : '릴레이 서버 연결…');
+  if (!r.conns.length) {
     box.replaceChildren(legend,
       h('div', { class: 'muted' }, '연결된 릴레이 서버가 없습니다. 릴레이 서버에 연결하면 다른 네트워크에 있거나 꺼져 있는 사람에게도 쪽지를 보낼 수 있습니다.'),
-      h('div', { class: 'bar' }, h('button', { type: 'button', class: 'primary', onclick: () => invoke('open_relay_setup') }, '릴레이 서버 연결…')));
+      h('div', { class: 'bar' }, add));
     return;
   }
+  if (r.conns.length === 1) opened.add(r.conns[0].id);
+  box.replaceChildren(legend,
+    ...r.conns.map((c, i) => drawConn(c, r.device, i === 0 && r.conns.length > 1)),
+    h('div', { class: 'muted' }, '같은 서버의 다른 Tenancy나 다른 서버에도 연결할 수 있습니다. 같은 사람이 여러 연결에 있으면 연결된 쪽으로 보냅니다.'),
+    h('div', { class: 'bar' }, add));
+}
+
+function drawConn(r, device, first) {
   const [cls, label] = CONN[r.state] || CONN.off;
   const p = r.policy || {};
   const changed = r.key_changed || [];
-  box.replaceChildren(legend,
+  const tenancy = r.tenancy_name || r.tenancy;
+  // A policy summary next to the status, so a closed entry still tells the essentials.
+  const brief = p.encryption ? [ENC[p.encryption] || p.encryption, p.force_relay && '릴레이 경유 강제'].filter(Boolean).join(' · ') : '';
+  const d = h('details', { class: 'connbox', open: opened.has(r.id), ontoggle: () => (d.open ? opened.add(r.id) : opened.delete(r.id)) },
+    h('summary', {}, h('span', { class: 'conn ' + cls }, '● '), h('b', {}, tenancy || r.server_name || r.url),
+      h('span', { class: 'muted' }, ` · ${tenancy ? `${r.server_name || r.url} · ` : ''}${label}${brief ? ` · ${brief}` : ''}`),
+      r.message ? h('div', { class: r.state === 'error' ? 'err' : 'muted' }, r.message) : ''),
     kv([
       ['서버', `${r.server_name || '(이름 없음)'} · ${r.url}`],
       r.server_version && ['서버 버전', h('span', { class: 'mono' }, r.server_version)],
+      ['Tenancy', r.tenancy ? `${r.tenancy_name || r.tenancy} (${r.tenancy})` : '(지정 안 함 — 이전 버전에서 연결)'],
       ['상태', h('span', {}, h('span', { class: 'conn ' + cls }, '● ', label), r.message ? h('span', { class: 'muted' }, ` ${r.message}`) : '')],
       ['계정', r.username || '(계정 없음 — 기기 등록)'],
       ['계정 ID', h('span', { class: 'mono' }, r.account || '—')],
-      ['기기 ID', h('span', { class: 'mono' }, r.device)],
+      r.address && ['내 주소', h('span', { class: 'mono addr', title: '다른 Tenancy의 사람은 이 주소로 나에게 보낼 수 있습니다' }, r.address)],
+      ['기기 ID', h('span', { class: 'mono' }, device)],
       ['연결', h('span', {}, /^https?:\/\//i.test(r.url) ? 'WebSocket · ' : 'TCP · ',
         r.tls ? h('span', { title: r.fingerprint }, 'TLS · 인증서 ', h('span', { class: 'mono' }, fp(r.fingerprint).slice(0, 19))) : h('span', { class: 'warn' }, '⚠ 암호화되지 않은 연결'))],
       p.encryption && ['로그온', AUTH[p.auth] || p.auth],
       ...(p.encryption ? policyRows(p) : []),
       p.encryption === 'e2ee' && ['내 보안 키', h('span', { class: 'mono' }, fp(r.my_key))],
-      ['연락처', `${r.contacts}명`],
+      ['연락처', `${r.contacts}명${r.departments ? ` · 부서 ${r.departments}개` : ''}`],
+      first && ['LAN 알림', '이 연결의 계정을 LAN에 알립니다 (목록의 첫 연결)'],
     ]),
     holdControl(r),
     changed.length ? h('div', { class: 'warn' },
       `보안 키가 바뀐 기기가 있습니다: ${changed.map((c) => `${c.name} (${fp(c.fingerprint)})`).join(', ')}. 상대에게 직접 확인한 뒤 수락하세요. 수락 전에는 이 사람들에게 종단간 암호화 쪽지를 보내지 않습니다.`,
-      ' ', h('a', { onclick: () => invoke('relay_accept_keys') }, '새 키 수락')) : '',
+      ' ', h('a', { onclick: () => invoke('relay_accept_keys', { id: r.id }) }, '새 키 수락')) : '',
     h('div', { class: 'bar' },
-      h('button', { type: 'button', onclick: () => invoke('relay_reconnect') }, '다시 연결'),
+      h('button', { type: 'button', onclick: () => invoke('relay_reconnect', { id: r.id }) }, '다시 연결'),
       h('button', { type: 'button', onclick: async () => {
-        if (confirm('릴레이 서버 연결을 해제할까요?\n릴레이 연락처가 목록에서 사라집니다. 같은 서버에 다시 연결하면 이 기기로 다시 로그온합니다.')) await invoke('relay_disconnect');
+        if (confirm(`'${tenancy || r.server_name || r.url}' 연결을 해제할까요?\n이 연결의 연락처가 목록에서 사라집니다. 같은 서버와 Tenancy에 다시 연결하면 이 기기로 다시 로그온합니다.`)) await invoke('relay_disconnect', { id: r.id });
       } }, '연결 해제')));
+  return d;
 }
 
 // "Relay receive": whether the server keeps messages for this device (or every device
@@ -652,7 +791,7 @@ function holdControl(r) {
   const seg = h('div', { class: 'seg', role: 'radiogroup' }, HOLD.map(([mode, label, tip]) =>
     h('button', { type: 'button', class: mode === r.hold ? 'on' : '', title: tip, disabled: r.state !== 'online', onclick: async () => {
       err.textContent = '';
-      try { await invoke('relay_hold', { mode }); } catch (x) { err.textContent = String(x); }
+      try { await invoke('relay_hold', { id: r.id, mode }); } catch (x) { err.textContent = String(x); }
     } }, label)));
   wrap.append(seg, err);
   return wrap;
@@ -666,32 +805,41 @@ async function relaysetup() {
   const steps = ['서버', '확인', '계정', '완료'];
   const head = (i) => h('div', { class: 'steps' }, steps.map((t, j) => h('span', { class: j === i ? 'on' : j < i ? 'done' : '' }, `${j + 1}. ${t}`)));
 
+  let tenancy = '';
   function stepAddr(value = '') {
     const url = h('input', { value, placeholder: '예: https://relay.example.com 또는 192.168.0.10:45443' });
+    const tn = h('input', { value: tenancy, placeholder: '예: example', autocapitalize: 'off', spellcheck: false });
     const next = h('button', { class: 'primary', onclick: go }, '다음');
     async function go() {
       err.textContent = '';
       if (!url.value.trim()) { url.focus(); return; }
+      tenancy = tn.value.trim().toLowerCase();
+      if (!tenancy) { err.textContent = 'Tenancy ID를 입력하세요'; tn.focus(); return; }
+      if (!/^[a-z0-9-]{2,32}$/.test(tenancy)) { err.textContent = 'Tenancy ID는 영문 소문자, 숫자, -로 된 2~32자입니다'; tn.focus(); return; }
       busy(next, true, '연결 중…');
-      try { probe = await invoke('relay_probe', { url: url.value }); stepConfirm(); }
+      try { probe = await invoke('relay_probe', { url: url.value, tenancy }); stepConfirm(); }
       catch (x) { err.textContent = String(x); busy(next, false, '다음'); }
     }
-    url.addEventListener('keydown', (e) => { if (e.key === 'Enter') go(); });
+    [url, tn].forEach((i) => i.addEventListener('keydown', (e) => { if (e.key === 'Enter') go(); }));
     render(head(0),
       h('div', { class: 'grow form' },
         h('label', {}, h('span', { class: 'muted' }, '릴레이 서버 주소'), url),
         h('div', { class: 'muted' }, '관리자에게 받은 주소를 입력하세요. https://로 시작하는 주소는 WebSocket으로 연결합니다 (Cloudflare Tunnel 같은 HTTPS 프록시). 그 밖의 주소는 TCP로 직접 연결하며, 포트를 생략하면 45443을 씁니다.'),
+        h('label', {}, h('span', { class: 'muted' }, 'Tenancy ID'), tn),
+        h('div', { class: 'muted' }, '서버 안에서 회사나 조직을 구분하는 ID입니다. 관리자에게 받은 값을 입력하세요 (영문 소문자, 숫자, -).'),
         err),
       h('div', { class: 'bar' }, h('button', { onclick: close }, '취소'), next));
     url.focus();
   }
 
   function stepConfirm() {
-    const s = probe.server || {}, p = probe.policy || {};
+    const s = probe.server || {}, p = probe.policy || {}, t = probe.tenancy || {};
+    const tenancies = (probe.features || []).includes('tenancy');
     render(head(1),
       h('div', { class: 'grow form' },
         kv([
           ['서버 이름', h('b', {}, s.name || '(이름 없음)')],
+          tenancies && ['Tenancy', h('span', {}, h('b', {}, t.name || t.id), ` (${t.id})`)],
           ['주소', probe.url],
           ['연결 방식', probe.ws ? `WebSocket${probe.tls ? ' (HTTPS)' : ' (암호화 없음)'}` : `TCP${probe.tls ? ' · TLS' : ' (암호화 없음)'}`],
           ['서버 버전', s.version || '—'],
@@ -706,6 +854,7 @@ async function relaysetup() {
               h('div', {}, '🔒 자체 서명 인증서입니다. 아래 지문이 관리자가 알려 준 지문(관리 화면 > 개요)과 같은지 확인하세요. 같으면 이 서버를 신뢰합니다.'),
               h('div', { class: 'fp' }, fp(probe.fingerprint))))
           : h('div', { class: 'warn' }, '⚠ 이 서버는 암호화되지 않은 연결만 받습니다. 쪽지와 파일이 네트워크에 그대로 노출됩니다. 신뢰할 수 있는 내부망에서만 쓰세요.'),
+        !tenancies && h('div', { class: 'warn' }, '⚠ 이 서버는 Tenancy를 지원하지 않는 이전 버전입니다. 입력한 Tenancy ID는 쓰이지 않습니다.'),
         err),
       h('div', { class: 'bar' }, h('button', { onclick: () => stepAddr(probe.url) }, '이전'), h('button', { class: 'primary', onclick: () => stepAuth() }, '신뢰하고 계속')));
   }
@@ -717,7 +866,7 @@ async function relaysetup() {
       err.textContent = '';
       busy(btn, true, '처리 중…');
       try {
-        const r = await invoke('relay_join', { url: probe.url, tls: probe.tls, fingerprint: probe.fingerprint, mode, user, pass });
+        const r = await invoke('relay_join', { url: probe.url, tls: probe.tls, fingerprint: probe.fingerprint, tenancy, mode, user, pass });
         stepDone(r);
       } catch (x) { err.textContent = String(x); busy(btn, false, mode === 'register' ? '가입 신청' : mode === 'login' ? '로그인' : '이 기기 등록'); }
     };
@@ -764,9 +913,9 @@ async function relaysetup() {
     render(head(3),
       h('div', { class: 'grow form' },
         h('div', { class: ok ? '' : 'warn' }, ok
-          ? `✅ ${probe.server.name || '릴레이 서버'}에 연결했습니다. 이제 다른 네트워크에 있거나 꺼져 있는 사람에게도 쪽지를 보낼 수 있습니다.`
+          ? `✅ ${probe.server.name || '릴레이 서버'}${probe.tenancy && probe.tenancy.name ? ` (${probe.tenancy.name})` : ''}에 연결했습니다. 이제 다른 네트워크에 있거나 꺼져 있는 사람에게도 쪽지를 보낼 수 있습니다.`
           : `⏳ ${r.message || '가입 신청이 접수되었습니다.'} 관리자가 승인하면 자동으로 연결됩니다.`),
-        h('div', { class: 'muted' }, '연결 상태와 계정 정보는 설정 창 맨 아래 "릴레이 서버 계정"에서 볼 수 있습니다.')),
+        h('div', { class: 'muted' }, '연결 상태와 계정 정보는 설정 창 맨 아래 "릴레이 서버 연결"에서 볼 수 있습니다.')),
       h('div', { class: 'bar' }, h('button', { class: 'primary', onclick: close }, '닫기')));
   }
 

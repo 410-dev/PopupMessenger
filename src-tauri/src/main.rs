@@ -166,31 +166,36 @@ fn forget_peer(app: AppHandle, id: String) -> Result<(), String> {
     Ok(())
 }
 
-/// Contact search, offline people included. With a relay: LAN users and relay
-/// contacts (plus an exact server lookup when the server only lists people you
-/// have talked to). Without one: LAN users and people from the message history.
+/// Contact search, offline people included. With relays: LAN users and every
+/// connection's contacts (plus an exact server lookup where the server only lists
+/// people you have talked to). Without one: LAN users and people from the message history.
 #[tauri::command]
 async fn search_contacts(app: AppHandle, query: String) -> Value {
     let st = app.state::<AppState>();
     let q = query.trim().to_lowercase();
-    let relay = st.relay.configured();
-    let (lookup_scope, server) = {
-        let c = st.relay.cfg.lock().unwrap();
-        c.as_ref()
-            .map(|c| (c.policy["contacts"] == "lookup", c.server_name.clone()))
-            .unwrap_or((false, String::new()))
-    };
-    let mut looked_up = None;
-    if relay && lookup_scope && st.relay.online() && q.chars().count() >= 2 {
-        looked_up = relay::lookup(&app, query.trim()).await;
+    let links = st.relay.links();
+    let relay = !links.is_empty();
+    let lookup_scope = |l: &relay::Link| l.cfg.lock().unwrap().policy["contacts"] == "lookup";
+    let mut looked_up: Vec<String> = Vec::new();
+    if q.chars().count() >= 2 && !q.contains('@') {
+        for l in links.iter().filter(|l| l.online() && lookup_scope(l)) {
+            if let Some(a) = relay::lookup(&app, l, query.trim()).await {
+                looked_up.push(a);
+            }
+        }
     }
+    let servers: Vec<Value> = links
+        .iter()
+        .map(|l| json!({ "id": l.id(), "label": l.cfg.lock().unwrap().label(), "online": l.online(), "lookup": lookup_scope(l) }))
+        .collect();
+    let label = |conn: &str| servers.iter().find(|s| s["id"] == conn).map(|s| s["label"].clone()).unwrap_or_default();
     let me = st.my_id();
     let mut out: Vec<Value> = Vec::new();
     let mut seen = std::collections::HashSet::new();
     for p in st.peers(false) {
         let user = p.username.clone();
         let hay = format!("{} {} {} {} {}", p.display, p.name, p.host, p.ip, user).to_lowercase();
-        let exact = looked_up.as_deref().is_some_and(|a| a == p.account);
+        let exact = looked_up.contains(&p.account);
         if !q.is_empty() && !hay.contains(&q) && !exact {
             continue;
         }
@@ -199,6 +204,7 @@ async fn search_contacts(app: AppHandle, query: String) -> Value {
             "id": p.id, "display": p.display, "host": p.host, "ip": p.ip, "username": user, "online": p.online,
             "status": p.status, "reach": p.reach, "state": p.state,
             "source": if p.account.is_empty() { "lan" } else { "relay" },
+            "conn": label(&p.conn),
         }));
     }
     if !relay {
@@ -226,7 +232,19 @@ async fn search_contacts(app: AppHandle, query: String) -> Value {
         }
     }
     out.truncate(500);
-    json!({ "relay": relay, "online": st.relay.online(), "server": server, "lookup": lookup_scope, "results": out })
+    json!({ "relay": relay, "servers": servers, "results": out })
+}
+
+/// Departments of every relay connection with their members' devices.
+#[tauri::command]
+fn departments(app: AppHandle) -> Vec<Value> {
+    relay::departments(&app)
+}
+
+/// Who an address (protocol 9.1) reaches, checked by the server that would send to it.
+#[tauri::command]
+async fn relay_resolve(app: AppHandle, address: String) -> Result<Value, String> {
+    relay::check_address(&app, &address).await
 }
 
 #[tauri::command]
@@ -392,45 +410,48 @@ fn relay_info(app: AppHandle) -> Value {
     relay::info(&app)
 }
 
-/// This device's "relay receive" setting on the server; `mode` sets it.
+/// This device's "relay receive" setting on connection `id`; `mode` sets it.
 #[tauri::command]
-async fn relay_hold(app: AppHandle, mode: Option<String>) -> Result<String, String> {
-    relay::hold(&app, mode.as_deref()).await
+async fn relay_hold(app: AppHandle, id: String, mode: Option<String>) -> Result<String, String> {
+    relay::hold(&app, &id, mode.as_deref()).await
 }
 
-/// Contacts the server at `url` and returns its identity and policy for the user to confirm.
+/// Contacts the server at `url` for `tenancy` and returns its identity and policy for
+/// the user to confirm.
 #[tauri::command]
-async fn relay_probe(url: String) -> Result<Value, String> {
-    relay::probe(&url).await
+async fn relay_probe(app: AppHandle, url: String, tenancy: String) -> Result<Value, String> {
+    relay::probe(&app, &url, &tenancy).await
 }
 
-/// `mode`: "device" (servers without accounts), "login" or "register".
+/// Adds a connection. `mode`: "device" (servers without accounts), "login" or "register".
+#[allow(clippy::too_many_arguments)]
 #[tauri::command]
 async fn relay_join(
     app: AppHandle,
     url: String,
     tls: bool,
     fingerprint: String,
+    tenancy: String,
     mode: String,
     user: String,
     pass: String,
 ) -> Result<Value, String> {
-    relay::join(&app, &url, tls, &fingerprint, &mode, &user, &pass).await
+    relay::join(&app, &url, tls, &fingerprint, &tenancy, &mode, &user, &pass).await
 }
 
 #[tauri::command]
-async fn relay_disconnect(app: AppHandle) {
-    relay::disconnect(&app).await;
+async fn relay_disconnect(app: AppHandle, id: String) {
+    relay::disconnect(&app, &id).await;
 }
 
 #[tauri::command]
-fn relay_reconnect(app: AppHandle) {
-    relay::reconnect(&app);
+fn relay_reconnect(app: AppHandle, id: String) {
+    relay::reconnect(&app, &id);
 }
 
 #[tauri::command]
-fn relay_accept_keys(app: AppHandle) {
-    relay::accept_keys(&app);
+fn relay_accept_keys(app: AppHandle, id: String) {
+    relay::accept_keys(&app, &id);
 }
 
 #[tauri::command]
@@ -483,6 +504,8 @@ fn main() {
             open_groups,
             forget_peer,
             search_contacts,
+            departments,
+            relay_resolve,
             open_search,
             open_picker,
             open_message,

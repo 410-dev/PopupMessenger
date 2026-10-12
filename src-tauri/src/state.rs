@@ -171,7 +171,23 @@ pub struct Meta {
 #[derive(Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct RelayId {
     pub server: String,
+    /// Missing from peers before tenancies: the unmigrated tenancy.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub tenancy: String,
     pub account: String,
+}
+
+/// One way to reach a device: through one of our relay connections.
+#[derive(Clone, Default)]
+pub struct Route {
+    /// Relay connection id (`RelayConfig::id`).
+    pub conn: String,
+    pub account: String,
+    pub username: String,
+    pub hold: bool,
+    /// Connected to that relay right now (and our connection to it is up).
+    pub online: bool,
+    pub status: Status,
 }
 
 fn yes() -> bool {
@@ -193,10 +209,14 @@ pub struct Peer {
     /// Protocol version from the peer's last announcement.
     pub ver: u32,
     /// Relay account this device is registered to (from the relay contacts, or as
-    /// the device announced it on the LAN); empty without a relay.
+    /// the device announced it on the LAN); empty without a relay. The best route's.
     pub relay_account: String,
-    /// Relay account the device itself announced on the LAN for our relay server.
+    /// Relay connection of `relay_account`.
+    pub relay_conn: String,
+    /// Relay account the device itself announced on the LAN for one of our relay
+    /// connections (`relay_self_conn`).
     pub relay_self: String,
+    pub relay_self_conn: String,
     /// The relay account's username ("handle").
     pub username: String,
     /// The relay stores messages for it while it is offline ("relay receive" on).
@@ -211,6 +231,10 @@ pub struct Peer {
     pub relay_online: bool,
     #[serde(skip)]
     pub relay_status: Status,
+    /// Every relay connection that lists this device, best first (rebuilt from the
+    /// relay contacts by `relay::rebuild_peers`).
+    #[serde(skip)]
+    pub routes: Vec<Route>,
 }
 
 #[derive(Serialize)]
@@ -236,6 +260,8 @@ pub struct PeerView {
     /// Relay account the device is registered to, and its username.
     pub account: String,
     pub username: String,
+    /// Relay connection of that account.
+    pub conn: String,
     /// "both" (LAN + relay), "lan", "relay" (relay only), "hold" (offline, the relay
     /// stores for it), "dnd" (online, do not disturb) or "off".
     pub state: &'static str,
@@ -307,6 +333,10 @@ pub struct Message {
     /// "lan" or "relay" (empty for messages from before 0.1.8).
     #[serde(default)]
     pub via: String,
+    /// Relay address of the sending device (protocol 9.1). For senders in other
+    /// tenancies `from_id` is this address, so replies go there.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub from_address: String,
     #[serde(default)]
     pub note: String,
     #[serde(default)]
@@ -540,7 +570,7 @@ impl AppState {
             let mut d = self.data.lock().unwrap();
             match d.peers.get(id) {
                 None => {}
-                Some(p) if p.online || id.starts_with("r:") || !p.relay_account.is_empty() => {
+                Some(p) if p.online || id.starts_with("r:") || !p.relay_account.is_empty() || !p.routes.is_empty() => {
                     return Err("접속 중이거나 릴레이 연락처에 있는 사용자는 지울 수 없습니다".into());
                 }
                 Some(_) => {}
@@ -633,6 +663,7 @@ fn peer_view(p: &Peer, d: &Data, show_host: bool, relay: bool) -> PeerView {
         reach: state != "off",
         account: if acc { p.relay_account.clone() } else { String::new() },
         username: if acc { p.username.clone() } else { String::new() },
+        conn: if acc { p.relay_conn.clone() } else { String::new() },
         state,
     }
 }

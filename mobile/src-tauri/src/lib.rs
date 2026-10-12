@@ -1,11 +1,13 @@
 //! PopupMessenger for Android and iOS. Unlike the desktop app there is no LAN:
-//! the phone belongs to one relay server and talks to everyone through it, and it
-//! cannot be used until it has joined one (see relay.rs for when it is connected).
+//! the phone belongs to one or more relay connections (a server and a tenancy each)
+//! and talks to everyone through them, and it cannot be used until it has joined
+//! one (see relay.rs for when they are connected).
 
 #[path = "../../../src-tauri/src/e2ee.rs"]
 mod e2ee;
 mod relay;
 #[path = "../../../src-tauri/src/relay_io.rs"]
+#[allow(dead_code)] // its hello and probe: the phone names a tenancy (relay.rs)
 mod relay_io;
 mod store;
 
@@ -51,13 +53,13 @@ async fn insets(app: AppHandle) {
 // ---------------------------------------------------------------- joining
 
 #[tauri::command]
-async fn probe(url: String) -> R<Value> {
-    relay_io::probe(&url).await
+async fn probe(app: AppHandle, url: String, tenancy: String) -> R<Value> {
+    relay::probe(&app, &url, &tenancy).await
 }
 
 #[tauri::command]
 #[allow(clippy::too_many_arguments)]
-async fn join(app: AppHandle, url: String, tls: bool, fingerprint: String, mode: String, user: String, pass: String, name: String) -> R<Value> {
+async fn join(app: AppHandle, url: String, tls: bool, fingerprint: String, tenancy: String, mode: String, user: String, pass: String, name: String) -> R<Value> {
     let st = app.state::<App>();
     let name = name.trim();
     if name.is_empty() {
@@ -65,12 +67,15 @@ async fn join(app: AppHandle, url: String, tls: bool, fingerprint: String, mode:
     }
     st.store.settings.lock().unwrap().name = name.chars().take(40).collect();
     st.store.save_settings();
-    relay::join(&app, &url, tls, &fingerprint, &mode, &user, &pass).await
+    let r = relay::join(&app, &url, tls, &fingerprint, &tenancy, &mode, &user, &pass).await;
+    relay::announce(&app); // the name may have changed for the other connections
+    r
 }
 
+/// Removes one relay connection.
 #[tauri::command]
-async fn unlink(app: AppHandle) {
-    relay::unlink(&app).await;
+async fn unlink(app: AppHandle, conn: String) {
+    relay::unlink(&app, &conn).await;
 }
 
 #[tauri::command]
@@ -78,9 +83,10 @@ fn relay_info(app: AppHandle) -> Value {
     relay::info(&app)
 }
 
+/// Reconnects one connection, or all of them without `conn`.
 #[tauri::command]
-fn reconnect(app: AppHandle) {
-    relay::reconnect(&app);
+fn reconnect(app: AppHandle, conn: Option<String>) {
+    relay::reconnect(&app, conn.as_deref().unwrap_or(""));
 }
 
 #[tauri::command]
@@ -89,8 +95,8 @@ fn refresh(app: AppHandle) {
 }
 
 #[tauri::command]
-async fn hold(app: AppHandle, mode: Option<String>) -> R<String> {
-    relay::hold(&app, mode.as_deref()).await
+async fn hold(app: AppHandle, conn: String, mode: Option<String>) -> R<String> {
+    relay::hold(&app, &conn, mode.as_deref()).await
 }
 
 #[tauri::command]
@@ -113,38 +119,75 @@ async fn lookup(app: AppHandle, query: String) -> R<Value> {
     relay::lookup(&app, &query).await
 }
 
+/// Checks an address typed as a recipient: who it reaches, through which connection.
+#[tauri::command]
+async fn resolve(app: AppHandle, address: String) -> R<Value> {
+    relay::resolve(&app, &address).await
+}
+
+#[tauri::command]
+fn departments(app: AppHandle) -> Vec<Value> {
+    relay::departments(&app)
+}
+
+/// Everyone in a department, as recipients.
+#[tauri::command]
+async fn dept_members(app: AppHandle, conn: String, id: String) -> R<Vec<Value>> {
+    relay::dept_members(&app, &conn, &id).await
+}
+
 /// Where a reply goes: the sender's account (all of their devices), or for "reply
-/// all" every other account in the group too.
+/// all" every other account in the group too. Senders of other tenancies are not in
+/// the contacts and are answered at their address.
 #[tauri::command]
 fn reply_targets(app: AppHandle, st: State<App>, id: String, all: bool) -> R<Vec<Value>> {
     let m = st.store.data.lock().unwrap().inbox.iter().find(|m| m.id == id).cloned().ok_or("쪽지가 없습니다")?;
     let me = st.store.my_id();
-    let my_acc = relay::my_account(&app);
-    let mut out: Vec<String> = Vec::new();
-    let sender = if !m.from.is_empty() { Some(m.from.clone()) } else { relay::account_of_device(&app, &m.from_device) };
-    match sender {
-        // A message from another of my devices: back to that device.
-        Some(a) if a == my_acc && !m.from_device.is_empty() => out.push(format!("{a}/{}", m.from_device)),
-        Some(a) if !a.is_empty() => out.push(a),
-        _ => {}
+    let (conn, my_acc, my_addr) = relay::me_on(&app, &m.conn).ok_or("이 쪽지를 받은 릴레이 연결이 없습니다")?;
+    let mut out: Vec<(String, String)> = Vec::new();
+    if !m.from_address.is_empty() && relay::is_external(&app, &conn, &m.from_address) {
+        out.push((m.from_address.clone(), m.from_name.clone()));
+    } else {
+        let sender = if !m.from.is_empty() { Some(m.from.clone()) } else { relay::account_of_device(&app, &conn, &m.from_device) };
+        match sender {
+            // A message from another of my devices: back to that device.
+            Some(a) if a == my_acc && !m.from_device.is_empty() => out.push((format!("{a}/{}", m.from_device), String::new())),
+            Some(a) if !a.is_empty() => out.push((a, String::new())),
+            _ => {}
+        }
     }
     if all {
         for mem in m.group.iter().flat_map(|g| g.members.iter()) {
             if mem.id == me {
                 continue;
             }
-            let acc = match mem.id.strip_prefix("r:") {
-                Some(a) => Some(a.to_string()),
-                None => relay::account_of_device(&app, &mem.id),
+            let to = if mem.id.contains('@') {
+                // Mine is "<user>:<device>@…"; the group may name me without the device.
+                let mine = !my_addr.is_empty()
+                    && (mem.id == my_addr || my_addr.split_once('@').is_some_and(|(l, r)| mem.id == format!("{}@{r}", l.split(':').next().unwrap_or(l))));
+                (!mine).then(|| mem.id.clone())
+            } else {
+                match mem.id.strip_prefix("r:") {
+                    Some(a) => Some(a.to_string()),
+                    None => relay::account_of_device(&app, &conn, &mem.id),
+                }
+                .filter(|a| !a.is_empty() && *a != my_acc)
             };
-            if let Some(a) = acc.filter(|a| !a.is_empty() && *a != my_acc) {
-                if !out.contains(&a) {
-                    out.push(a);
+            if let Some(t) = to {
+                if !out.iter().any(|o| o.0 == t) {
+                    out.push((t, mem.name.clone()));
                 }
             }
         }
     }
-    Ok(out.into_iter().map(|t| json!({ "to": t, "name": relay::target_name(&app, &t) })).collect())
+    Ok(out
+        .into_iter()
+        .map(|(t, n)| {
+            let known = relay::target_name(&app, &conn, &t);
+            let name = if known == t && !n.is_empty() { n } else { known };
+            json!({ "conn": conn, "to": t, "name": name })
+        })
+        .collect())
 }
 
 // ---------------------------------------------------------------- messages
@@ -253,10 +296,21 @@ async fn file_action(app: AppHandle, path: String, action: String) -> R<String> 
 // ---------------------------------------------------------------- sending
 
 #[derive(Deserialize)]
+struct Dest {
+    /// The relay connection that sends to it (empty: the first).
+    #[serde(default)]
+    conn: String,
+    /// "<account>", "<account>/<device>" or an address.
+    to: String,
+    /// What the UI calls it (addresses have no contact entry).
+    #[serde(default)]
+    name: String,
+}
+
+#[derive(Deserialize)]
 struct Outgoing {
     job: String,
-    /// "<account>" or "<account>/<device>".
-    to: Vec<String>,
+    to: Vec<Dest>,
     text: String,
     /// Staged attachment tokens.
     files: Vec<String>,
@@ -282,33 +336,50 @@ async fn send(app: AppHandle, msg: Outgoing) -> R<Value> {
         }
         v
     };
-    let names: Vec<(String, String)> = msg.to.iter().map(|t| (t.clone(), relay::target_name(&app, t))).collect();
-    let group = (msg.reveal && msg.to.len() > 1).then(|| GroupInfo {
-        name: String::new(),
-        members: names
-            .iter()
-            .map(|(t, n)| Member {
-                // Device ids as the desktop app keeps them; "r:<account>" for a whole account.
-                id: match t.split_once('/') {
-                    Some((_, d)) => d.to_string(),
-                    None => format!("r:{t}"),
-                },
-                name: n.clone(),
-            })
-            .collect(),
-    });
-    let res = relay::send(&app, &msg.job, &msg.to, &msg.text, &staged, group.as_ref()).await;
+    // (connection, target, name); old saved recipients name no connection: the first.
+    let dests: Vec<(String, String, String)> = msg
+        .to
+        .iter()
+        .map(|d| {
+            let conn = relay::me_on(&app, &d.conn).map(|m| m.0).unwrap_or_else(|| d.conn.clone());
+            let name = if d.name.is_empty() { relay::target_name(&app, &conn, &d.to) } else { d.name.clone() };
+            (conn, d.to.clone(), name)
+        })
+        .collect();
+    let mut conns: Vec<String> = Vec::new();
+    for (c, _, _) in &dests {
+        if !conns.contains(c) {
+            conns.push(c.clone());
+        }
+    }
+    // One send per connection; each uploads the attachments once.
+    let mut res: Vec<(String, String, relay::Outcome)> = Vec::new();
+    for conn in &conns {
+        let targets: Vec<String> = dests.iter().filter(|d| &d.0 == conn).map(|d| d.1.clone()).collect();
+        // Recipients on this connection see the others as its ids name them.
+        let group = (msg.reveal && dests.len() > 1).then(|| GroupInfo {
+            name: String::new(),
+            members: dests.iter().map(|(c, t, n)| Member { id: relay::member_id(&app, c, t, conn), name: n.clone() }).collect(),
+        });
+        for (t, r) in relay::send(&app, conn, &msg.job, &targets, &msg.text, &staged, group.as_ref()).await {
+            res.push((conn.clone(), t, r));
+        }
+    }
     // Kept after a failure so the same sheet can try again; dropped when it closes.
-    if res.iter().all(|r| r.1.is_ok()) {
+    if res.iter().all(|r| r.2.is_ok()) {
         for t in &msg.files {
             stage_drop(st.clone(), t.clone());
         }
     }
-    let to: Vec<Recipient> = names
+    let to: Vec<Recipient> = dests
         .iter()
-        .map(|(t, n)| {
-            let r = res.iter().find(|r| &r.0 == t).map(|r| r.1.clone()).unwrap_or_else(|| Err("보내지 못했습니다".into()));
-            Recipient { to: t.clone(), name: n.clone(), ok: r.is_ok(), via: r.clone().unwrap_or_default(), error: r.err().unwrap_or_default() }
+        .map(|(c, t, n)| {
+            let r = res.iter().find(|r| &r.0 == c && &r.1 == t).map(|r| r.2.clone()).unwrap_or_else(|| Err("보내지 못했습니다".into()));
+            let (via, error) = match r {
+                Ok((via, note)) => (via, note),
+                Err(e) => (String::new(), e),
+            };
+            Recipient { conn: c.clone(), to: t.clone(), name: n.clone(), ok: !via.is_empty(), via, error }
         })
         .collect();
     let any_ok = to.iter().any(|r| r.ok);
@@ -434,6 +505,9 @@ pub fn run() {
             accept_keys,
             contacts,
             lookup,
+            resolve,
+            departments,
+            dept_members,
             reply_targets,
             messages,
             mark_read,
