@@ -284,10 +284,9 @@ fn asset(ct: &'static str, body: impl Into<axum::body::Body>) -> Response {
 /// The page links its script and stylesheet with the server version, so a browser
 /// never keeps using the previous build's UI after an upgrade.
 async fn index() -> Response {
-    let v = crate::version();
     let html = include_str!("../web/index.html")
-        .replace("\"app.js\"", &format!("\"app.js?v={v}\""))
-        .replace("\"style.css\"", &format!("\"style.css?v={v}\""));
+        .replace("\"app.js\"", &format!("\"app.js?v={}\"", store::content_tag(include_str!("../web/app.js"))))
+        .replace("\"style.css\"", &format!("\"style.css?v={}\"", store::content_tag(include_str!("../web/style.css"))));
     let mut r = asset("text/html; charset=utf-8", html);
     r.headers_mut().insert(header::CACHE_CONTROL, "no-store".parse().unwrap());
     r

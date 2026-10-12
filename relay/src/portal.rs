@@ -262,10 +262,9 @@ fn asset(ct: &'static str, body: impl Into<axum::body::Body>, cache: &'static st
 }
 
 async fn index() -> Response {
-    let v = crate::version();
     let html = include_str!("../web/user.html")
-        .replace("\"user.js\"", &format!("\"user.js?v={v}\""))
-        .replace("\"style.css\"", &format!("\"style.css?v={v}\""));
+        .replace("\"user.js\"", &format!("\"user.js?v={}\"", store::content_tag(include_str!("../web/user.js"))))
+        .replace("\"style.css\"", &format!("\"style.css?v={}\"", store::content_tag(include_str!("../web/style.css"))));
     asset("text/html; charset=utf-8", html, "no-store")
 }
 

@@ -128,6 +128,13 @@ pub fn token() -> String {
     base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(rand::random::<[u8; 32]>())
 }
 
+/// A short hash of a web asset for its URL (`app.js?v=<tag>`). Proxies such as
+/// Cloudflare may override our no-cache header and keep assets for hours, so the
+/// URL itself must change whenever the content does, even within one server version.
+pub fn content_tag(s: &str) -> String {
+    sha256_hex(s.as_bytes())[..12].to_string()
+}
+
 pub fn sha256_hex(b: &[u8]) -> String {
     hex(&Sha256::digest(b))
 }
