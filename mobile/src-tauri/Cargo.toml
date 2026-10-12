@@ -1,6 +1,6 @@
 [package]
 name = "popup-messenger-mobile"
-version = "0.1.8"
+version = "0.2.0"
 description = "PopupMessenger for Android and iOS (relay only)"
 edition = "2021"
 

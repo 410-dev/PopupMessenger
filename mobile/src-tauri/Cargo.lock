@@ -2421,7 +2421,7 @@ dependencies = [
 
 [[package]]
 name = "popup-messenger-mobile"
-version = "0.1.8"
+version = "0.2.0"
 dependencies = [
  "base64 0.22.1",
  "chacha20poly1305",
