@@ -56,6 +56,19 @@ CREATE INDEX IF NOT EXISTS devices_last_seen ON devices(last_seen);
 CREATE INDEX IF NOT EXISTS deliveries_account ON deliveries(account, acked);
 CREATE INDEX IF NOT EXISTS messages_created ON messages(created);
 CREATE INDEX IF NOT EXISTS audit_action ON audit(action);
+CREATE TABLE IF NOT EXISTS departments (
+  id TEXT PRIMARY KEY COLLATE NOCASE, name TEXT NOT NULL, note TEXT NOT NULL DEFAULT '', created INTEGER NOT NULL);
+CREATE TABLE IF NOT EXISTS members (
+  department TEXT NOT NULL REFERENCES departments(id) ON DELETE CASCADE ON UPDATE CASCADE,
+  account TEXT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE, PRIMARY KEY (department, account));
+CREATE INDEX IF NOT EXISTS members_account ON members(account);
+-- Bearer tokens for scripts, acting as their account. A key that may receive has
+-- its own device ('api-<id>') so messages wait for it like for any device.
+CREATE TABLE IF NOT EXISTS api_keys (
+  id TEXT PRIMARY KEY, account TEXT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE, name TEXT NOT NULL,
+  hash TEXT NOT NULL, send INTEGER NOT NULL, receive INTEGER NOT NULL, created INTEGER NOT NULL,
+  created_by TEXT NOT NULL DEFAULT '', last_used INTEGER, last_ip TEXT NOT NULL DEFAULT '');
+CREATE INDEX IF NOT EXISTS api_keys_account ON api_keys(account);
 ";
 
 /// Which account an audit row is about, derived from its actor
@@ -89,6 +102,13 @@ pub fn open(path: &Path) -> rusqlite::Result<Connection> {
         if !has {
             c.execute_batch(&format!("ALTER TABLE {table} ADD COLUMN hold INTEGER NOT NULL DEFAULT 1;"))?;
         }
+    }
+    // Added with tenancies: the sender's address, for messages between tenancies.
+    let has: bool = c
+        .prepare("SELECT 1 FROM pragma_table_info('messages') WHERE name = 'from_addr'")?
+        .exists([])?;
+    if !has {
+        c.execute_batch("ALTER TABLE messages ADD COLUMN from_addr TEXT NOT NULL DEFAULT '';")?;
     }
     Ok(c)
 }
@@ -302,6 +322,7 @@ pub fn contact(
         "account": account,
         "username": username,
         "name": name,
+        "departments": departments_of(c, account),
         "status": best,
         "online": best != "offline",
         "last_seen": last_seen,
@@ -311,6 +332,21 @@ pub fn contact(
         "removed": false,
         "devices": devices,
     }))
+}
+
+/// IDs of the departments an account belongs to.
+pub fn departments_of(c: &Connection, account: &str) -> Vec<String> {
+    c.prepare_cached("SELECT department FROM members WHERE account = ?1 ORDER BY department")
+        .and_then(|mut st| st.query_map([account], |r| r.get(0))?.collect())
+        .unwrap_or_default()
+}
+
+/// Department IDs: 1-32 of a-z, 0-9, '.', '_' and '-' (they appear in addresses).
+pub fn valid_department(id: &str) -> bool {
+    (1..=32).contains(&id.len())
+        && id
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || "._-".contains(c))
 }
 
 /// Active, non-disabled devices of an account: (id, profile, stores while offline).
@@ -380,4 +416,43 @@ pub fn blob_dir(dir: &Path, mid: &str) -> std::path::PathBuf {
 
 pub fn archive_dir(dir: &Path, mid: &str) -> std::path::PathBuf {
     dir.join("archive").join(mid)
+}
+
+// ---------------------------------------------------------------- server database
+
+/// Server-wide data: tenancies, admins, where moved accounts went, and the server
+/// audit log. Each tenancy's own data is in its own `relay.db`.
+const SERVER_SCHEMA: &str = "
+PRAGMA journal_mode = WAL;
+CREATE TABLE IF NOT EXISTS kv (k TEXT PRIMARY KEY, v TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS tenancies (
+  id TEXT PRIMARY KEY, name TEXT NOT NULL, note TEXT NOT NULL DEFAULT '', limits TEXT NOT NULL DEFAULT '{}',
+  created INTEGER NOT NULL);
+-- tenancy '' = server admin.
+CREATE TABLE IF NOT EXISTS admins (
+  id INTEGER PRIMARY KEY, tenancy TEXT NOT NULL DEFAULT '', username TEXT NOT NULL COLLATE NOCASE,
+  pass TEXT NOT NULL, created INTEGER NOT NULL, last_login INTEGER, UNIQUE (tenancy, username));
+-- Accounts moved out of the unmigrated tenancy: kind 'device' (device ID) or 'user'
+-- (lower-case username), so clients without tenancy support still find them.
+CREATE TABLE IF NOT EXISTS moved (
+  kind TEXT NOT NULL, key TEXT NOT NULL, tenancy TEXT NOT NULL, ts INTEGER NOT NULL, PRIMARY KEY (kind, key));
+CREATE TABLE IF NOT EXISTS audit (id INTEGER PRIMARY KEY, ts INTEGER NOT NULL, actor TEXT NOT NULL,
+  action TEXT NOT NULL, detail TEXT NOT NULL DEFAULT '', account TEXT, tenancy TEXT);
+CREATE INDEX IF NOT EXISTS audit_ts ON audit(ts);
+CREATE INDEX IF NOT EXISTS audit_action ON audit(action);
+";
+
+pub fn open_server(path: &Path) -> rusqlite::Result<Connection> {
+    let c = Connection::open(path)?;
+    c.busy_timeout(std::time::Duration::from_secs(5))?;
+    c.execute_batch(SERVER_SCHEMA)?;
+    Ok(c)
+}
+
+/// Records a server-level action (server audit log), optionally about a tenancy.
+pub fn audit_server(c: &Connection, actor: &str, action: &str, detail: &str, tenancy: Option<&str>) {
+    let _ = c.execute(
+        "INSERT INTO audit (ts, actor, action, detail, tenancy) VALUES (?1, ?2, ?3, ?4, ?5)",
+        params![now_ms(), actor, action, detail, tenancy],
+    );
 }

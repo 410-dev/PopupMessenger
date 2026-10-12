@@ -233,6 +233,7 @@ async fn store_and_forward_without_accounts() {
 
     let left: i64 = r
         .server
+        .unmigrated()
         .db()
         .query_row("SELECT COUNT(*) FROM messages", [], |x| x.get(0))
         .unwrap();
@@ -313,6 +314,7 @@ async fn multi_device_delivery_and_expiry() {
     assert_eq!(t.req(json!({ "t": "ack", "mid": mid })).await["t"], "ok");
     let pending: i64 = r
         .server
+        .unmigrated()
         .db()
         .query_row(
             "SELECT COUNT(*) FROM deliveries WHERE acked IS NULL",
@@ -443,6 +445,10 @@ async fn http(
     }
     if csrf {
         req.push_str("X-Relay-Admin: 1\r\n");
+    }
+    // Server admins act within a tenancy; unless a test names one, the unmigrated one.
+    if !path.contains("tenancy=") && !path.starts_with("/api/tenancies") && !path.starts_with("/api/server") {
+        req.push_str("X-Relay-Tenancy: unmigrated\r\n");
     }
     if let Some(c) = cookie {
         req.push_str(&format!("Cookie: {c}\r\n"));
@@ -601,7 +607,7 @@ async fn admin_audit_of_plaintext_messages() {
     assert_eq!(v["total"], 0);
 
     let mut s = TcpStream::connect(r.admin_addr).await.unwrap();
-    let req = format!("GET /api/archive/{mid}/files/0 HTTP/1.1\r\nHost: x\r\nConnection: close\r\nCookie: {cookie}\r\n\r\n");
+    let req = format!("GET /api/archive/{mid}/files/0?tenancy=unmigrated HTTP/1.1\r\nHost: x\r\nConnection: close\r\nCookie: {cookie}\r\n\r\n");
     s.write_all(req.as_bytes()).await.unwrap();
     let mut out = Vec::new();
     s.read_to_end(&mut out).await.unwrap();
@@ -619,7 +625,7 @@ async fn admin_audit_of_plaintext_messages() {
 
     // Retention removes archived copies and their files.
     janitor::sweep(&r.server, store::now_ms() + 91 * 86_400_000);
-    let n: i64 = r.server.db().query_row("SELECT COUNT(*) FROM archive", [], |x| x.get(0)).unwrap();
+    let n: i64 = r.server.unmigrated().db().query_row("SELECT COUNT(*) FROM archive", [], |x| x.get(0)).unwrap();
     assert_eq!(n, 0);
     assert!(!store::archive_dir(&r.server.dir, &mid).exists());
 }
@@ -653,7 +659,7 @@ async fn e2ee_messages_are_never_archived() {
         .await;
     assert_eq!(ok["t"], "ready");
     frame::read(&mut t.io, T).await.unwrap().unwrap();
-    let n: i64 = r.server.db().query_row("SELECT COUNT(*) FROM archive", [], |x| x.get(0)).unwrap();
+    let n: i64 = r.server.unmigrated().db().query_row("SELECT COUNT(*) FROM archive", [], |x| x.get(0)).unwrap();
     assert_eq!(n, 0);
 }
 
@@ -699,7 +705,7 @@ async fn websocket_behind_tls_proxy_streams_large_files() {
     let mut a = ws_client(&r, true).await;
     a.hello().await;
     let la = a.req(login("wsa", None)).await;
-    let conns = r.server.hub.snapshot();
+    let conns = r.server.unmigrated().hub.snapshot();
     assert!(conns.iter().all(|c| c.transport == "ws-proxy" && c.ip == "203.0.113.7"));
 
     // A 3 MB attachment crosses as ~200 WebSocket messages of 16 KB.
@@ -831,7 +837,7 @@ async fn user_portal_self_service() {
 
     // Activity: own events only, never what admins did.
     let acc = me["account"]["id"].as_str().unwrap().to_string();
-    store::audit_for(&r.server.db(), "admin:root", "account_update", "secret admin note", &acc);
+    store::audit_for(&r.server.unmigrated().db(), "admin:root", "account_update", "secret admin note", &acc);
     let (_, _, act) = http_at(r.relay_addr, "GET", "/api/me/activity", Some(&cookie), None, &[]).await;
     let actions: Vec<&str> = act["items"].as_array().unwrap().iter().filter_map(|x| x["action"].as_str()).collect();
     for want in ["register", "device_add", "user_login", "user_device_kick", "user_device_delete"] {
@@ -869,7 +875,8 @@ async fn admin_lists_are_paged_on_the_server() {
     let (_, cookies, _) = http(&r, "POST", "/api/setup", None, Some(setup), true).await;
     let cookie = cookies[0].clone();
     {
-        let db = r.server.db();
+        let tn = r.server.unmigrated();
+        let db = tn.db();
         for i in 0..250i64 {
             let state = if i % 10 == 0 { "pending" } else { "active" };
             db.execute(
@@ -910,7 +917,7 @@ async fn admin_lists_are_paged_on_the_server() {
     let v = get("/api/devices?filter=online".into()).await;
     assert_eq!(v["total"], 0);
 
-    let v = get("/api/audit?per=10".into()).await;
+    let v = get("/api/audit?per=10&tenancy=".into()).await;
     assert!(v["actions"].as_array().unwrap().iter().any(|a| a == "admin_setup"));
     let v = get("/api/connections".into()).await;
     assert_eq!(v["total"], 0);
@@ -949,7 +956,7 @@ async fn device_targets_and_relay_receive_setting() {
     let sent = send(&r, &o_session, &[&to], "just m2", &[]).await;
     assert_eq!(sent["result"][0]["to"], json!(to), "{sent}");
     assert_eq!(sent["result"][0]["devices"], 1);
-    let n: i64 = r.server.db().query_row("SELECT COUNT(*) FROM deliveries WHERE device = 'm1'", [], |r| r.get(0)).unwrap();
+    let n: i64 = r.server.unmigrated().db().query_row("SELECT COUNT(*) FROM deliveries WHERE device = 'm1'", [], |r| r.get(0)).unwrap();
     assert_eq!(n, 0);
 
     // m2 turns relay receive off for itself: offline m2 gets nothing, m1 still does.
@@ -1016,4 +1023,379 @@ async fn own_devices_and_contact_freshness() {
     c.req(json!({ "t": "profile", "profile": { "name": "Pia", "status": "dnd" } })).await;
     let b = c.req(json!({ "t": "contacts" })).await["list"][0]["updated"].as_i64().unwrap();
     assert!(b > a, "{a} -> {b}");
+}
+
+// ---------------------------------------------------------------- tenancies
+
+async fn admin_cookie(r: &Running) -> String {
+    let cred = json!({ "username": "root", "password": "correct horse" });
+    let (st, cookies, _) = http(r, "POST", "/api/setup", None, Some(cred), true).await;
+    assert_eq!(st, 200);
+    cookies[0].clone()
+}
+
+/// Logs a device on in `tenancy` (as a client with tenancy support).
+async fn logon_in(r: &Running, tenancy: &str, device: &str) -> (Client, Value) {
+    let mut c = Client::plain(r).await;
+    let h = c.req(json!({ "t": "hello", "proto": 1, "app": "test", "tenancy": tenancy })).await;
+    assert_eq!(h["t"], "hello", "{h}");
+    assert_eq!(h["tenancy"]["id"], tenancy);
+    let l = c.req(login(device, None)).await;
+    (c, l)
+}
+
+/// Creates tenancy `id` whose policy lets devices sign themselves up over plain TCP.
+async fn open_tenancy(r: &Running, cookie: &str, id: &str) {
+    let body = json!({ "id": id, "name": format!("{id} Inc."), "admin": { "username": "boss", "password": "boss-password" } });
+    let (st, _, v) = http(r, "POST", "/api/tenancies", Some(cookie), Some(body), true).await;
+    assert_eq!(st, 200, "{v}");
+    let path = format!("/api/settings?tenancy={id}");
+    let (_, _, v) = http(r, "GET", &path, Some(cookie), None, false).await;
+    let mut s = v["settings"].clone();
+    s["policy"]["auth"] = json!("none");
+    s["policy"]["registration"] = json!("open");
+    s["policy"]["encryption"] = json!("plain");
+    let (st, _, v) = http(r, "PUT", &path, Some(cookie), Some(s), true).await;
+    assert_eq!(st, 200, "{v}");
+}
+
+fn open_policy(s: &mut Settings) {
+    s.policy.encryption = Encryption::Plain;
+    s.policy.auth = Auth::None;
+    s.policy.registration = Registration::Open;
+}
+
+#[tokio::test]
+async fn tenancies_are_isolated() {
+    let r = server(open_policy).await;
+    let cookie = admin_cookie(&r).await;
+    let (st, _, _) = http(&r, "POST", "/api/tenancies", Some(&cookie), Some(json!({ "id": "Bad ID" })), true).await;
+    assert_eq!(st, 400);
+    open_tenancy(&r, &cookie, "acme").await;
+    let (st, _, _) = http(&r, "POST", "/api/tenancies", Some(&cookie), Some(json!({ "id": "acme" })), true).await;
+    assert_eq!(st, 400, "IDs are unique");
+
+    // The tenancy's own admin sees only that tenancy, whatever it asks for.
+    let cred = json!({ "tenancy": "acme", "username": "boss", "password": "boss-password" });
+    let (st, ck, v) = http(&r, "POST", "/api/login", None, Some(cred), true).await;
+    assert_eq!(st, 200, "{v}");
+    let boss = ck[0].clone();
+    let (st, _, _) = http(&r, "GET", "/api/tenancies", Some(&boss), None, false).await;
+    assert_eq!(st, 403);
+    let (st, _, _) = http(&r, "GET", "/api/server/settings", Some(&boss), None, false).await;
+    assert_eq!(st, 403);
+    let (_, _, v) = http(&r, "GET", "/api/overview?tenancy=unmigrated", Some(&boss), None, false).await;
+    assert_eq!(v["tenancy"]["id"], "acme");
+    let wrong = json!({ "tenancy": "unmigrated", "username": "boss", "password": "boss-password" });
+    let (st, _, _) = http(&r, "POST", "/api/login", None, Some(wrong), true).await;
+    assert_eq!(st, 401, "admins belong to one tenancy");
+
+    let mut c = Client::plain(&r).await;
+    let e = c.req(json!({ "t": "hello", "proto": 1, "app": "test", "tenancy": "nope" })).await;
+    assert_eq!(e["code"], "unknown_tenancy");
+
+    let (mut a, la) = logon_in(&r, "acme", "ta1").await;
+    assert_eq!(la["tenancy"]["id"], "acme", "{la}");
+    let (_b, lb) = logon_in(&r, "acme", "ta2").await;
+    let (_u, lu) = logon(&r, "u1", None).await;
+    assert_eq!(lu["tenancy"]["id"], "unmigrated");
+    // The same installation may join several tenancies of one server.
+    let (_u_in_acme, l) = logon_in(&r, "acme", "u1").await;
+    assert_eq!(l["t"], "login", "{l}");
+    assert_ne!(l["account"], lu["account"]);
+
+    let v = a.req(json!({ "t": "contacts" })).await;
+    let accounts: Vec<&Value> = v["list"].as_array().unwrap().iter().map(|c| &c["account"]).collect();
+    assert!(accounts.contains(&&lb["account"]));
+    assert!(!accounts.contains(&&lu["account"]), "other tenancies are invisible");
+
+    let s = lu["session"].as_str().unwrap();
+    let v = send(&r, s, &[lb["account"].as_str().unwrap()], "hi", &[]).await;
+    assert_eq!(v["code"], "unknown_user", "{v}");
+    let v = send(&r, la["session"].as_str().unwrap(), &[lb["account"].as_str().unwrap()], "hi", &[]).await;
+    assert_eq!(v["result"][0]["state"], "delivered", "{v}");
+}
+
+#[tokio::test]
+async fn unmigrated_accounts_move_and_old_clients_follow() {
+    let r = server(open_policy).await;
+    let cookie = admin_cookie(&r).await;
+    open_tenancy(&r, &cookie, "acme").await;
+
+    let (mut u, lu) = logon(&r, "old1", None).await;
+    let acc = lu["account"].as_str().unwrap().to_string();
+    let (mut u2, l2) = logon(&r, "old2", None).await;
+    let v = send(&r, l2["session"].as_str().unwrap(), &[&acc], "before the move", &[b"file-bytes"]).await;
+    assert_eq!(v["t"], "sent", "{v}");
+
+    let body = json!({ "ids": [acc], "action": "move", "tenancy": "acme" });
+    let (_, _, v) = http(&r, "POST", "/api/accounts/bulk", Some(&cookie), Some(body), true).await;
+    assert_eq!(v["count"], 1, "{v}");
+    u.wait_event("kicked").await;
+    loop {
+        let e = u2.wait_event("contact").await;
+        if e["contact"]["account"] == json!(acc) && e["contact"]["removed"] == true {
+            break;
+        }
+    }
+
+    // An old client logs on as before and lands in the new tenancy.
+    let (mut u, l) = logon(&r, "old1", None).await;
+    assert_eq!(l["tenancy"]["id"], "acme", "{l}");
+    assert_eq!(l["tenancy"]["moved"], true);
+    assert_eq!(l["account"], json!(acc));
+    let inbox = u.req(json!({ "t": "inbox" })).await;
+    let mid = inbox["list"][0]["mid"].as_str().unwrap().to_string();
+    let mut t = transfer(&r, l["session"].as_str().unwrap()).await;
+    let f = t.req(json!({ "t": "fetch", "mid": mid })).await;
+    assert_eq!(f["body"]["text"], "before the move");
+    let mut got = vec![0u8; 10];
+    t.io.read_exact(&mut got).await.unwrap();
+    assert_eq!(&got, b"file-bytes");
+    // A client with tenancy support names it directly.
+    drop(u);
+    let (_u, l) = logon_in(&r, "acme", "old1").await;
+    assert_eq!(l["account"], json!(acc));
+    assert_eq!(l["tenancy"]["moved"], false);
+
+    // A tenancy with users cannot be deleted; deleting them all first works.
+    let (st, _, _) = http(&r, "DELETE", "/api/tenancies/acme", Some(&cookie), None, true).await;
+    assert_eq!(st, 400);
+    let purge = |c: &str| json!({ "confirm": c });
+    let (st, _, _) = http(&r, "POST", "/api/tenancies/acme/purge", Some(&cookie), Some(purge("acm")), true).await;
+    assert_eq!(st, 400);
+    let (_, _, v) = http(&r, "POST", "/api/tenancies/acme/purge", Some(&cookie), Some(purge("acme")), true).await;
+    assert_eq!(v["count"], 1, "{v}");
+    let (st, _, _) = http(&r, "DELETE", "/api/tenancies/acme", Some(&cookie), None, true).await;
+    assert_eq!(st, 200);
+    let mut c = Client::plain(&r).await;
+    let e = c.req(json!({ "t": "hello", "proto": 1, "app": "test", "tenancy": "acme" })).await;
+    assert_eq!(e["code"], "unknown_tenancy");
+    let (st, _, _) = http(&r, "DELETE", "/api/tenancies/unmigrated", Some(&cookie), None, true).await;
+    assert_eq!(st, 400);
+}
+
+#[tokio::test]
+async fn existing_data_becomes_the_unmigrated_tenancy() {
+    // A data folder from before tenancies: one relay.db with admins and settings.
+    let dir = std::env::temp_dir().join(format!("popup-relay-test-{}", store::new_id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    {
+        let c = store::open(&dir.join("relay.db")).unwrap();
+        store::kv_set(&c, "server_id", "0123456789abcdef");
+        let mut s = Settings::default();
+        s.server_name = "Old relay".into();
+        open_policy(&mut s);
+        store::kv_set(&c, "settings", &serde_json::to_string(&s).unwrap());
+        let hash = popup_relay::relay::hash_password("correct horse").unwrap();
+        c.execute(
+            "INSERT INTO admins (username, pass, created) VALUES ('root', ?1, 0)",
+            [hash],
+        )
+        .unwrap();
+    }
+    let r = start(Config {
+        data_dir: dir,
+        relay_bind: "127.0.0.1:0".parse().unwrap(),
+        admin_bind: "127.0.0.1:0".parse().unwrap(),
+        tls_cert: None,
+        tls_key: None,
+        tls_names: vec!["localhost".into()],
+    })
+    .await
+    .unwrap();
+    assert_eq!(r.server.id, "0123456789abcdef");
+    let mut c = Client::plain(&r).await;
+    let h = c.hello().await;
+    assert_eq!(h["server"]["name"], "Old relay");
+    assert_eq!(h["tenancy"]["id"], "unmigrated");
+    assert_eq!(h["policy"]["auth"], "none");
+    let cred = json!({ "username": "root", "password": "correct horse" });
+    let (st, _, v) = http(&r, "POST", "/api/login", None, Some(cred), true).await;
+    assert_eq!(st, 200, "the old admins are server admins now: {v}");
+}
+
+/// Changes one tenancy's settings through the admin API.
+async fn tenancy_settings(r: &Running, cookie: &str, id: &str, f: impl FnOnce(&mut Value)) {
+    let path = format!("/api/settings?tenancy={id}");
+    let (_, _, v) = http(r, "GET", &path, Some(cookie), None, false).await;
+    let mut s = v["settings"].clone();
+    f(&mut s);
+    let (st, _, v) = http(r, "PUT", &path, Some(cookie), Some(s), true).await;
+    assert_eq!(st, 200, "{v}");
+}
+
+#[tokio::test]
+async fn departments_addresses_and_cross_tenancy_rules() {
+    let r = server(open_policy).await;
+    let cookie = admin_cookie(&r).await;
+    open_tenancy(&r, &cookie, "acme").await;
+    open_tenancy(&r, &cookie, "beta").await;
+
+    let (_a1, l1) = logon_in(&r, "acme", "a1").await;
+    let (_a2, l2) = logon_in(&r, "acme", "a2").await;
+    let (mut a3, l3) = logon_in(&r, "acme", "a3").await;
+    let (mut b1, lb) = logon_in(&r, "beta", "b1").await;
+    assert_eq!(l1["address"], json!(format!("{}:a1@acme:localhost", l1["account"].as_str().unwrap())));
+
+    // Departments: a2 and a3 are developers, a3 also in ops.
+    let acme = |p: &str| format!("{p}?tenancy=acme");
+    for (id, name) in [("dev", "개발팀"), ("ops", "운영팀")] {
+        let (st, _, v) = http(&r, "POST", &acme("/api/departments"), Some(&cookie), Some(json!({ "id": id, "name": name })), true).await;
+        assert_eq!(st, 200, "{v}");
+    }
+    let (st, _, _) = http(&r, "POST", &acme("/api/departments"), Some(&cookie), Some(json!({ "id": "Bad Id" })), true).await;
+    assert_eq!(st, 400);
+    let add = json!({ "add": [l2["account"], l3["account"]] });
+    http(&r, "POST", &acme("/api/departments/dev/members"), Some(&cookie), Some(add), true).await;
+    let a3acc = l3["account"].as_str().unwrap();
+    let body = json!({ "departments": ["dev", "ops"] });
+    let (st, _, v) = http(&r, "PATCH", &acme(&format!("/api/accounts/{a3acc}")), Some(&cookie), Some(body), true).await;
+    assert_eq!(st, 200, "{v}");
+    let (_, _, v) = http(&r, "GET", "/api/accounts?department=ops&tenancy=acme", Some(&cookie), None, false).await;
+    assert_eq!(v["total"], 1, "{v}");
+    let deps = a3.req(json!({ "t": "departments" })).await;
+    assert_eq!(deps["list"].as_array().unwrap().len(), 2, "{deps}");
+    let c = a3.req(json!({ "t": "contacts" })).await;
+    let me = c["list"].as_array().unwrap().iter().find(|x| x["account"] == l3["account"]).unwrap().clone();
+    assert_eq!(me["departments"], json!(["dev", "ops"]));
+
+    // Wildcards within a tenancy: everyone in a department, minus the sender.
+    let s1 = l1["session"].as_str().unwrap();
+    let v = send(&r, s1, &["*@dev:acme:localhost"], "to developers", &[]).await;
+    let got: Vec<&Value> = v["result"].as_array().unwrap().iter().map(|x| &x["account"]).collect();
+    assert_eq!(got.len(), 2, "{v}");
+    assert!(got.contains(&&l2["account"]) && got.contains(&&l3["account"]));
+    let v = send(&r, s1, &["*@ops,nothing:acme:localhost"], "to ops", &[]).await;
+    assert_eq!(v["result"].as_array().unwrap().len(), 1, "{v}");
+    let r1 = a3.req(json!({ "t": "resolve", "address": "*:a2@*:acme:localhost" })).await;
+    assert_eq!(r1["list"].as_array().unwrap().len(), 1, "{r1}");
+    assert_eq!(r1["list"][0]["devices"][0]["id"], "a2");
+
+    // Other tenancies: closed until the server and both tenancies allow it.
+    let to_beta = format!("{}@beta:localhost", lb["account"].as_str().unwrap());
+    let v = send(&r, s1, &[&to_beta], "hello beta", &[]).await;
+    assert_eq!(v["code"], "policy", "{v}");
+    let (_, _, mut ss) = http(&r, "GET", "/api/server/settings", Some(&cookie), None, false).await;
+    ss["settings"]["exchange"]["cross_tenancy"] = json!(true);
+    let (st, _, _) = http(&r, "PUT", "/api/server/settings", Some(&cookie), Some(ss["settings"].clone()), true).await;
+    assert_eq!(st, 200);
+    let v = send(&r, s1, &[&to_beta], "hello beta", &[]).await;
+    assert_eq!(v["code"], "policy", "acme does not send yet: {v}");
+    tenancy_settings(&r, &cookie, "acme", |s| s["exchange"]["send_local"] = json!(true)).await;
+    let v = send(&r, s1, &[&to_beta], "hello beta", &[]).await;
+    assert_eq!(v["code"], "policy", "beta does not receive yet: {v}");
+    tenancy_settings(&r, &cookie, "beta", |s| s["exchange"]["receive_local"] = json!(true)).await;
+    let v = send(&r, s1, &[&to_beta], "hello beta", &[b"cross"]).await;
+    assert_eq!(v["result"][0]["state"], "delivered", "{v}");
+    assert_eq!(v["result"][0]["tenancy"], "beta");
+    b1.wait_event("inbox").await;
+    let inbox = b1.req(json!({ "t": "inbox" })).await;
+    assert_eq!(inbox["list"][0]["from_address"], json!(format!("{}:a1@acme:localhost", l1["account"].as_str().unwrap())));
+    let mid = inbox["list"][0]["mid"].as_str().unwrap().to_string();
+    let mut t = transfer(&r, lb["session"].as_str().unwrap()).await;
+    let f = t.req(json!({ "t": "fetch", "mid": mid })).await;
+    assert_eq!(f["body"]["text"], "hello beta");
+    let mut got = vec![0u8; 5];
+    t.io.read_exact(&mut got).await.unwrap();
+    assert_eq!(&got, b"cross");
+    // The other direction is still closed, and a deny list wins over the rest.
+    let v = send(&r, lb["session"].as_str().unwrap(), &[&format!("{}@acme:localhost", l1["account"].as_str().unwrap())], "back", &[]).await;
+    assert_eq!(v["code"], "policy", "{v}");
+    tenancy_settings(&r, &cookie, "beta", |s| s["exchange"]["deny"] = json!(["acme"])).await;
+    let v = send(&r, s1, &[&to_beta], "denied", &[]).await;
+    assert_eq!(v["code"], "policy", "{v}");
+    // A server exception for one tenancy overrides the server rule.
+    tenancy_settings(&r, &cookie, "beta", |s| s["exchange"]["deny"] = json!([])).await;
+    let (st, _, _) = http(&r, "PATCH", "/api/tenancies/beta", Some(&cookie), Some(json!({ "limits": { "cross_tenancy": false } })), true).await;
+    assert_eq!(st, 200);
+    let v = send(&r, s1, &[&to_beta], "excepted", &[]).await;
+    assert_eq!(v["code"], "policy", "{v}");
+
+    // Other servers: refused by policy, and unsupported once allowed.
+    let far = "kim@corp:far.example";
+    let v = send(&r, s1, &[far], "far away", &[]).await;
+    assert_eq!(v["code"], "policy", "{v}");
+    ss["settings"]["exchange"]["send_remote"] = json!(true);
+    http(&r, "PUT", "/api/server/settings", Some(&cookie), Some(ss["settings"].clone()), true).await;
+    tenancy_settings(&r, &cookie, "acme", |s| s["exchange"]["send_remote"] = json!(true)).await;
+    let v = send(&r, s1, &[far], "far away", &[]).await;
+    assert_eq!(v["code"], "unsupported", "{v}");
+    let v = send(&r, s1, &["not an address@"], "x", &[]).await;
+    assert_eq!(v["code"], "bad_request", "{v}");
+}
+
+#[tokio::test]
+async fn api_keys_send_and_receive_for_scripts() {
+    let r = server(open_policy).await;
+    let cookie = admin_cookie(&r).await;
+    open_tenancy(&r, &cookie, "acme").await;
+    let (_a1, l1) = logon_in(&r, "acme", "a1").await;
+    let (_a2, l2) = logon_in(&r, "acme", "a2").await;
+    let a1 = l1["account"].as_str().unwrap();
+    let a2 = l2["account"].as_str().unwrap();
+
+    let new_key = json!({ "account": a1, "name": "ci", "send": true, "receive": true });
+    let (st, _, _) = http(&r, "POST", "/api/keys?tenancy=acme", Some(&cookie), Some(new_key.clone()), true).await;
+    assert_eq!(st, 400, "the tenancy does not allow keys yet");
+    tenancy_settings(&r, &cookie, "acme", |s| s["api_keys"] = json!(true)).await;
+    let (st, _, v) = http(&r, "POST", "/api/keys?tenancy=acme", Some(&cookie), Some(new_key), true).await;
+    assert_eq!(st, 200, "{v}");
+    let token = v["token"].as_str().unwrap().to_string();
+    let key_id = v["id"].as_str().unwrap().to_string();
+    assert!(token.starts_with("pm.acme."));
+    let bearer = format!("Bearer {token}");
+    let auth = [("Authorization", bearer.as_str()), ("Content-Type", "application/json")];
+
+    let (st, _, me) = http_at(r.relay_addr, "GET", "/api/v1/me", None, None, &auth).await;
+    assert_eq!(st, 200, "{me}");
+    assert_eq!(me["address"], json!(format!("{a1}:api-{key_id}@acme:localhost")));
+    let bad = [("Authorization", "Bearer pm.acme.nope.nope")];
+    let (st, _, _) = http_at(r.relay_addr, "GET", "/api/v1/me", None, None, &bad).await;
+    assert_eq!(st, 401);
+
+    // Sending: plain text and an inline attachment, to an account ID.
+    let data = base64::engine::general_purpose::STANDARD.encode(b"report");
+    let body = json!({ "to": [a2], "text": "from a script", "files": [{ "name": "r.txt", "data": data }] });
+    let (st, _, v) = http_at(r.relay_addr, "POST", "/api/v1/send", None, Some(body), &auth).await;
+    assert_eq!(st, 200, "{v}");
+    assert_eq!(v["result"][0]["state"], "delivered", "{v}");
+    let body = json!({ "to": ["nobody"], "text": "x" });
+    let (st, _, v) = http_at(r.relay_addr, "POST", "/api/v1/send", None, Some(body), &auth).await;
+    assert_eq!((st, v["code"].clone()), (404, json!("unknown_user")), "{v}");
+
+    // Receiving: the key has its own device, so messages to the account wait for it.
+    let v = send(&r, l2["session"].as_str().unwrap(), &[a1], "for the script", &[b"payload"]).await;
+    assert_eq!(v["result"][0]["devices"], 2, "{v}");
+    let (_, _, v) = http_at(r.relay_addr, "GET", "/api/v1/inbox", None, None, &auth).await;
+    let items = v["items"].as_array().unwrap();
+    assert_eq!(items.len(), 1, "{v}");
+    assert_eq!(items[0]["text"], "for the script");
+    assert_eq!(items[0]["files"][0]["name"], "a.bin");
+    let mid = items[0]["mid"].as_str().unwrap().to_string();
+    let mut s = TcpStream::connect(r.relay_addr).await.unwrap();
+    let req = format!("GET /api/v1/messages/{mid}/files/0 HTTP/1.1\r\nHost: x\r\nConnection: close\r\nAuthorization: {bearer}\r\n\r\n");
+    s.write_all(req.as_bytes()).await.unwrap();
+    let mut out = Vec::new();
+    s.read_to_end(&mut out).await.unwrap();
+    assert!(String::from_utf8_lossy(&out).ends_with("payload"));
+    let (st, _, _) = http_at(r.relay_addr, "POST", &format!("/api/v1/messages/{mid}/ack"), None, None, &auth).await;
+    assert_eq!(st, 200);
+    let (_, _, v) = http_at(r.relay_addr, "GET", "/api/v1/inbox", None, None, &auth).await;
+    assert_eq!(v["items"].as_array().unwrap().len(), 0);
+
+    // Keys stop working when revoked, or when the tenancy turns them off.
+    let (_, _, v) = http(&r, "GET", "/api/keys?tenancy=acme", Some(&cookie), None, false).await;
+    assert_eq!(v["items"][0]["name"], "ci", "{v}");
+    tenancy_settings(&r, &cookie, "acme", |s| s["api_keys"] = json!(false)).await;
+    let (st, _, _) = http_at(r.relay_addr, "GET", "/api/v1/me", None, None, &auth).await;
+    assert_eq!(st, 403);
+    tenancy_settings(&r, &cookie, "acme", |s| s["api_keys"] = json!(true)).await;
+    let (st, _, _) = http(&r, "DELETE", &format!("/api/keys/{key_id}?tenancy=acme"), Some(&cookie), None, true).await;
+    assert_eq!(st, 200);
+    let (st, _, _) = http_at(r.relay_addr, "GET", "/api/v1/me", None, None, &auth).await;
+    assert_eq!(st, 401);
+    let c = l2["session"].as_str().unwrap();
+    let v = send(&r, c, &[a1], "after revoke", &[]).await;
+    assert_eq!(v["result"][0]["devices"], 1, "the key's device is gone: {v}");
 }

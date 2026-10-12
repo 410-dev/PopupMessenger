@@ -3,6 +3,8 @@
 use crate::hub::{Conn, Out};
 use crate::settings::{Auth, Contacts, Encryption, Registration, MAX_DEVICES_CAP};
 use crate::store::{self, now_ms};
+use crate::address;
+use crate::tenant::Tenant;
 use crate::{frame, Server};
 use argon2::password_hash::{
     rand_core::OsRng, PasswordHash, PasswordHasher, PasswordVerifier, SaltString,
@@ -11,7 +13,7 @@ use argon2::Argon2;
 use base64::Engine;
 use rusqlite::{params, OptionalExtension};
 use serde_json::{json, Map, Value};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -83,7 +85,7 @@ async fn handle(server: Arc<Server>, s: TcpStream, addr: SocketAddr) {
     if !matches!(timeout(HANDSHAKE, s.peek(&mut b)).await, Ok(Ok(1))) {
         return;
     }
-    let st = server.settings();
+    let st = server.server_settings();
     // HTTP requests start with an upper-case method name (GET, POST, ...).
     let http = |c: u8| c.is_ascii_uppercase();
     let (io, secure, transport): (Box<dyn Io>, bool, &'static str) = if b[0] == 0x16 {
@@ -152,13 +154,32 @@ async fn session(
         .chars()
         .take(32)
         .collect();
-    let s = server.settings();
+    // Clients without tenancy support name none and land in the unmigrated tenancy
+    // (or, at login, wherever their account was moved to).
+    let named = hello["tenancy"]
+        .as_str()
+        .map(|s| s.trim().to_lowercase())
+        .filter(|s| !s.is_empty());
+    let tn = match &named {
+        None => server.unmigrated(),
+        Some(id) => match server.tenant(id) {
+            Some(t) => t,
+            None => {
+                let e = perr("unknown_tenancy", "이 서버에 없는 Tenancy ID입니다");
+                return frame::write(&mut io, &err_frame(&rid, &e)).await;
+            }
+        },
+    };
+    let s = tn.settings();
     let reply = json!({
         "t": "hello", "rid": rid, "proto": crate::PROTOCOL,
-        "server": { "id": server.id, "name": s.server_name, "version": crate::version() },
+        "server": { "id": server.id, "name": s.server_name, "version": crate::version(), "domain": server.domain() },
+        "tenancy": { "id": tn.id, "name": tn.name() },
         "transport": { "kind": transport, "ws_chunk": s.ws_chunk_kb as usize * 1024 },
-        // "device_target": send `to` may name "<account>/<device>"; "hold": relay receive setting.
-        "features": ["device_target", "hold"],
+        // "device_target": send `to` may name "<account>/<device>"; "hold": relay receive
+        // setting; "tenancy": `hello` may name a tenancy; "address": `send` and `resolve`
+        // take addresses; "departments": the `departments` request.
+        "features": ["device_target", "hold", "tenancy", "address", "departments"],
         "policy": s.policy,
     });
     frame::write(&mut io, &reply).await?;
@@ -169,7 +190,9 @@ async fn session(
 
     let req = frame::read(&mut io, HANDSHAKE).await?.ok_or("eof")?;
     match req["t"].as_str() {
-        Some("login") | Some("register") => control(server, io, ip, tls, transport, app, req).await,
+        Some("login") | Some("register") => {
+            control(server, tn, io, ip, tls, transport, app, req).await
+        }
         Some("auth") => transfer(server, io, req).await,
         _ => {
             frame::write(
@@ -259,8 +282,8 @@ async fn verify_password_async(pass: String, hash: Option<String>) -> bool {
     .unwrap_or(false)
 }
 
-async fn login(server: &Server, req: &Value, ip: &str, app: &str) -> Result<LoggedIn, PErr> {
-    let s = server.settings();
+async fn login(tn: &Tenant, req: &Value, ip: &str, app: &str) -> Result<LoggedIn, PErr> {
+    let s = tn.settings();
     let p = &s.policy;
     let id = s_field(req, "id", 64);
     if !valid_id(&id) {
@@ -282,9 +305,9 @@ async fn login(server: &Server, req: &Value, ip: &str, app: &str) -> Result<Logg
     let prof = profile(&req["profile"]);
     let register = req["t"] == "register";
     let dev_key = format!("dev:{id}");
-    server.locked(&dev_key).map_err(|s| locked(s))?;
+    tn.locked(&dev_key).map_err(|s| locked(s))?;
 
-    let device: Option<(String, String, bool)> = server
+    let device: Option<(String, String, bool)> = tn
         .db()
         .query_row(
             "SELECT account, secret, disabled FROM devices WHERE id = ?1",
@@ -296,7 +319,7 @@ async fn login(server: &Server, req: &Value, ip: &str, app: &str) -> Result<Logg
         .flatten();
     if let Some((_, sec, _)) = &device {
         if *sec != secret {
-            server.login_failed(&dev_key);
+            tn.login_failed(&dev_key);
             return Err(perr("auth_failed", "기기 인증에 실패했습니다"));
         }
     }
@@ -315,9 +338,10 @@ async fn login(server: &Server, req: &Value, ip: &str, app: &str) -> Result<Logg
                     Registration::Approval => "pending",
                     Registration::Open => "active",
                 };
+                crate::admin::room_for_account(tn).map_err(|e| perr("registration_closed", e))?;
                 let acc = store::new_id();
                 let now = now_ms();
-                let c = server.db();
+                let c = tn.db();
                 c.execute(
                     "INSERT INTO accounts (id, name, state, created, updated) VALUES (?1, ?2, ?3, ?4, ?4)",
                     params![acc, prof["name"].as_str().unwrap_or(""), state, now],
@@ -342,7 +366,7 @@ async fn login(server: &Server, req: &Value, ip: &str, app: &str) -> Result<Logg
             if let Some((acc, _, _)) = known {
                 // A registered device logs on with its device secret alone (checked above);
                 // the password is only needed to add a device to an account.
-                let uname: Option<String> = server
+                let uname: Option<String> = tn
                     .db()
                     .query_row("SELECT username FROM accounts WHERE id = ?1", [acc], |r| {
                         r.get(0)
@@ -357,7 +381,7 @@ async fn login(server: &Server, req: &Value, ip: &str, app: &str) -> Result<Logg
                     return Err(perr("auth_required", "사용자 이름과 비밀번호가 필요합니다"));
                 }
                 let user_key = format!("user:{}", user.to_lowercase());
-                server.locked(&user_key).map_err(|s| locked(s))?;
+                tn.locked(&user_key).map_err(|s| locked(s))?;
                 if register {
                     if p.registration == Registration::Closed {
                         return Err(perr(
@@ -389,9 +413,10 @@ async fn login(server: &Server, req: &Value, ip: &str, app: &str) -> Result<Logg
                     } else {
                         "pending"
                     };
+                    crate::admin::room_for_account(tn).map_err(|e| perr("registration_closed", e))?;
                     let acc = store::new_id();
                     let now = now_ms();
-                    let c = server.db();
+                    let c = tn.db();
                     let r = c.execute(
                     "INSERT INTO accounts (id, username, pass, name, state, created, updated) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6)",
                     params![acc, user, hash, prof["name"].as_str().unwrap_or(""), state, now],
@@ -408,7 +433,7 @@ async fn login(server: &Server, req: &Value, ip: &str, app: &str) -> Result<Logg
                     );
                     (acc, Some(user))
                 } else {
-                    let row: Option<(String, String, Option<String>)> = server
+                    let row: Option<(String, String, Option<String>)> = tn
                         .db()
                         .query_row(
                             "SELECT id, username, pass FROM accounts WHERE username = ?1",
@@ -421,19 +446,19 @@ async fn login(server: &Server, req: &Value, ip: &str, app: &str) -> Result<Logg
                     let ok =
                         verify_password_async(pass, row.as_ref().and_then(|r| r.2.clone())).await;
                     let Some((acc, uname, _)) = row.filter(|_| ok) else {
-                        server.login_failed(&user_key);
+                        tn.login_failed(&user_key);
                         return Err(perr(
                             "auth_failed",
                             "사용자 이름 또는 비밀번호가 틀렸습니다",
                         ));
                     };
-                    server.login_ok(&user_key);
-                    let c = server.db();
+                    tn.login_ok(&user_key);
+                    let c = tn.db();
                     let same = device.as_ref().is_some_and(|d| d.0 == acc);
                     if !same {
                         let (count, limit): (i64, Option<i64>) = c
                         .query_row(
-                            "SELECT (SELECT COUNT(*) FROM devices WHERE account = ?1), max_devices FROM accounts WHERE id = ?1",
+                            "SELECT (SELECT COUNT(*) FROM devices WHERE account = ?1 AND id NOT LIKE 'api-%'), max_devices FROM accounts WHERE id = ?1",
                             [&acc],
                             |r| Ok((r.get(0)?, r.get(1)?)),
                         )
@@ -484,7 +509,7 @@ async fn login(server: &Server, req: &Value, ip: &str, app: &str) -> Result<Logg
         }
     };
 
-    let c = server.db();
+    let c = tn.db();
     let (state, dev_disabled): (String, bool) = c
         .query_row(
             "SELECT a.state, d.disabled FROM accounts a JOIN devices d ON d.account = a.id WHERE a.id = ?1 AND d.id = ?2",
@@ -522,7 +547,7 @@ async fn login(server: &Server, req: &Value, ip: &str, app: &str) -> Result<Logg
         params![now, account],
     );
     drop(c);
-    server.login_ok(&dev_key);
+    tn.login_ok(&dev_key);
     Ok(LoggedIn {
         device: id,
         account,
@@ -547,8 +572,32 @@ fn insert_device(c: &rusqlite::Connection, id: &str, account: &str, secret: &str
 
 // ---------------------------------------------------------------- control connection
 
+/// Where an unmigrated-tenancy login really belongs: the tenancy its device or
+/// username was moved to, if it is no longer in the unmigrated tenancy.
+fn redirect(server: &Server, tn: &Arc<Tenant>, req: &Value) -> Option<Arc<Tenant>> {
+    if !tn.is_unmigrated() {
+        return None;
+    }
+    let id = s_field(req, "id", 64);
+    let known = |sql: &str, key: &str| -> bool {
+        tn.db().query_row(sql, [key], |_| Ok(())).optional().ok().flatten().is_some()
+    };
+    if !id.is_empty() && !known("SELECT 1 FROM devices WHERE id = ?1", &id) {
+        if let Some(t) = server.moved_to("device", &id) {
+            return Some(t);
+        }
+    }
+    let user = s_field(req, "user", 32).to_lowercase();
+    if !user.is_empty() && !known("SELECT 1 FROM accounts WHERE username = ?1", &user) {
+        return server.moved_to("user", &user);
+    }
+    None
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn control(
     server: Arc<Server>,
+    tn: Arc<Tenant>,
     mut io: Box<dyn Io>,
     ip: String,
     tls: bool,
@@ -557,20 +606,38 @@ async fn control(
     req: Value,
 ) -> Result<(), String> {
     let rid = req["rid"].clone();
-    let me = match login(&server, &req, &ip, &app).await {
+    let moved = redirect(&server, &tn, &req);
+    let tn = moved.clone().unwrap_or(tn);
+    if moved.is_some() && !tls && tn.settings().policy.encryption != Encryption::Plain {
+        let e = perr("tls_required", "이 서버는 암호화(TLS) 연결만 받습니다");
+        return frame::write(&mut io, &err_frame(&rid, &e)).await;
+    }
+    let me = match login(&tn, &req, &ip, &app).await {
         Ok(m) => m,
         Err(e) => return frame::write(&mut io, &err_frame(&rid, &e)).await,
     };
     let token = store::token();
+    let user = me.username.clone().unwrap_or_else(|| me.account.clone());
     frame::write(
         &mut io,
-        &json!({ "t": "login", "rid": rid, "session": token, "account": me.account, "username": me.username }),
+        &json!({ "t": "login", "rid": rid, "session": token, "account": me.account, "username": me.username,
+                 // The tenancy actually logged on to; differs from `hello` after a move.
+                 "tenancy": { "id": tn.id, "name": tn.name(), "moved": moved.is_some() },
+                 "address": address::device_address(&user, &me.device, &tn.id, &server.domain()) }),
     )
     .await?;
+    if moved.is_some() {
+        // `hello` carried the unmigrated tenancy's policy.
+        frame::write(
+            &mut io,
+            &json!({ "t": "event", "e": "policy", "policy": tn.settings().policy }),
+        )
+        .await?;
+    }
 
     let (tx, mut rx) = mpsc::unbounded_channel::<Out>();
     let kill = Arc::new(Notify::new());
-    server.hub.add(
+    tn.hub.add(
         &me.device,
         Conn {
             tx: tx.clone(),
@@ -599,9 +666,9 @@ async fn control(
         let _ = w.shutdown().await;
     });
 
-    server.contact_changed(&me.account);
+    tn.contact_changed(&me.account);
     let (pending, expired) = {
-        let c = server.db();
+        let c = tn.db();
         (
             store::pending_count(&c, &me.device),
             store::expired_count(&c, &me.device),
@@ -614,7 +681,7 @@ async fn control(
     }
 
     loop {
-        let idle = Duration::from_secs(server.settings().idle_timeout_secs as u64);
+        let idle = Duration::from_secs(tn.settings().idle_timeout_secs as u64);
         let req = tokio::select! {
             r = frame::read(&mut r, idle) => match r { Ok(Some(v)) => v, _ => break },
             _ = kill.notified() => break,
@@ -625,7 +692,7 @@ async fn control(
             let _ = tx.send(Out::Frame(json!({ "t": "ok", "rid": rid })));
             break;
         }
-        let resp = match control_req(&server, &me, t, &req) {
+        let resp = match control_req(&server, &tn, &me, t, &req) {
             Ok(v) => with_rid(v, &rid),
             Err(e) => err_frame(&rid, &e),
         };
@@ -634,10 +701,10 @@ async fn control(
         }
     }
     let _ = tx.send(Out::Close);
-    if server.hub.remove(&me.device, &token) {
+    if tn.hub.remove(&me.device, &token) {
         let now = now_ms();
         {
-            let c = server.db();
+            let c = tn.db();
             let _ = c.execute(
                 "UPDATE devices SET last_seen = ?1 WHERE id = ?2",
                 params![now, me.device],
@@ -647,19 +714,19 @@ async fn control(
                 params![now, me.account],
             );
         }
-        server.contact_changed(&me.account);
+        tn.contact_changed(&me.account);
     }
     let _ = timeout(Duration::from_secs(5), writer).await;
     Ok(())
 }
 
-fn control_req(server: &Server, me: &LoggedIn, t: &str, req: &Value) -> Result<Value, PErr> {
+fn control_req(server: &Server, tn: &Tenant, me: &LoggedIn, t: &str, req: &Value) -> Result<Value, PErr> {
     match t {
         "ping" => Ok(json!({ "t": "pong" })),
         "profile" => {
             let p = profile(&req["profile"]);
             {
-                let c = server.db();
+                let c = tn.db();
                 let _ = c.execute(
                     "UPDATE devices SET profile = ?1 WHERE id = ?2",
                     params![p.to_string(), me.device],
@@ -671,11 +738,11 @@ fn control_req(server: &Server, me: &LoggedIn, t: &str, req: &Value) -> Result<V
                     );
                 }
             }
-            server.contact_changed(&me.account);
+            tn.contact_changed(&me.account);
             Ok(json!({ "t": "ok" }))
         }
         "hold" => {
-            let c = server.db();
+            let c = tn.db();
             if let Some(mode) = req["mode"].as_str() {
                 let (acc, dev) = match mode {
                     "allow" => (1, Some(1)),
@@ -692,19 +759,19 @@ fn control_req(server: &Server, me: &LoggedIn, t: &str, req: &Value) -> Result<V
             let mode = store::hold_mode(&c, &me.device);
             drop(c);
             if req["mode"].is_string() {
-                server.contact_changed(&me.account);
+                tn.contact_changed(&me.account);
             }
             Ok(json!({ "t": "hold", "mode": mode }))
         }
         "contacts" => Ok(contacts(
-            server,
+            tn,
             &me.account,
             req["since"].as_i64().unwrap_or(0),
         )),
         "lookup" => {
             let q = s_field(req, "query", 64);
-            let s = server.settings();
-            let found: Option<String> = server
+            let s = tn.settings();
+            let found: Option<String> = tn
                 .db()
                 .query_row(
                     "SELECT id FROM accounts WHERE (username = ?1 OR id = ?1) AND state = 'active'",
@@ -717,20 +784,20 @@ fn control_req(server: &Server, me: &LoggedIn, t: &str, req: &Value) -> Result<V
             let Some(acc) = found.filter(|_| !q.is_empty()) else {
                 return Err(perr("not_found", "사용자를 찾을 수 없습니다"));
             };
-            let new = store::link(&server.db(), &me.account, &acc);
+            let new = store::link(&tn.db(), &me.account, &acc);
             if new && s.policy.contacts == Contacts::Lookup {
-                server.contact_changed(&me.account); // the other side now sees us
+                tn.contact_changed(&me.account); // the other side now sees us
             }
-            let online = server.hub.online();
-            let entry = store::contact(&server.db(), &online, &acc, s.show_host);
+            let online = tn.hub.online();
+            let entry = store::contact(&tn.db(), &online, &acc, s.show_host);
             Ok(json!({ "t": "lookup", "contact": entry }))
         }
         "inbox" => {
-            let c = server.db();
+            let c = tn.db();
             let now = now_ms();
             let mut st = c
                 .prepare_cached(
-                    "SELECT m.mid, m.from_account, m.from_device, m.from_name, m.created, m.files, m.files_gone, m.files_expires
+                    "SELECT m.mid, m.from_account, m.from_device, m.from_name, m.created, m.files, m.files_gone, m.files_expires, m.from_addr
                      FROM deliveries d JOIN messages m ON m.mid = d.mid
                      WHERE d.device = ?1 AND d.acked IS NULL ORDER BY m.created",
                 )
@@ -747,6 +814,7 @@ fn control_req(server: &Server, me: &LoggedIn, t: &str, req: &Value) -> Result<V
                         "ts": r.get::<_, i64>(4)?,
                         "files": if gone { json!([]) } else { files_json(&files) },
                         "files_expired": gone && files != "[]",
+                        "from_address": r.get::<_, String>(8)?,
                     }))
                 })
                 .map_err(|e| perr("bad_request", e.to_string()))?
@@ -769,8 +837,54 @@ fn control_req(server: &Server, me: &LoggedIn, t: &str, req: &Value) -> Result<V
                 .collect();
             Ok(json!({ "t": "inbox", "list": list, "expired": expired }))
         }
+        "resolve" => {
+            // Who an address reaches, with devices and keys (to encrypt for them).
+            let q = s_field(req, "address", 400);
+            let a = address::parse(&q).map_err(|e| perr("bad_request", e))?;
+            let r = address::resolve(server, tn, &a, MAX_FANOUT).map_err(|e| PErr {
+                code: e.code,
+                reason: e.reason,
+                extra: Value::Null,
+            })?;
+            let online = r.tn.hub.online();
+            let show_host = r.tn.settings().show_host;
+            let domain = server.domain();
+            let c = r.tn.db();
+            let list: Vec<Value> = r
+                .accounts
+                .iter()
+                .filter(|(acc, _)| !(r.tn.id == tn.id && *acc == me.account && a.device.is_none()))
+                .filter_map(|(acc, dev)| {
+                    let mut e = store::contact(&c, &online, acc, show_host)?;
+                    if let (Some(d), Some(list)) = (dev, e["devices"].as_array_mut()) {
+                        list.retain(|x| x["id"] == json!(d));
+                    }
+                    let user = e["username"].as_str().unwrap_or(acc).to_string();
+                    e["tenancy"] = json!(r.tn.id);
+                    e["address"] = json!(format!("{user}@{}:{domain}", r.tn.id));
+                    Some(e)
+                })
+                .collect();
+            Ok(json!({ "t": "resolve", "address": a.to_string(), "tenancy": r.tn.id, "list": list }))
+        }
+        "departments" => {
+            let c = tn.db();
+            let list: Vec<Value> = c
+                .prepare(
+                    "SELECT d.id, d.name, (SELECT COUNT(*) FROM members m JOIN accounts a ON a.id = m.account
+                       WHERE m.department = d.id AND a.state = 'active') FROM departments d ORDER BY d.name, d.id",
+                )
+                .and_then(|mut st| {
+                    st.query_map([], |r| {
+                        Ok(json!({ "id": r.get::<_, String>(0)?, "name": r.get::<_, String>(1)?, "members": r.get::<_, i64>(2)? }))
+                    })?
+                    .collect()
+                })
+                .map_err(|e| perr("bad_request", e.to_string()))?;
+            Ok(json!({ "t": "departments", "list": list }))
+        }
         "expired_ack" => {
-            let _ = server
+            let _ = tn
                 .db()
                 .execute("DELETE FROM expired WHERE device = ?1", [&me.device]);
             Ok(json!({ "t": "ok" }))
@@ -780,16 +894,16 @@ fn control_req(server: &Server, me: &LoggedIn, t: &str, req: &Value) -> Result<V
 }
 
 /// `files` column ("[size, …]") as protocol file entries.
-fn files_json(files: &str) -> Value {
+pub(crate) fn files_json(files: &str) -> Value {
     let sizes: Vec<u64> = serde_json::from_str(files).unwrap_or_default();
     Value::Array(sizes.into_iter().map(|s| json!({ "size": s })).collect())
 }
 
-fn contacts(server: &Server, viewer: &str, since: i64) -> Value {
-    let s = server.settings();
-    let online = server.hub.online();
+fn contacts(tn: &Tenant, viewer: &str, since: i64) -> Value {
+    let s = tn.settings();
+    let online = tn.hub.online();
     let now = now_ms();
-    let c = server.db();
+    let c = tn.db();
     let full = since <= 0;
     let ids: Vec<String> = {
         let (sql, args): (&str, Vec<Value>) = match (s.policy.contacts, full) {
@@ -832,7 +946,8 @@ fn contacts(server: &Server, viewer: &str, since: i64) -> Value {
 
 async fn transfer(server: Arc<Server>, mut io: Box<dyn Io>, req: Value) -> Result<(), String> {
     let token = req["session"].as_str().unwrap_or("").to_string();
-    let Some((device, account)) = server.hub.session(&token) else {
+    // Session tokens are unique over all tenancies; the token says which one.
+    let Some((tn, device, account)) = server.session(&token) else {
         return frame::write(
             &mut io,
             &err_frame(&req["rid"], &perr("session", "세션이 만료되었습니다")),
@@ -845,7 +960,7 @@ async fn transfer(server: Arc<Server>, mut io: Box<dyn Io>, req: Value) -> Resul
             return Ok(());
         };
         let rid = req["rid"].clone();
-        if server.hub.session(&token).is_none() {
+        if tn.hub.session(&token).is_none() {
             return frame::write(
                 &mut io,
                 &err_frame(&rid, &perr("session", "세션이 만료되었습니다")),
@@ -853,11 +968,11 @@ async fn transfer(server: Arc<Server>, mut io: Box<dyn Io>, req: Value) -> Resul
             .await;
         }
         match req["t"].as_str().unwrap_or("") {
-            "send" => send(&server, &mut io, &device, &account, &req).await?,
-            "fetch" => fetch(&server, &mut io, &device, &req).await?,
+            "send" => send(&server, &tn, &mut io, &device, &account, &req).await?,
+            "fetch" => fetch(&tn, &mut io, &device, &req).await?,
             "ack" => {
                 let mid = req["mid"].as_str().unwrap_or("");
-                let v = match ack(&server, &device, mid) {
+                let v = match ack(&tn, &device, mid) {
                     Ok(()) => json!({ "t": "ok", "rid": rid }),
                     Err(e) => err_frame(&rid, &e),
                 };
@@ -874,15 +989,21 @@ async fn transfer(server: Arc<Server>, mut io: Box<dyn Io>, req: Value) -> Resul
     }
 }
 
+/// Accounts one address may reach.
+const MAX_FANOUT: usize = 1000;
+
 struct Target {
-    /// As the sender named it: "<account>" or "<account>/<device>".
+    /// As the sender named it: "<account>", "<account>/<device>" or an address.
     to: String,
+    /// The tenancy the account is in.
+    tn: Arc<Tenant>,
     account: String,
     devices: Vec<String>,
 }
 
-async fn send(
+pub(crate) async fn send(
     server: &Server,
+    tn: &Arc<Tenant>,
     io: &mut Box<dyn Io>,
     device: &str,
     account: &str,
@@ -890,7 +1011,7 @@ async fn send(
 ) -> Result<(), String> {
     let rid = req["rid"].clone();
     let fail = |e: PErr| err_frame(&rid, &e);
-    let s = server.settings();
+    let s = tn.settings();
     let p = &s.policy;
     let body = req["body"].clone();
     if !body.is_object() {
@@ -942,127 +1063,181 @@ async fn send(
     }
     let total: u64 = sizes.iter().sum();
 
-    // Resolve recipients.
-    let mut targets: Vec<Target> = Vec::new();
+    // Resolve recipients: account IDs of this tenancy ("<account>[/<device>]") or
+    // addresses, which may name other tenancies and several accounts.
+    let mut wanted: Vec<(String, Arc<Tenant>, String, Option<String>)> = Vec::new();
     let mut rejected: Vec<Value> = Vec::new();
-    let quota_err = {
-        let c = server.db();
-        let mut seen = HashSet::new();
-        for to in req["to"]
-            .as_array()
-            .into_iter()
-            .flatten()
-            .filter_map(|v| v.as_str())
-        {
+    let mut seen = HashSet::new();
+    for to in req["to"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|v| v.as_str())
+    {
+        if !seen.insert(to.to_string()) {
+            continue;
+        }
+        if address::is_address(to) {
+            let found = address::parse(to)
+                .map_err(|e| address::Refused { code: "bad_request", reason: e })
+                .and_then(|a| address::resolve(server, tn, &a, MAX_FANOUT));
+            match found {
+                Ok(r) => {
+                    for (acc, dev) in r.accounts {
+                        wanted.push((to.to_string(), r.tn.clone(), acc, dev));
+                    }
+                }
+                Err(e) => rejected.push(json!({ "to": to, "code": e.code, "reason": e.reason })),
+            }
+        } else {
             // "<account>/<device>" sends to that one device only.
-            let (to_acc, only) = match to.split_once('/') {
-                Some((a, d)) => (a, Some(d)),
+            let (acc, only) = match to.split_once('/') {
+                Some((a, d)) => (a, Some(d.to_string())),
                 None => (to, None),
             };
-            // Not to yourself; your other devices only one at a time.
-            if !seen.insert(to.to_string()) || (to_acc == account && only.is_none_or(|d| d == device)) {
+            wanted.push((to.to_string(), tn.clone(), acc.to_string(), only));
+        }
+    }
+    let mut targets: Vec<Target> = Vec::new();
+    for (to, dst, acc, only) in wanted {
+        // Not to yourself; your other devices only one at a time.
+        if dst.id == tn.id && acc == account && only.as_deref().is_none_or(|d| d == device) {
+            if !address::is_address(&to) {
                 continue;
             }
-            let full = to;
-            let to = to_acc;
+            // A wildcard address that includes the sender: skip just the sender.
+            if only.is_none() {
+                continue;
+            }
+        }
+        let (active, mut devs) = {
+            let c = dst.db();
             let active: bool = c
-                .query_row(
-                    "SELECT state = 'active' FROM accounts WHERE id = ?1",
-                    [to],
-                    |r| r.get(0),
-                )
+                .query_row("SELECT state = 'active' FROM accounts WHERE id = ?1", [&acc], |r| r.get(0))
                 .optional()
                 .ok()
                 .flatten()
                 .unwrap_or(false);
-            let mut devs = if active {
-                store::devices_of(&c, to)
-            } else {
-                vec![]
-            };
-            if let Some(d) = only {
-                devs.retain(|x| x.0 == d);
-            }
-            let to = full;
-            if devs.is_empty() {
-                let reason = if active {
-                    "받는 사람이 아직 이 서버에 기기를 등록하지 않았습니다"
-                } else {
-                    "받는 사람이 이 서버에 없습니다"
-                };
-                rejected.push(json!({ "to": to, "code": "unknown_user", "reason": reason }));
-                continue;
-            }
-            // Offline devices that turned "relay receive" off get nothing stored.
-            devs.retain(|(d, _, hold)| *hold || server.hub.is_online(d));
-            if devs.is_empty() {
-                rejected.push(json!({ "to": to, "code": "offline", "reason": "받는 사람이 오프라인이고 릴레이 수신을 꺼 두었습니다" }));
-                continue;
-            }
-            let over = devs.iter().find_map(|(_, prof, _)| {
-                let mf = prof["max_files"].as_u64().unwrap_or(0);
-                let ms = prof["max_file_size"].as_u64().unwrap_or(0);
-                if mf > 0 && sizes.len() as u64 > mf {
-                    Some(format!("받는 사람은 첨부파일을 {mf}개까지 받습니다"))
-                } else if ms > 0 && sizes.iter().any(|&n| n > ms) {
-                    Some(format!(
-                        "받는 사람의 파일 허용 크기({})를 넘습니다",
-                        human(ms)
-                    ))
-                } else {
-                    None
-                }
-            });
-            if let Some(r) = over {
-                rejected.push(json!({ "to": to, "code": "policy", "reason": r }));
-                continue;
-            }
-            if enc != "none" {
-                let keys = &body["keys"];
-                if devs
-                    .iter()
-                    .any(|(d, _, _)| keys[d].as_str().map_or(true, str::is_empty))
-                {
-                    rejected.push(json!({ "to": to, "code": "keys", "reason": "받는 사람의 기기 키가 바뀌었습니다. 연락처를 새로 받은 뒤 다시 보내세요" }));
-                    continue;
-                }
-            }
-            targets.push(Target {
-                to: to.to_string(),
-                account: to_acc.to_string(),
-                devices: devs.into_iter().map(|d| d.0).collect(),
-            });
+            (active, if active { store::devices_of(&c, &acc) } else { vec![] })
+        };
+        if let Some(d) = &only {
+            devs.retain(|x| &x.0 == d);
         }
-        if total > 0 {
-            let (all, mine): (i64, i64) = c
-                .query_row(
-                    "SELECT COALESCE(SUM(bytes), 0), COALESCE(SUM(CASE WHEN from_account = ?1 THEN bytes END), 0) FROM messages WHERE files_gone = 0",
-                    [account],
-                    |r| Ok((r.get(0)?, r.get(1)?)),
-                )
-                .unwrap_or((0, 0));
-            let acct_quota: Option<i64> = c
-                .query_row(
-                    "SELECT quota_mb FROM accounts WHERE id = ?1",
-                    [account],
-                    |r| r.get(0),
-                )
-                .optional()
-                .ok()
-                .flatten()
-                .flatten();
-            let mb = 1024 * 1024;
-            let acct_quota = acct_quota.map(|q| q as u64).unwrap_or(s.account_quota_mb);
-            if s.storage_quota_mb > 0 && all as u64 + total > s.storage_quota_mb * mb {
-                Some(perr("quota", "서버 저장 공간이 부족합니다"))
-            } else if acct_quota > 0 && mine as u64 + total > acct_quota * mb {
-                Some(perr("quota", "내 계정의 서버 보관 용량이 부족합니다"))
+        let reject = |code: &str, reason: String| json!({ "to": to, "account": acc, "code": code, "reason": reason });
+        if devs.is_empty() {
+            let reason = if active {
+                "받는 사람이 아직 이 서버에 기기를 등록하지 않았습니다"
+            } else {
+                "받는 사람이 이 서버에 없습니다"
+            };
+            rejected.push(reject("unknown_user", reason.into()));
+            continue;
+        }
+        // Offline devices that turned "relay receive" off get nothing stored.
+        devs.retain(|(d, _, hold)| *hold || dst.hub.is_online(d));
+        if devs.is_empty() {
+            rejected.push(reject("offline", "받는 사람이 오프라인이고 릴레이 수신을 꺼 두었습니다".into()));
+            continue;
+        }
+        let over = devs.iter().find_map(|(_, prof, _)| {
+            let mf = prof["max_files"].as_u64().unwrap_or(0);
+            let ms = prof["max_file_size"].as_u64().unwrap_or(0);
+            if mf > 0 && sizes.len() as u64 > mf {
+                Some(format!("받는 사람은 첨부파일을 {mf}개까지 받습니다"))
+            } else if ms > 0 && sizes.iter().any(|&n| n > ms) {
+                Some(format!("받는 사람의 파일 허용 크기({})를 넘습니다", human(ms)))
             } else {
                 None
             }
+        });
+        if let Some(r) = over {
+            rejected.push(reject("policy", r));
+            continue;
+        }
+        if dst.id != tn.id {
+            // The receiving tenancy's own rules apply to what it stores.
+            let ds = dst.settings();
+            let dp = &ds.policy;
+            let r = if dp.encryption == Encryption::E2ee && enc == "none" {
+                Some("받는 Tenancy는 종단간 암호화된 쪽지만 받습니다".to_string())
+            } else if sizes.len() > dp.relay_max_files as usize {
+                Some(format!("받는 Tenancy는 첨부파일을 {}개까지 받습니다", dp.relay_max_files))
+            } else if sizes.iter().any(|&n| n > dp.relay_max_file_size) {
+                Some(format!("받는 Tenancy의 파일 허용 크기({})를 넘습니다", human(dp.relay_max_file_size)))
+            } else if body_s.len() > ds.max_body_kb as usize * 1024 {
+                Some(format!("받는 Tenancy의 본문 한도({}KB)를 넘습니다", ds.max_body_kb))
+            } else {
+                None
+            };
+            if let Some(r) = r {
+                rejected.push(reject("policy", r));
+                continue;
+            }
+            let q = dst.limits().storage_quota_mb;
+            if total > 0 && q > 0 && dst.stored_bytes() + total > q * 1024 * 1024 {
+                rejected.push(reject("quota", "받는 Tenancy의 서버 저장 공간이 부족합니다".into()));
+                continue;
+            }
+        }
+        if enc != "none" {
+            let keys = &body["keys"];
+            if devs
+                .iter()
+                .any(|(d, _, _)| keys[d].as_str().map_or(true, str::is_empty))
+            {
+                rejected.push(reject("keys", "받는 사람의 기기 키가 바뀌었습니다. 연락처를 새로 받은 뒤 다시 보내세요".into()));
+                continue;
+            }
+        }
+        let devices: Vec<String> = devs.into_iter().map(|d| d.0).collect();
+        // The same account reached twice (e.g. by ID and by address): merge.
+        match targets.iter_mut().find(|t| t.tn.id == dst.id && t.account == acc && t.to == to) {
+            Some(t) => {
+                for d in devices {
+                    if !t.devices.contains(&d) {
+                        t.devices.push(d);
+                    }
+                }
+            }
+            None => targets.push(Target { to, tn: dst, account: acc, devices }),
+        }
+    }
+
+    // Over all tenancies; taken before this tenancy's database lock (it locks each in turn).
+    let server_used = if total > 0 && s.storage_quota_mb > 0 {
+        server.stored_bytes()
+    } else {
+        0
+    };
+    let quota_err = if total > 0 {
+        let c = tn.db();
+        let (all, mine): (i64, i64) = c
+            .query_row(
+                "SELECT COALESCE(SUM(bytes), 0), COALESCE(SUM(CASE WHEN from_account = ?1 THEN bytes END), 0) FROM messages WHERE files_gone = 0",
+                [account],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap_or((0, 0));
+        let acct_quota: Option<i64> = c
+            .query_row("SELECT quota_mb FROM accounts WHERE id = ?1", [account], |r| r.get(0))
+            .optional()
+            .ok()
+            .flatten()
+            .flatten();
+        let mb = 1024 * 1024;
+        let acct_quota = acct_quota.map(|q| q as u64).unwrap_or(s.account_quota_mb);
+        let tenant_quota = tn.limits().storage_quota_mb;
+        if s.storage_quota_mb > 0 && server_used + total > s.storage_quota_mb * mb {
+            Some(perr("quota", "서버 저장 공간이 부족합니다"))
+        } else if tenant_quota > 0 && all as u64 + total > tenant_quota * mb {
+            Some(perr("quota", "이 Tenancy의 서버 저장 공간이 부족합니다"))
+        } else if acct_quota > 0 && mine as u64 + total > acct_quota * mb {
+            Some(perr("quota", "내 계정의 서버 보관 용량이 부족합니다"))
         } else {
             None
         }
+    } else {
+        None
     };
     if let Some(e) = quota_err {
         return frame::write(io, &fail(e)).await;
@@ -1086,7 +1261,7 @@ async fn send(
     .await?;
 
     // Attachments go to <blobs>/<mid>/<n>.part and are renamed once complete.
-    let dir = store::blob_dir(&server.dir, &mid);
+    let dir = store::blob_dir(&tn.dir, &mid);
     if !sizes.is_empty() {
         if let Err(e) = receive_files(io, &dir, &sizes).await {
             let _ = tokio::fs::remove_dir_all(&dir).await;
@@ -1095,51 +1270,82 @@ async fn send(
     }
 
     let now = now_ms();
-    let hour = 3_600_000i64;
-    let text_exp = now + p.retention_hours.text as i64 * hour;
-    let files_exp = now + p.retention_hours.files.min(p.retention_hours.text) as i64 * hour;
-    let from_name: String = {
-        let c = server.db();
-        c.query_row("SELECT name FROM accounts WHERE id = ?1", [account], |r| {
-            r.get(0)
+    let (from_name, from_user): (String, String) = tn
+        .db()
+        .query_row("SELECT name, COALESCE(username, id) FROM accounts WHERE id = ?1", [account], |r| {
+            Ok((r.get(0)?, r.get(1)?))
         })
-        .unwrap_or_default()
-    };
+        .unwrap_or_default();
+    let from_addr = address::device_address(&from_user, device, &tn.id, &server.domain());
+    // Each receiving tenancy stores its own copy, under its own retention.
+    let mut tenancies: Vec<Arc<Tenant>> = Vec::new();
+    for t in &targets {
+        if !tenancies.iter().any(|x| x.id == t.tn.id) {
+            tenancies.push(t.tn.clone());
+        }
+    }
+    let mut expires: HashMap<String, i64> = HashMap::new();
     let mut new_links = Vec::new();
-    {
-        let mut c = server.db();
-        let tx = c.transaction().map_err(|e| e.to_string())?;
-        tx.execute(
-            "INSERT INTO messages (mid, from_account, from_device, from_name, body, files, bytes, created, text_expires, files_expires)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
-            params![mid, account, device, from_name, body_s, serde_json::to_string(&sizes).unwrap_or_default(), total as i64, now, text_exp, files_exp],
-        )
-        .map_err(|e| e.to_string())?;
-        for t in &targets {
-            for d in &t.devices {
-                tx.execute(
-                    "INSERT OR IGNORE INTO deliveries (mid, device, account) VALUES (?1, ?2, ?3)",
-                    params![mid, d, t.account],
-                )
-                .map_err(|e| e.to_string())?;
-            }
-            if store::link(&tx, account, &t.account) {
-                new_links.push(t.account.clone());
+    for dst in &tenancies {
+        let mine: Vec<&Target> = targets.iter().filter(|t| t.tn.id == dst.id).collect();
+        if dst.id != tn.id && !sizes.is_empty() {
+            let to = store::blob_dir(&dst.dir, &mid);
+            if let Err(e) = link_dir(&dir, &to) {
+                let _ = std::fs::remove_dir_all(&to);
+                return Err(format!("attachment copy: {e}"));
             }
         }
-        tx.commit().map_err(|e| e.to_string())?;
-        let n: usize = targets.iter().map(|t| t.devices.len()).sum();
-        store::stat(&c, "msgs", 1);
-        store::stat(&c, "bytes", total as i64);
-        store::stat(&c, "deliveries", n as i64);
+        let ds = dst.settings();
+        let r = &ds.policy.retention_hours;
+        let hour = 3_600_000i64;
+        let text_exp = now + r.text as i64 * hour;
+        let files_exp = now + r.files.min(r.text) as i64 * hour;
+        expires.insert(dst.id.clone(), text_exp);
+        {
+            let mut c = dst.db();
+            let tx = c.transaction().map_err(|e| e.to_string())?;
+            tx.execute(
+                "INSERT INTO messages (mid, from_account, from_device, from_name, body, files, bytes, created, text_expires, files_expires, from_addr)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                params![mid, account, device, from_name, body_s, serde_json::to_string(&sizes).unwrap_or_default(), total as i64, now, text_exp, files_exp, from_addr],
+            )
+            .map_err(|e| e.to_string())?;
+            for t in &mine {
+                for d in &t.devices {
+                    tx.execute(
+                        "INSERT OR IGNORE INTO deliveries (mid, device, account) VALUES (?1, ?2, ?3)",
+                        params![mid, d, t.account],
+                    )
+                    .map_err(|e| e.to_string())?;
+                }
+                if dst.id == tn.id && store::link(&tx, account, &t.account) {
+                    new_links.push(t.account.clone());
+                }
+            }
+            tx.commit().map_err(|e| e.to_string())?;
+            let n: usize = mine.iter().map(|t| t.devices.len()).sum();
+            store::stat(&c, "msgs", 1);
+            store::stat(&c, "bytes", total as i64);
+            store::stat(&c, "deliveries", n as i64);
+        }
+        // The sending tenancy archives below; a receiving one keeps what it received.
+        if dst.id != tn.id && ds.archive && enc == "none" {
+            let label = format!("{from_name} <{from_addr}>");
+            archive(dst, &mid, now, account, device, &label, &mine, &body, &sizes, ds.archive_files);
+        }
     }
     if s.archive && enc == "none" {
-        archive(server, &mid, now, account, device, &from_name, &targets, &body, &sizes, s.archive_files);
+        let all: Vec<&Target> = targets.iter().collect();
+        archive(tn, &mid, now, account, device, &from_name, &all, &body, &sizes, s.archive_files);
+    }
+    if !tenancies.iter().any(|t| t.id == tn.id) {
+        // Nothing for this tenancy: its copy of the attachments was only a staging area.
+        let _ = tokio::fs::remove_dir_all(&dir).await;
     }
     if !new_links.is_empty() && p.contacts == Contacts::Lookup {
-        server.contact_changed(account);
+        tn.contact_changed(account);
         for a in &new_links {
-            server.contact_changed(a);
+            tn.contact_changed(a);
         }
     }
 
@@ -1147,13 +1353,13 @@ async fn send(
     for t in &targets {
         let mut online = 0;
         for d in &t.devices {
-            if server.hub.is_online(d) {
+            if t.tn.hub.is_online(d) {
                 online += 1;
                 let (n, x) = {
-                    let c = server.db();
+                    let c = t.tn.db();
                     (store::pending_count(&c, d), store::expired_count(&c, d))
                 };
-                server.hub.send(
+                t.tn.hub.send(
                     d,
                     json!({ "t": "event", "e": "inbox", "count": n, "expired": x }),
                 );
@@ -1161,12 +1367,16 @@ async fn send(
         }
         let mut r = json!({
             "to": t.to,
+            "account": t.account,
             "state": if online > 0 { "delivered" } else { "stored" },
             "devices": t.devices.len(),
             "online": online,
         });
+        if t.tn.id != tn.id {
+            r["tenancy"] = json!(t.tn.id);
+        }
         if online == 0 {
-            r["expires"] = json!(text_exp);
+            r["expires"] = json!(expires.get(&t.tn.id).copied().unwrap_or(now));
         }
         result.push(r);
     }
@@ -1182,21 +1392,33 @@ async fn send(
     .await
 }
 
+/// Hard-links (or copies) every file of `from` into `to`.
+fn link_dir(from: &std::path::Path, to: &std::path::Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(to)?;
+    for e in std::fs::read_dir(from)?.flatten() {
+        let (a, b) = (e.path(), to.join(e.file_name()));
+        if std::fs::hard_link(&a, &b).is_err() {
+            std::fs::copy(&a, &b)?;
+        }
+    }
+    Ok(())
+}
+
 /// Keeps a reviewable copy of a plaintext message (admin "쪽지 감사").
 #[allow(clippy::too_many_arguments)]
 fn archive(
-    server: &Server,
+    tn: &Tenant,
     mid: &str,
     now: i64,
     account: &str,
     device: &str,
     from_name: &str,
-    targets: &[Target],
+    targets: &[&Target],
     body: &Value,
     sizes: &[u64],
     with_files: bool,
 ) {
-    let c = server.db();
+    let c = tn.db();
     let recipients: Vec<Value> = targets
         .iter()
         .map(|t| {
@@ -1207,7 +1429,7 @@ fn archive(
         })
         .collect();
     let kept = with_files && !sizes.is_empty() && {
-        let (src, dst) = (store::blob_dir(&server.dir, mid), store::archive_dir(&server.dir, mid));
+        let (src, dst) = (store::blob_dir(&tn.dir, mid), store::archive_dir(&tn.dir, mid));
         std::fs::create_dir_all(&dst).is_ok()
             && (0..sizes.len()).all(|i| {
                 let (a, b) = (src.join(i.to_string()), dst.join(i.to_string()));
@@ -1271,7 +1493,7 @@ async fn receive_files(
 }
 
 async fn fetch(
-    server: &Server,
+    tn: &Tenant,
     io: &mut Box<dyn Io>,
     device: &str,
     req: &Value,
@@ -1279,19 +1501,19 @@ async fn fetch(
     let rid = req["rid"].clone();
     let mid = req["mid"].as_str().unwrap_or("").to_string();
     let now = now_ms();
-    let row: Option<(String, String, String, i64, String, String, bool)> = {
-        let c = server.db();
+    let row: Option<(String, String, String, i64, String, String, bool, String)> = {
+        let c = tn.db();
         c.query_row(
-            "SELECT m.from_account, m.from_device, m.from_name, m.created, m.files, m.body, (m.files_gone != 0 OR m.files_expires <= ?3)
+            "SELECT m.from_account, m.from_device, m.from_name, m.created, m.files, m.body, (m.files_gone != 0 OR m.files_expires <= ?3), m.from_addr
              FROM deliveries d JOIN messages m ON m.mid = d.mid WHERE d.mid = ?1 AND d.device = ?2 AND d.acked IS NULL",
             params![mid, device, now],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?)),
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?, r.get(7)?)),
         )
         .optional()
         .ok()
         .flatten()
     };
-    let Some((from, from_device, from_name, ts, files, body, gone)) = row else {
+    let Some((from, from_device, from_name, ts, files, body, gone, from_addr)) = row else {
         return frame::write(
             io,
             &err_frame(&rid, &perr("not_found", "보관함에 없는 쪽지입니다")),
@@ -1313,7 +1535,7 @@ async fn fetch(
     } else {
         serde_json::from_str(&files).unwrap_or_default()
     };
-    let dir = store::blob_dir(&server.dir, &mid);
+    let dir = store::blob_dir(&tn.dir, &mid);
     // Open every file first so a concurrent expiry cannot cut the stream short.
     let mut handles = Vec::new();
     for i in 0..sizes.len() {
@@ -1329,7 +1551,7 @@ async fn fetch(
         }
     }
     let hdr = json!({
-        "t": "fetch", "rid": rid, "mid": mid, "from": from, "from_device": from_device, "from_name": from_name,
+        "t": "fetch", "rid": rid, "mid": mid, "from": from, "from_device": from_device, "from_name": from_name, "from_address": from_addr,
         "ts": ts, "files": sizes.iter().map(|s| json!({ "size": s })).collect::<Vec<_>>(),
         "files_expired": gone && files != "[]", "body": body,
     });
@@ -1353,8 +1575,8 @@ async fn fetch(
     io.flush().await.map_err(|e| e.to_string())
 }
 
-fn ack(server: &Server, device: &str, mid: &str) -> Result<(), PErr> {
-    let c = server.db();
+pub(crate) fn ack(tn: &Tenant, device: &str, mid: &str) -> Result<(), PErr> {
+    let c = tn.db();
     let n = c
         .execute(
             "UPDATE deliveries SET acked = ?1 WHERE mid = ?2 AND device = ?3 AND acked IS NULL",
@@ -1372,7 +1594,7 @@ fn ack(server: &Server, device: &str, mid: &str) -> Result<(), PErr> {
         )
         .unwrap_or(1);
     if left == 0 {
-        store::drop_message(&c, &server.dir, mid);
+        store::drop_message(&c, &tn.dir, mid);
     }
     Ok(())
 }

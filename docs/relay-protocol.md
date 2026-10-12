@@ -62,6 +62,8 @@ PopupMessenger의 선택적 셀프호스팅 릴레이 서버와 클라이언트 
 | `unknown_user` | 받는 사람이 이 서버에 없음 |
 | `quota` | 서버 또는 계정의 저장 공간이 부족함 |
 | `not_found` | 보관함에 없는 쪽지 (만료 포함) |
+| `unknown_tenancy` | `hello`: 이 서버에 없는 Tenancy ID (8절) |
+| `unsupported` | 다른 서버의 주소: 정책은 허용하지만 서버 간 전송을 아직 지원하지 않음 (9.3) |
 
 ---
 
@@ -123,15 +125,22 @@ PopupMessenger의 선택적 셀프호스팅 릴레이 서버와 클라이언트 
 ### 4.1 hello (모든 연결의 첫 프레임)
 
 ```json
-→ { "t": "hello", "rid": "1", "proto": 1, "app": "0.2.0" }
+→ { "t": "hello", "rid": "1", "proto": 1, "app": "0.2.0", "tenancy": "example" }
 ← { "t": "hello", "rid": "1", "proto": 1,
-    "server": { "id": "<서버 고유 ID>", "name": "사내 릴레이", "version": "0.1.0" },
-    "features": ["device_target", "hold"],
+    "server": { "id": "<서버 고유 ID>", "name": "사내 릴레이", "version": "0.1.0", "domain": "relay.example.com" },
+    "tenancy": { "id": "example", "name": "Example Inc." },
+    "features": ["device_target", "hold", "tenancy", "address", "departments"],
     "policy": { … } }
 ```
 
-`features`는 같은 프로토콜 버전 안에서 나중에 더해진 기능입니다(없으면 둘 다 없는 서버).
+`features`는 같은 프로토콜 버전 안에서 나중에 더해진 기능입니다(없으면 그 기능이 없는 서버).
 `device_target`: send의 `to`에 기기 하나를 지정할 수 있음(4.6). `hold`: 릴레이 수신 설정(4.10).
+`tenancy`: `hello`에 Tenancy를 지정할 수 있음(8절). `address`: send의 `to`와 `resolve`에 주소를 쓸 수 있음(9절).
+`departments`: `departments` 요청(9.2).
+
+`tenancy`는 접속할 Tenancy ID입니다. 빼면 Unmigrated Tenancy로 접속합니다(8.3). 없는 ID면 `hello` 대신
+`unknown_tenancy` 오류가 옵니다. 정책(`policy`)은 그 Tenancy의 정책입니다. 전송 연결의 `hello`에는 `tenancy`를
+넣지 않아도 됩니다(세션 토큰이 Tenancy를 알려 줌).
 
 `server.id`는 서버를 처음 설치할 때 만들어지는 무작위 ID입니다. 클라이언트는 이 값으로 "같은 릴레이에 연동된 적이 있는지"를 판단합니다(5절).
 
@@ -151,8 +160,15 @@ PopupMessenger의 선택적 셀프호스팅 릴레이 서버와 클라이언트 
                  "notify": true, "max_files": 10, "max_file_size": 10737418240 } }
 
 ← { "t": "login", "rid": "2", "session": "<불투명 토큰>",
-    "account": "<계정 ID>", "username": "hong" }
+    "account": "<계정 ID>", "username": "hong",
+    "tenancy": { "id": "example", "name": "Example Inc.", "moved": false },
+    "address": "hong:<기기 ID>@example:relay.example.com" }
 ```
+
+- `tenancy`는 실제로 로그온한 Tenancy입니다. Unmigrated Tenancy로 접속했는데 계정이 다른 Tenancy로 옮겨졌다면
+  `moved: true`와 옮겨 간 Tenancy가 오고, 바로 뒤에 그 Tenancy의 `event: policy`가 옵니다(8.3). 클라이언트는 저장한
+  Tenancy ID를 이 값으로 바꿉니다.
+- `address`는 이 기기의 주소입니다(9절). 사용자 이름이 없는 계정은 계정 ID를 씁니다.
 
 - `register`가 성공하면 `login`과 같은 응답을 보내고 바로 로그온 상태가 됩니다. `approval` 서버에서는 `pending` 오류를 보냅니다. 이후 관리자가 승인하면 같은 정보로 `login`할 수 있습니다.
 - `auth: none` 서버에서는 `register`가 따로 없습니다. 처음 보는 기기가 `login`하면 `registration` 정책에 따라 자동 가입(`open`), 승인 대기(`approval` → `pending`), 거부(`closed` → `registration_closed`) 중 하나가 됩니다.
@@ -177,7 +193,7 @@ PopupMessenger의 선택적 셀프호스팅 릴레이 서버와 클라이언트 
 → { "t": "contacts", "rid": "4", "since": 1767000000000 }
 ← { "t": "contacts", "rid": "4", "now": 1767100000000, "full": false,
     "list": [
-      { "account": "9f…", "username": "kim", "name": "김철수",
+      { "account": "9f…", "username": "kim", "name": "김철수", "departments": ["dev", "ops"],
         "status": "online", "online": true, "last_seen": 1767099990000, "removed": false,
         "devices": [
           { "id": "a1b2…", "name": "김철수", "host": "", "status": "online", "online": true,
@@ -187,6 +203,8 @@ PopupMessenger의 선택적 셀프호스팅 릴레이 서버와 클라이언트 
 ```
 
 - 기기의 `hold`: 그 기기가 오프라인일 때 서버가 쪽지를 보관해 주는지(4.10). 꺼져 있고 오프라인이면 보낼 수 없습니다.
+- `departments`: 그 계정이 속한 부서 ID(9.2). 연락처는 같은 Tenancy 안의 계정만 보여 줍니다.
+- ID가 `api-`로 시작하는 기기는 API 키(10절)입니다. 이름이 `API: …`이고 늘 오프라인으로 보입니다.
 - `updated`: 항목이 바뀔 때마다 커지는 값. `contacts` 응답과 `event: contact`가 엇갈려 도착하면 클라이언트는 `updated`가 더 큰 쪽을 남깁니다.
 
 - `since`를 생략하거나 0이면 `full: true`로 전체 목록을 보냅니다. 값이 있으면 그 시각 이후에 바뀐 계정만 보냅니다. 삭제된 계정은 `removed: true`로 옵니다. 클라이언트는 응답의 `now`를 다음 `since`로 씁니다.
@@ -222,7 +240,11 @@ PopupMessenger의 선택적 셀프호스팅 릴레이 서버와 클라이언트 
                 { "to": "…", "state": "failed", "code": "policy", "reason": "…" } ] }
 ```
 
-- 서버는 첨부 개수와 각 크기를 `relay_max_files`, `relay_max_file_size`, 그리고 받는 사람 기기 각각의 `max_files`, `max_file_size`와 비교합니다. 한도를 넘는 받는 사람은 `rejected`에 넣습니다. 받을 수 있는 사람이 하나도 없으면 `ready` 대신 `err`를 보냅니다.
+- `to`에는 주소(9절)도 쓸 수 있습니다. `@`가 들어 있으면 주소입니다. 주소 하나가 여러 계정에 닿으면(와일드카드)
+  `result`에 계정마다 한 줄씩, 같은 `to`로 들어갑니다. `result`와 `rejected`의 각 줄에는 `account`가, 다른 Tenancy의
+  계정이면 `tenancy`도 붙습니다. 와일드카드 주소에 보내는 사람 자신이 들어가면 자신은 빠집니다.
+- 서버는 첨부 개수와 각 크기를 `relay_max_files`, `relay_max_file_size`, 그리고 받는 사람 기기 각각의 `max_files`, `max_file_size`와 비교합니다.
+  다른 Tenancy로 보낼 때는 받는 Tenancy의 정책(첨부 한도, 본문 한도, 종단간 암호화 필수 여부, 저장 공간)도 함께 봅니다. 한도를 넘는 받는 사람은 `rejected`에 넣습니다. 받을 수 있는 사람이 하나도 없으면 `ready` 대신 `err`를 보냅니다.
 - `"<계정 ID>/<기기 ID>"`(`device_target`)는 그 기기에만 보냅니다. 결과의 `to`는 요청에 쓴 문자열 그대로입니다. 내 계정의 다른 기기에도 이렇게 보낼 수 있습니다(나 자신과 내 계정 전체는 안 됨).
 - 오프라인이면서 `hold`가 꺼진 기기는 빠집니다. 남는 기기가 없으면 `code: "offline"`으로 거부합니다.
 - 계정만 쓰면 그 계정에 등록된 **모든 기기**에 각각 전달 항목을 만듭니다. 온라인인 기기에는 바로 `event: inbox`를 보냅니다. `delivered`는 기기가 하나 이상 알림을 받았다는 뜻이고, `stored`는 모든 기기가 오프라인이라는 뜻입니다. 둘 다 서버에 보관되며, 기기마다 `ack`할 때까지 남아 있습니다.
@@ -237,6 +259,7 @@ PopupMessenger의 선택적 셀프호스팅 릴레이 서버와 클라이언트 
 → { "t": "inbox", "rid": "6" }                             // 제어 연결
 ← { "t": "inbox", "rid": "6",
     "list": [ { "mid": "…", "from": "<계정 ID>", "from_device": "<기기 ID>", "from_name": "김철수",
+                "from_address": "kim:<기기 ID>@example:relay.example.com",
                 "ts": 1767100000000, "files": [ { "size": 1048576 } ], "files_expired": false } ],
     "expired": [ { "from": "<계정 ID>", "from_name": "김철수", "count": 3, "last": 1767000000000 } ] }
 
@@ -251,6 +274,8 @@ PopupMessenger의 선택적 셀프호스팅 릴레이 서버와 클라이언트 
 ← { "t": "ok", "rid": "3" }
 ```
 
+- `from_address`: 보낸 기기의 주소(9절). `fetch` 응답에도 있습니다. 다른 Tenancy에서 온 쪽지는 보낸 사람이 연락처에
+  없으므로, 클라이언트는 이 주소로 보낸 사람을 표시하고 답장합니다. Tenancy 도입 전에 보관된 쪽지는 빈 문자열입니다.
 - 클라이언트는 로그온 직후와 `event: inbox`를 받을 때마다 `inbox` → `fetch` → `ack`를 차례로 실행합니다. 받은 쪽지는 LAN 수신과 같은 경로로 쪽지함에 넣고 팝업을 띄웁니다. 방해금지 상태면 쪽지함에만 넣습니다.
 - `ack`는 **그 기기 몫**만 완료 처리합니다. 받는 사람 계정의 기기가 여러 대면, 모든 기기가 `ack`해야 전달이 끝난 것으로 봅니다. 그 전까지는 계속 보관하고, 보관 기간이 지나면 남은 기기가 있어도 지웁니다.
 - `ack` 전에 연결이 끊기면 다음 로그온 때 다시 받습니다. 클라이언트는 `mid`로 중복을 거릅니다.
@@ -353,8 +378,11 @@ PopupMessenger의 선택적 셀프호스팅 릴레이 서버와 클라이언트 
 LAN 피어끼리 같은 릴레이를 쓰는지 알 수 있도록, 탐색 메타에 선택 필드를 추가합니다. 이 필드가 없는 이전 버전 피어와도 호환됩니다.
 
 ```json
-"relay": { "server": "<server.id>", "account": "<계정 ID>" }
+"relay": { "server": "<server.id>", "tenancy": "<Tenancy ID>", "account": "<계정 ID>" }
 ```
+
+클라이언트가 여러 릴레이에 연결해 있으면 그중 하나(목록의 첫 연결)를 싣습니다. `tenancy`가 없으면 `unmigrated`로 봅니다.
+"같은 릴레이"는 `server`와 `tenancy`가 모두 같다는 뜻입니다.
 
 ## 7. 서버 저장과 만료
 
@@ -364,3 +392,151 @@ LAN 피어끼리 같은 릴레이를 쓰는지 알 수 있도록, 탐색 메타�
   - 본문 만료 시각이 지나면 아직 `ack`하지 않은 기기마다 만료 알림(보낸 계정별 개수)을 쌓고 쪽지를 지웁니다.
   - 모든 기기가 `ack`한 쪽지는 바로 지웁니다.
 - 연락처: 계정(ID, username, 이름, 상태), 기기(ID, 프로필, 공개키, 기기 비밀값 해시, 마지막 접속 시각과 IP, 앱 버전).
+
+---
+
+## 8. Tenancy
+
+릴레이 서버 하나에 여러 조직(Tenancy)을 둘 수 있습니다. 서버 제공 업체가 서버 A에는 회사 A·B·C를, 서버 B에는
+회사 D·E·F를 두는 식입니다.
+
+### 8.1 격리
+
+- Tenancy마다 데이터베이스, 첨부 저장소, 사용자, 기기, 연락처, 정책(2절), 감사 로그가 따로 있습니다. 연락처·`lookup`·
+  계정 ID로 보내기는 같은 Tenancy 안에서만 됩니다. 다른 Tenancy로는 주소(9절)로만, 정책이 허용할 때만 보낼 수 있습니다.
+- 같은 기기(같은 `Settings.id`)가 한 서버의 여러 Tenancy에 각각 등록될 수 있습니다. Tenancy마다 계정과 기기 비밀값이 따로입니다.
+- 정책은 Tenancy 관리자가 정합니다. 물리 자원(Tenancy 저장 공간, 파일 크기 상한, 본문 상한, 사용자 수, 아카이브 첨부 보관)과
+  서버 운영 설정(TLS, WebSocket, 프록시, 서버 전체 저장 공간, 서버 주소)은 서버 총괄 관리자만 정합니다.
+  Tenancy 정책의 `relay_max_file_size`는 Tenancy의 파일 크기 상한을 넘지 않습니다.
+
+### 8.2 클라이언트의 연결
+
+- 연결 하나는 (서버 주소, Tenancy ID) 쌍입니다. 클라이언트는 연결을 여러 개 둘 수 있고(같은 서버의 여러 Tenancy, 여러 서버),
+  연결마다 제어 연결, 기기 비밀값, 연락처, 받은 쪽지 경로가 따로입니다. 같은 릴레이인지는 (`server.id`, `tenancy.id`)로 판단합니다.
+- 새 연결을 추가할 때 Tenancy ID는 필수입니다(빈 값은 받지 않음).
+- 구형 클라이언트, 그리고 Tenancy 도입 전에 저장된 연결은 `hello`에 `tenancy`를 넣지 않습니다. 이 연결은 Unmigrated Tenancy로 갑니다.
+
+### 8.3 Unmigrated Tenancy와 리디렉션
+
+- 서버를 Tenancy 지원 버전으로 올리면 기존 데이터(계정, 기기, 보관 쪽지, 설정, 감사 로그) 전체가 `unmigrated` Tenancy가 되고,
+  기존 관리자는 서버 총괄 관리자가 됩니다. `unmigrated`는 지울 수 없습니다.
+- 총괄 관리자는 Unmigrated의 사용자를 다른 Tenancy로 옮길 수 있습니다. 계정 ID, 기기 ID, 기기 비밀값이 그대로 가고,
+  그 기기들을 기다리던 쪽지와 첨부도 함께 갑니다. 옮긴 계정은 Unmigrated에서 `removed`로 보입니다.
+- 옮긴 뒤 그 기기가 `tenancy` 없이(또는 `unmigrated`로) 로그온하면, 서버는 기기 ID(새 기기면 사용자 이름)로 옮겨 간 Tenancy를 찾아
+  그곳으로 로그온시킵니다. `login` 응답의 `tenancy.moved`가 `true`이고, 그 Tenancy의 `event: policy`가 이어집니다.
+  구형 클라이언트는 아무것도 모른 채 계속 쓰고, 신형 클라이언트는 저장된 Tenancy ID를 바꿉니다.
+
+---
+
+## 9. 주소와 부서
+
+### 9.1 주소
+
+```
+<id>[:<device>]@[<departments>:]<tenancy>:<server>
+john:948asfsdddfgjsa@developers:example:relay.example.com
+```
+
+| 부분 | 뜻 | 생략 | `*` |
+|---|---|---|---|
+| `id` | 사용자 이름. 사용자 이름이 없는 계정은 계정 ID | 불가 | 그 Tenancy(또는 부서)의 모든 사용자 |
+| `device` | 기기 ID | 생략하면 모든 기기 | 모든 기기 |
+| `departments` | 부서 ID. 여러 개는 `,`로 구분(`dev,ops`). 그중 하나에 속한 사람만 | 생략하면 부서를 따지지 않음 | 모든 부서 |
+| `tenancy` | Tenancy ID | 불가 | 불가 |
+| `server` | 서버 주소(`hello`의 `server.domain`). 포트를 붙일 수 있음(`relay.example.com:45443`) | 불가 | 불가 |
+
+- 사용자 이름에는 `@`가 들어갈 수 있으므로 마지막 `@`를 기준으로 나눕니다.
+- 서버 주소는 관리자가 정한 `domain`, 없으면 `public_url`의 호스트, 없으면 인증서 이름입니다. 서버는 이 이름들을 모두 자기 자신으로 봅니다.
+- 주소 하나가 닿는 계정은 1000개까지입니다.
+- 장치를 지정했는데 그 사용자가 그 기기를 갖고 있지 않으면 그 사용자는 빠집니다(`*:<device>@…`는 그 기기의 주인 한 명).
+
+### 9.2 부서
+
+Tenancy 관리자가 부서를 만들고 사용자를 넣습니다. 사용자는 부서를 여러 개 가질 수 있습니다. 부서 ID는 1~32자의 영문 소문자,
+숫자, `.`, `_`, `-`입니다.
+
+```json
+→ { "t": "departments", "rid": "11" }
+← { "t": "departments", "rid": "11", "list": [ { "id": "dev", "name": "개발팀", "members": 12 } ] }
+```
+
+연락처 항목의 `departments`로 부서별 사람을 알 수 있습니다. 클라이언트는 연락처 검색에서 부서를 골라 그 부서원 전체를 받는 사람으로
+넣을 수 있습니다(주소 `*@<부서>:<tenancy>:<server>`로 보내도 같음).
+
+### 9.3 resolve
+
+```json
+→ { "t": "resolve", "rid": "12", "address": "*@dev:beta:relay.example.com" }
+← { "t": "resolve", "rid": "12", "address": "…", "tenancy": "beta",
+    "list": [ { …4.4의 연락처 항목…, "tenancy": "beta", "address": "kim@beta:relay.example.com" } ] }
+```
+
+주소가 닿는 계정과 기기(공개키 포함)를 알려 줍니다. 다른 Tenancy의 사람에게 E2EE로 보낼 때 이것으로 키를 받습니다.
+보내기와 같은 정책 검사를 거치며, 허용되지 않으면 `policy`, 없는 사람이면 `unknown_user`, 다른 서버면 `policy` 또는 `unsupported` 오류입니다.
+기기를 지정한 주소면 `devices`에 그 기기만 남습니다.
+
+### 9.4 Tenancy 사이의 교환 정책
+
+다른 Tenancy로 쪽지와 첨부파일을 보내려면 서버와 양쪽 Tenancy가 모두 허용해야 합니다.
+
+서버(총괄 관리자):
+
+| 설정 | 뜻 | 기본 |
+|---|---|---|
+| `exchange.cross_tenancy` | 이 서버의 Tenancy끼리 주고받기 | 꺼짐 |
+| `exchange.send_remote` | 다른 서버로 보내기 | 꺼짐 |
+| `exchange.receive_remote` | 다른 서버에서 받기 | 꺼짐 |
+| Tenancy별 예외 (`limits.cross_tenancy` / `send_remote` / `receive_remote`) | 비워 두면 서버 설정을 따르고, 켜거나 끄면 그 Tenancy만 예외 | 없음 |
+
+Tenancy(Tenancy 관리자, `exchange`):
+
+| 설정 | 뜻 |
+|---|---|
+| `send_local` / `receive_local` | 같은 서버의 다른 Tenancy로 보내기 / 받기 |
+| `send_remote` / `receive_remote` | 다른 서버의 Tenancy로 보내기 / 받기 |
+| `allow` | `tenancy:server` 목록. 비어 있지 않으면 이 목록에 있는 곳만. `*:server`는 그 서버의 모든 Tenancy, 서버를 뺀 `tenancy`는 이 서버 |
+| `deny` | 같은 형식. 여기 있으면 무조건 막음(`allow`보다 우선) |
+
+A Tenancy에서 B Tenancy(같은 서버)로 보내기 = 서버가 A·B 모두에 `cross_tenancy`를 허용 ∧ A의 `send_local` ∧ A의 목록이 B를 허용 ∧
+B의 `receive_local` ∧ B의 목록이 A를 허용.
+
+다른 서버로 보내기는 서버·Tenancy의 `send_remote`와 목록을 검사한 뒤, 서버 간 전송이 아직 없으므로 `unsupported`로 거부합니다.
+
+받는 Tenancy에는 쪽지 사본이 그 Tenancy의 보관 기간으로 저장되고, 받는 Tenancy의 아카이브가 켜져 있으면 그쪽에도 남습니다.
+보낸 쪽 Tenancy의 아카이브에는 보낸 쪽지 전체가 남습니다.
+
+---
+
+## 10. API 키 (스크립트용 HTTP API)
+
+터미널의 간단한 스크립트가 쪽지를 보내거나 받을 수 있도록, 사용자 계정에 묶인 API 키를 발급합니다.
+
+- Tenancy 정책 `api_keys`가 켜져 있어야 합니다. 종단간 암호화(`e2ee`) Tenancy에서는 쓸 수 없습니다(스크립트는 평문을 주고받음).
+- 사용자는 사용자 포털에서, Tenancy 관리자는 관리 화면에서 계정마다 키를 발급하고 폐기합니다. 키는 발급할 때 한 번만 보여 주고
+  서버는 해시만 저장합니다. 형식: `pm.<tenancy>.<키 ID>.<비밀값>`.
+- 권한은 `send`(보내기)와 `receive`(받기)입니다. 받기 키는 계정에 `api-<키 ID>` 기기를 하나 더 만듭니다. 계정 앞으로 온 쪽지는
+  이 기기 몫으로도 보관되어, 스크립트가 `ack`할 때까지(또는 보관 기간까지) 남습니다. 이 기기는 기기 수 한도에 들지 않습니다.
+- 정책이 꺼지거나 계정이 정지되면 키도 막힙니다. 틀린 키가 계속 오면 잠깁니다(로그인 잠금 설정을 따름).
+
+릴레이 포트에서 HTTP(S)로 호출합니다(WebSocket과 같은 포트). 사용자 포털을 꺼도 동작합니다.
+
+```
+Authorization: Bearer pm.example.0a1b2c3d4e5f6789.xxxxxxxx
+```
+
+| 요청 | 설명 |
+|---|---|
+| `GET /api/v1/me` | 키 정보: `tenancy`, `account`, `username`, `address`, `send`, `receive` |
+| `POST /api/v1/send` | `{ "to": ["kim", "<계정 ID>", "*@dev:example:relay.example.com"], "text": "…", "files": [ { "name": "a.txt", "data": "<base64>" } ] }`. `@`가 없는 받는 사람은 이 Tenancy의 사용자 이름 또는 계정 ID. 응답은 `{ "mid", "result" }`(4.6의 `sent`와 같음). 요청 본문은 64 MiB까지 |
+| `GET /api/v1/inbox` | 이 키가 받을 쪽지 목록(최대 500개). 항목마다 `mid`, `from`, `from_name`, `from_address`, `ts`, `text`, `group`, `files[{idx,size,name}]`, `files_expired` |
+| `GET /api/v1/messages/{mid}` | 쪽지 하나(형식은 위와 같음) |
+| `GET /api/v1/messages/{mid}/files/{idx}` | 첨부파일 원본 |
+| `POST /api/v1/messages/{mid}/ack` | 받기 완료. 이후 목록에서 빠짐 |
+
+오류는 `{ "error": "<사람이 읽을 메시지>", "code": "<1절의 code>" }`이고, HTTP 상태는 401(키가 틀림), 403(권한·정책), 404(없음),
+507(저장 공간 부족), 400(그 밖)입니다.
+
+```sh
+curl -s https://relay.example.com/api/v1/send -H "Authorization: Bearer $KEY" \
+  -H 'Content-Type: application/json' -d '{"to":["kim"],"text":"빌드 끝"}'
+```

@@ -1,6 +1,7 @@
 //! Periodic cleanup: attachment and message expiry, finished messages, old audit rows.
 
 use crate::store::{self, now_ms};
+use crate::tenant::Tenant;
 use crate::Server;
 use rusqlite::params;
 use serde_json::json;
@@ -22,16 +23,45 @@ pub struct Swept {
     pub notices: usize,
 }
 
-/// One cleanup pass as of `now` (ms). Public so tests and the admin UI can trigger it.
+/// One cleanup pass over every tenancy as of `now` (ms). Public so tests can trigger it.
 pub fn sweep(server: &Server, now: i64) -> Swept {
     let mut out = Swept::default();
+    for t in server.tenants() {
+        let r = sweep_tenant(&t, now);
+        out.files += r.files;
+        out.messages += r.messages;
+        out.notices += r.notices;
+    }
+    let audit_days = server.server_settings().audit_days as i64;
+    let _ = server.db().execute(
+        "DELETE FROM audit WHERE ts < ?1",
+        [now - audit_days * 86_400_000],
+    );
+    server
+        .admin_sessions
+        .lock()
+        .unwrap()
+        .retain(|_, s| s.expires > now);
+    server.user_sessions.lock().unwrap().retain(|_, s| s.expires > now);
+    server
+        .lockouts
+        .lock()
+        .unwrap()
+        .retain(|_, l| l.0 > 0 || l.1 > now);
+    server.remove_doomed();
+    out
+}
+
+/// One cleanup pass over one tenancy (also run from its admin UI).
+pub fn sweep_tenant(t: &Tenant, now: i64) -> Swept {
+    let mut out = Swept::default();
     let (audit_days, archive_days) = {
-        let s = server.settings();
+        let s = t.settings();
         (s.audit_days as i64, s.archive_days as i64)
     };
     let mut notify = Vec::new();
     {
-        let c = server.db();
+        let c = t.db();
 
         // Attachments past their retention: delete the blobs, keep the text.
         let mids: Vec<String> = c
@@ -39,7 +69,7 @@ pub fn sweep(server: &Server, now: i64) -> Swept {
             .and_then(|mut s| s.query_map([now], |r| r.get(0))?.collect())
             .unwrap_or_default();
         for mid in &mids {
-            let _ = std::fs::remove_dir_all(store::blob_dir(&server.dir, mid));
+            let _ = std::fs::remove_dir_all(store::blob_dir(&t.dir, mid));
             let _ = c.execute("UPDATE messages SET files_gone = 1 WHERE mid = ?1", [mid]);
         }
         out.files = mids.len();
@@ -65,7 +95,7 @@ pub fn sweep(server: &Server, now: i64) -> Swept {
                 notify.push(d.clone());
             }
             out.notices += devices.len();
-            store::drop_message(&c, &server.dir, mid);
+            store::drop_message(&c, &t.dir, mid);
         }
         out.messages = expired.len();
         if out.notices > 0 {
@@ -78,7 +108,7 @@ pub fn sweep(server: &Server, now: i64) -> Swept {
             .and_then(|mut s| s.query_map([], |r| r.get(0))?.collect())
             .unwrap_or_default();
         for mid in &done {
-            store::drop_message(&c, &server.dir, mid);
+            store::drop_message(&c, &t.dir, mid);
         }
 
         let _ = c.execute(
@@ -93,21 +123,14 @@ pub fn sweep(server: &Server, now: i64) -> Swept {
             .unwrap_or_default();
         for mid in &old {
             let _ = c.execute("DELETE FROM archive WHERE mid = ?1", [mid]);
-            let _ = std::fs::remove_dir_all(store::archive_dir(&server.dir, mid));
+            let _ = std::fs::remove_dir_all(store::archive_dir(&t.dir, mid));
         }
         let _ = c.execute(
             "DELETE FROM removed WHERE ts < ?1",
             [now - 365 * 86_400_000],
         );
     }
-    server
-        .admin_sessions
-        .lock()
-        .unwrap()
-        .retain(|_, s| s.expires > now);
-    server.user_sessions.lock().unwrap().retain(|_, s| s.expires > now);
-    server
-        .lockouts
+    t.lockouts
         .lock()
         .unwrap()
         .retain(|_, l| l.0 > 0 || l.1 > now);
@@ -115,12 +138,12 @@ pub fn sweep(server: &Server, now: i64) -> Swept {
     notify.sort();
     notify.dedup();
     for d in notify {
-        if server.hub.is_online(&d) {
+        if t.hub.is_online(&d) {
             let (n, x) = {
-                let c = server.db();
+                let c = t.db();
                 (store::pending_count(&c, &d), store::expired_count(&c, &d))
             };
-            server.hub.send(
+            t.hub.send(
                 &d,
                 json!({ "t": "event", "e": "inbox", "count": n, "expired": x }),
             );
@@ -130,11 +153,11 @@ pub fn sweep(server: &Server, now: i64) -> Swept {
 }
 
 /// Removes `.part` files and blob folders without a message row (left by a crash).
-pub fn clean_partial(server: &Server) {
-    let Ok(rd) = std::fs::read_dir(server.dir.join("blobs")) else {
+pub fn clean_partial(t: &Tenant) {
+    let Ok(rd) = std::fs::read_dir(t.dir.join("blobs")) else {
         return;
     };
-    let c = server.db();
+    let c = t.db();
     for e in rd.flatten() {
         let mid = e.file_name().to_string_lossy().into_owned();
         let known = c

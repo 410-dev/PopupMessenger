@@ -177,3 +177,283 @@ impl Settings {
         }
     }
 }
+
+// ---------------------------------------------------------------- tenancy split
+//
+// A server hosts several tenancies (organizations). What used to be one `Settings`
+// document is split three ways, and `Settings` above is what a tenancy runs with
+// (`effective`):
+//
+// - `ServerSettings`: how the server itself runs, set by server admins.
+// - `TenantSettings`: a tenancy's own policy, set by its admins.
+// - `Limits`: the physical resources a tenancy gets, set by server admins only.
+
+/// Server-wide settings (server admins only).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ServerSettings {
+    pub server_name: String,
+    /// Total bytes of stored attachments over all tenancies (0 = unlimited).
+    pub storage_quota_mb: u64,
+    pub idle_timeout_secs: u32,
+    /// How long the server audit log (tenancy and server admin actions) is kept.
+    pub audit_days: u32,
+    pub admin_session_hours: u32,
+    /// Failed admin logins before the admin name is locked.
+    pub login_max_failures: u32,
+    pub login_lockout_minutes: u32,
+    pub websocket: bool,
+    pub proxy_tls: bool,
+    pub ws_chunk_kb: u32,
+    pub public_url: String,
+    pub user_portal: bool,
+    /// The `<server>` part of addresses on this server (e.g. relay.example.com).
+    /// Blank: the host of `public_url`, else the first TLS name.
+    pub domain: String,
+    pub exchange: ServerExchange,
+}
+
+/// What the server lets tenancies exchange beyond themselves. A tenancy's
+/// `Limits` may make an exception either way.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ServerExchange {
+    /// Messages between tenancies of this server.
+    pub cross_tenancy: bool,
+    /// Messages to other servers.
+    pub send_remote: bool,
+    /// Messages from other servers.
+    pub receive_remote: bool,
+}
+
+impl Default for ServerSettings {
+    fn default() -> Self {
+        Self::from(&Settings::default())
+    }
+}
+
+impl From<&Settings> for ServerSettings {
+    fn from(s: &Settings) -> Self {
+        Self {
+            server_name: s.server_name.clone(),
+            storage_quota_mb: s.storage_quota_mb,
+            idle_timeout_secs: s.idle_timeout_secs,
+            audit_days: s.audit_days,
+            admin_session_hours: s.admin_session_hours,
+            login_max_failures: s.login_max_failures,
+            login_lockout_minutes: s.login_lockout_minutes,
+            websocket: s.websocket,
+            proxy_tls: s.proxy_tls,
+            ws_chunk_kb: s.ws_chunk_kb,
+            public_url: s.public_url.clone(),
+            user_portal: s.user_portal,
+            domain: String::new(),
+            exchange: ServerExchange::default(),
+        }
+    }
+}
+
+impl ServerSettings {
+    pub fn normalize(&mut self) {
+        let mut s = Settings::default();
+        self.apply_to(&mut s);
+        s.audit_days = self.audit_days;
+        s.login_max_failures = self.login_max_failures;
+        s.login_lockout_minutes = self.login_lockout_minutes;
+        s.normalize();
+        let (domain, exchange) = (self.domain.clone(), self.exchange.clone());
+        *self = Self::from(&s);
+        self.domain = domain
+            .trim()
+            .trim_end_matches('.')
+            .to_lowercase()
+            .chars()
+            .filter(|c| c.is_ascii_alphanumeric() || ".-:[]".contains(*c))
+            .take(253)
+            .collect();
+        self.exchange = exchange;
+    }
+
+    /// The server's part of a tenancy's `Settings`. The audit retention and login
+    /// lockout of `Settings` are the tenancy's; the server's own apply to admin
+    /// logins and the server audit log.
+    fn apply_to(&self, s: &mut Settings) {
+        s.server_name = self.server_name.clone();
+        s.storage_quota_mb = self.storage_quota_mb;
+        s.idle_timeout_secs = self.idle_timeout_secs;
+        s.admin_session_hours = self.admin_session_hours;
+        s.websocket = self.websocket;
+        s.proxy_tls = self.proxy_tls;
+        s.ws_chunk_kb = self.ws_chunk_kb;
+        s.public_url = self.public_url.clone();
+        s.user_portal = self.user_portal;
+    }
+}
+
+/// A tenancy's own policy (its admins and server admins).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct TenantSettings {
+    pub policy: Policy,
+    pub show_host: bool,
+    /// Stored attachment bytes per sending account (0 = no per-account limit).
+    pub account_quota_mb: u64,
+    pub min_password_len: u32,
+    pub login_max_failures: u32,
+    pub login_lockout_minutes: u32,
+    pub audit_days: u32,
+    pub archive: bool,
+    pub archive_files: bool,
+    pub archive_days: u32,
+    pub exchange: Exchange,
+    /// Account holders may issue API keys (bearer tokens) for scripts.
+    pub api_keys: bool,
+}
+
+/// What a tenancy exchanges with other tenancies, here or on other servers. The
+/// server's `ServerExchange` (and the tenancy's exceptions) must allow it too.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Exchange {
+    /// Send messages and attachments to other tenancies of this server.
+    pub send_local: bool,
+    /// Receive from other tenancies of this server.
+    pub receive_local: bool,
+    /// Send to tenancies on other servers.
+    pub send_remote: bool,
+    /// Receive from tenancies on other servers.
+    pub receive_remote: bool,
+    /// "tenancy:server" patterns (`*` for any tenancy of a server; a bare tenancy
+    /// means one on this server). If not empty, only these.
+    pub allow: Vec<String>,
+    /// Never these, whatever `allow` says.
+    pub deny: Vec<String>,
+}
+
+impl Exchange {
+    fn normalize(&mut self) {
+        for l in [&mut self.allow, &mut self.deny] {
+            let mut v: Vec<String> = l
+                .iter()
+                .map(|p| p.trim().to_lowercase())
+                .filter(|p| !p.is_empty() && p.len() <= 300)
+                .collect();
+            v.sort();
+            v.dedup();
+            v.truncate(1000);
+            *l = v;
+        }
+    }
+}
+
+impl Default for TenantSettings {
+    fn default() -> Self {
+        Self::from(&Settings::default())
+    }
+}
+
+impl From<&Settings> for TenantSettings {
+    fn from(s: &Settings) -> Self {
+        Self {
+            policy: s.policy.clone(),
+            show_host: s.show_host,
+            account_quota_mb: s.account_quota_mb,
+            min_password_len: s.min_password_len,
+            login_max_failures: s.login_max_failures,
+            login_lockout_minutes: s.login_lockout_minutes,
+            audit_days: s.audit_days,
+            archive: s.archive,
+            archive_files: s.archive_files,
+            archive_days: s.archive_days,
+            exchange: Exchange::default(),
+            api_keys: false,
+        }
+    }
+}
+
+impl TenantSettings {
+    /// Clamps into range and into what the tenancy's `limits` allow.
+    pub fn normalize(&mut self, limits: &Limits) {
+        let mut s = Settings::default();
+        self.apply_to(&mut s);
+        s.normalize();
+        let (mut exchange, api_keys) = (self.exchange.clone(), self.api_keys);
+        exchange.normalize();
+        *self = Self::from(&s);
+        self.exchange = exchange;
+        // Scripts send plaintext; an end-to-end encrypted tenancy cannot have them.
+        self.api_keys = api_keys && self.policy.encryption != Encryption::E2ee;
+        if limits.max_file_size_mb > 0 {
+            let cap = limits.max_file_size_mb * 1024 * 1024;
+            self.policy.relay_max_file_size = self.policy.relay_max_file_size.min(cap);
+        }
+        if !limits.archive_files {
+            self.archive_files = false;
+        }
+    }
+
+    fn apply_to(&self, s: &mut Settings) {
+        s.policy = self.policy.clone();
+        s.show_host = self.show_host;
+        s.account_quota_mb = self.account_quota_mb;
+        s.min_password_len = self.min_password_len;
+        s.login_max_failures = self.login_max_failures;
+        s.login_lockout_minutes = self.login_lockout_minutes;
+        s.audit_days = self.audit_days;
+        s.archive = self.archive;
+        s.archive_files = self.archive_files;
+        s.archive_days = self.archive_days;
+    }
+}
+
+/// Physical resources a tenancy may use (server admins only).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Limits {
+    /// Stored attachment bytes of the whole tenancy (0 = unlimited).
+    pub storage_quota_mb: u64,
+    /// Largest attachment the tenancy may allow (0 = no cap).
+    pub max_file_size_mb: u64,
+    /// Largest message body.
+    pub max_body_kb: u32,
+    /// Accounts in the tenancy (0 = unlimited).
+    pub max_accounts: u32,
+    /// Whether the tenancy may keep attachments in its message archive.
+    pub archive_files: bool,
+    /// Exceptions to the server's `ServerExchange` for this tenancy (None = as the server says).
+    pub cross_tenancy: Option<bool>,
+    pub send_remote: Option<bool>,
+    pub receive_remote: Option<bool>,
+}
+
+impl Default for Limits {
+    fn default() -> Self {
+        Self {
+            storage_quota_mb: 0,
+            max_file_size_mb: 0,
+            max_body_kb: Settings::default().max_body_kb,
+            max_accounts: 0,
+            archive_files: true,
+            cross_tenancy: None,
+            send_remote: None,
+            receive_remote: None,
+        }
+    }
+}
+
+impl Limits {
+    pub fn normalize(&mut self) {
+        // Frames are capped at 8 MiB; leave room for the envelope.
+        self.max_body_kb = self.max_body_kb.clamp(1, 7 * 1024);
+    }
+}
+
+/// What a tenancy runs with: its policy within its limits, on this server.
+pub fn effective(server: &ServerSettings, tenant: &TenantSettings, limits: &Limits) -> Settings {
+    let mut s = Settings::default();
+    tenant.apply_to(&mut s);
+    server.apply_to(&mut s);
+    s.max_body_kb = limits.max_body_kb;
+    s.normalize();
+    s
+}

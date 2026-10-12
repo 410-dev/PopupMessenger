@@ -38,6 +38,11 @@ a:hover { text-decoration: underline; }
 .top .who { opacity: .85; }
 .top button { background: transparent; border: 1px solid #444c56; color: var(--side-fg); padding: 2px 8px; border-radius: 4px; cursor: pointer; }
 .top button:hover { background: var(--side-hi); }
+.top .tenpick { background: var(--side-hi); color: #fff; border: 1px solid #444c56; border-radius: 4px; padding: 2px 6px; max-width: 280px; }
+.checks { display: flex; flex-direction: column; gap: 4px; max-height: 180px; overflow: auto; }
+.checks .line { display: flex; gap: 6px; align-items: center; }
+.modal .line { display: flex; gap: 6px; align-items: center; margin: 4px 0; }
+.drawer .fs .line { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
 .side { background: var(--side); color: var(--side-fg); padding: 6px 0; overflow: auto; }
 .side .grp { padding: 10px 14px 4px; font-size: 10.5px; text-transform: uppercase; letter-spacing: .6px; opacity: .55; }
 .side a { display: flex; align-items: center; gap: 8px; padding: 5px 14px; color: var(--side-fg); text-decoration: none; border-left: 3px solid transparent; }
