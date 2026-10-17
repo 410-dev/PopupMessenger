@@ -16,3 +16,4 @@ mobile/plugin/ios/.build/
 mobile/plugin/permissions/
 mobile/plugin/android/build/
 mobile/plugin/android/.gradle/
+*.DS_Store
